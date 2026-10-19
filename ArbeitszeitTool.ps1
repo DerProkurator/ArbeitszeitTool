@@ -31,6 +31,38 @@
  Verhindert die Unternehmensrichtlinie die Skriptausfuehrung, ist der
  zulaessige Startweg mit der zustaendigen IT abzustimmen.
 ==================================================================
+ AENDERUNGSJOURNAL
+--------------------------------------------------
+19.07.2026 - OPTIONALER PC-SHUTDOWN BEIM
+ANWENDUNGSSCHLIESSEN
+--------------------------------------------------
+ Status: umgesetzt, statisch geprueft, automatisiert getestet
+         (Tests 114a-114r); UI-Optik und echter Shutdownstart
+         manuell NICHT getestet.
+ - Die vorhandene Opt-in-Einstellung ShutdownOfferEnabled gilt
+   jetzt zusaetzlich fuer den Dialog "Anwendung schliessen"
+   (kein neuer persistenter Schalter, Standard bleibt false).
+ - Zusaetzliche eindeutige Shutdown-Auswahl im Schliessen-Dialog:
+   mit aktivem Tag "Arbeitstag beenden, Anwendung schliessen und
+   PC herunterfahren", ohne aktiven Tag "Anwendung schliessen und
+   PC herunterfahren"; bei deaktivierter Einstellung vollstaendig
+   ausgeblendet.
+ - Ein aktiver Arbeitstag wird VOR dem Shutdown vollstaendig
+   validiert und beendet (Complete-WorkDay, keine -SkipValidation);
+   es gibt keinen Pfad, der den PC mit offenem Arbeitstag
+   herunterfaehrt.
+ - Gemeinsamer sicherer Shutdownpfad Invoke-SafeApplicationShutdown
+   (Fensterposition, Radiostatus, CleanShutdown=true, finaler
+   Save-Vault, Radioabbau, Shutdown-Anforderung, erst danach
+   CloseConfirmed/kontrolliertes Schliessen);
+   Invoke-EndDayShutdown bleibt als kompatibler Wrapper erhalten.
+ - Kein Shutdown bei Speicherfehler; bei fehlgeschlagenem
+   Shutdownstart werden CleanShutdown und Radiozustand
+   wiederhergestellt und der korrigierte Sitzungsstatus erneut
+   gespeichert (sonst NICHT-GESPEICHERT-Anzeige).
+ - Ergaenzte Tests 114a-114r; automatisierte Tests starten
+   niemals shutdown.exe (ausschliesslich Simulationsflags).
+==================================================================
 #>
 [CmdletBinding()]
 param(
@@ -1835,8 +1867,10 @@ function Get-DefaultSettings {
         SoundEnabled         = $false
         StartView            = 'Kompakt'    # 'Kompakt' oder 'Erweitert'
         # Opt-in (Standard AUS): Tagesabschlussdialog bietet zusaetzlich
-        # "Arbeitstag beenden und PC herunterfahren" an. Die konkrete Auswahl
-        # gilt nur fuer den jeweiligen Tagesabschluss.
+        # "Arbeitstag beenden und PC herunterfahren" an; der Dialog
+        # "Anwendung schliessen" bietet zusaetzlich eine passende
+        # Shutdown-Auswahl an. Die konkrete Auswahl gilt nur fuer den
+        # jeweiligen Vorgang und wird nie vorausgewaehlt.
         ShutdownOfferEnabled = $false
         # Eigene Presets der kompakten Ansicht (nur Id/Name/Fields; keine
         # Fensterposition, Passwoerter, Radiosender oder Arbeitszeitdaten)
@@ -5200,7 +5234,10 @@ function Invoke-WindowsShutdownRequest {
         # SimulatedShutdownStartFails kann zusaetzlich der Fehlpfad
         # (shutdown.exe nicht startbar) gefahrlos simuliert werden.
         if ($script:App -and $script:App.Flags -and $script:App.Flags.SimulatedShutdownStartFails) { return $false }
-        if ($script:App -and $script:App.Flags) { $script:App.Flags.SimulatedShutdownRequested = $true }
+        if ($script:App -and $script:App.Flags) {
+            $script:App.Flags.SimulatedShutdownRequested = $true
+            $script:App.Flags.SimulatedShutdownRequestCount++
+        }
         return $true
     }
     try {
@@ -5213,21 +5250,40 @@ function Invoke-WindowsShutdownRequest {
     }
 }
 
-# Sichere Reihenfolge nach "Arbeitstag beenden und PC herunterfahren":
-# Der Arbeitstag ist zu diesem Zeitpunkt bereits validiert, vollstaendig
-# abgeschlossen, gespeichert und verifiziert (Complete-WorkDay/Save-Vault).
-# Hier folgen: CleanShutdown-Speicherung (geprueft), kontrolliertes Beenden
-# von Radio/UI und ERST DANACH die Shutdown-Anforderung. Bei Speicherfehler,
-# Cloudkonflikt oder fehlgeschlagenem Start des Shutdownprozesses wird KEIN
-# Shutdown ausgeloest; der Arbeitstag bleibt korrekt beendet und gespeichert.
-function Invoke-EndDayShutdown {
+# Gemeinsamer sicherer technischer Shutdownablauf fuer BEIDE Einstiege
+# (Tagesabschluss-Dialog und Dialog "Anwendung schliessen"). Ein evtl.
+# aktiver Arbeitstag ist zu diesem Zeitpunkt bereits validiert, vollstaendig
+# abgeschlossen, gespeichert und verifiziert - diese Funktion beendet
+# niemals selbst einen Arbeitstag und wird nie mit offenem Tag aufgerufen.
+# Sichere Reihenfolge: Fensterposition bestmoeglich sichern -> tatsaechlichen
+# Radio-Wiedergabestatus uebernehmen -> CleanShutdown=true -> finaler
+# Save-Vault (geprueft) -> Radio kontrolliert abbauen -> Shutdown-Anforderung
+# -> ERST bei erfolgreich gestarteter Anforderung CloseConfirmed=true und
+# kontrolliertes Schliessen. Bei Speicherfehler, Cloudkonflikt oder
+# fehlgeschlagenem Start des Shutdownprozesses wird KEIN Shutdown ausgeloest;
+# die Anwendung bleibt geoeffnet und bedienbar, CleanShutdown wird wieder
+# false. Die Meldungstexte sind pro Einstieg parametrisierbar (mit/ohne
+# beendeten Arbeitstag); der Ablauf selbst ist identisch.
+function Invoke-SafeApplicationShutdown {
+    param(
+        [string]$DayStateShort = 'Der Arbeitstag ist korrekt beendet',
+        [string]$DayStateSaved = 'Der Arbeitstag ist korrekt beendet und gespeichert',
+        [string]$SuccessLogText = 'Arbeitstag beendet - Windows-Herunterfahren angefordert, die Anwendung wird geschlossen.'
+    )
     if ($null -eq $script:App.Vault -or -not $script:VaultSession.Unlocked) { return $false }
+    # Fensterposition bestmoeglich sichern (ein Fehler bricht den Ablauf
+    # nicht ab; ohne echtes WPF-Fenster - z. B. im Testlauf - entfaellt dies)
+    try {
+        $compactWin = $script:App.Ui.Compact
+        if ($compactWin -is [System.Windows.Window]) { Save-CompactWindowPlacement -Window $compactWin | Out-Null }
+    }
+    catch { }
     try { Set-RadioLastPlayingSetting | Out-Null } catch { }
     $script:App.Vault['CleanShutdown'] = $true
     if (-not (Save-Vault)) {
         $script:App.Vault['CleanShutdown'] = $false
         Show-Warning -Message ('Der PC wird NICHT heruntergefahren, weil der finale Speichervorgang fehlgeschlagen ist (z. B. Schreibfehler oder extern veränderte Tresordatei). ' +
-            'Der Arbeitstag ist korrekt beendet; die Anwendung bleibt geöffnet.')
+            $DayStateShort + '; die Anwendung bleibt geöffnet.')
         return $false
     }
     try { Clear-RadioPlayer } catch { }
@@ -5249,7 +5305,7 @@ function Invoke-EndDayShutdown {
         $script:App.Vault['CleanShutdown'] = $false
         if (Save-Vault -NoTrackingCheckpoint -Quiet) {
             Show-Warning -Message ('Das Herunterfahren konnte nicht gestartet werden - der PC wird NICHT heruntergefahren. ' +
-                'Der Arbeitstag ist korrekt beendet und gespeichert; die Anwendung kann normal weiterverwendet oder geschlossen werden.')
+                $DayStateSaved + '; die Anwendung kann normal weiterverwendet oder geschlossen werden.')
         }
         else {
             # UnsavedChanges ist durch Save-Vault gesetzt; die begrenzte
@@ -5257,12 +5313,12 @@ function Invoke-EndDayShutdown {
             # Erfolgsmeldung, keine Speicher- oder Dialogschleife.
             Write-AppLog -Level 'WARN' -Message 'Sitzungsstatus (CleanShutdown=false) nach fehlgeschlagenem Shutdownstart noch NICHT gespeichert - automatische Wiederholung läuft.'
             Show-Warning -Message ('Das Herunterfahren konnte nicht gestartet werden - der PC wird NICHT heruntergefahren. ' +
-                'Der Arbeitstag ist korrekt beendet und gespeichert. Der Sitzungsstatus konnte jedoch noch NICHT dauerhaft gespeichert werden; ' +
+                $DayStateSaved + '. Der Sitzungsstatus konnte jedoch noch NICHT dauerhaft gespeichert werden; ' +
                 'der Zustand wird als NICHT GESPEICHERT angezeigt und automatisch erneut versucht.')
         }
         return $false
     }
-    Write-AppLog -Message 'Arbeitstag beendet - Windows-Herunterfahren angefordert, die Anwendung wird geschlossen.'
+    Write-AppLog -Message $SuccessLogText
     $script:App.CloseConfirmed = $true
     try {
         if ($script:App.Ui.Compact) { $script:App.Ui.Compact.Close() }
@@ -5270,6 +5326,14 @@ function Invoke-EndDayShutdown {
     }
     catch { Stop-ApplicationDispatcher }
     return $true
+}
+
+# Kompatibler Wrapper fuer den vorhandenen Tagesabschluss-Shutdown
+# ("Arbeitstag beenden und PC herunterfahren"): Der Arbeitstag ist bereits
+# validiert, abgeschlossen, gespeichert und verifiziert; hier folgt nur noch
+# der gemeinsame sichere Shutdownablauf mit den unveraenderten Meldungen.
+function Invoke-EndDayShutdown {
+    return Invoke-SafeApplicationShutdown
 }
 
 $script:CloseAppXaml = @'
@@ -5286,12 +5350,31 @@ $script:CloseAppXaml = @'
                  FontFamily="Consolas" Margin="0,8,0,8"/>
         <Button x:Name="BtnCloseOnly" Content="Nur Anwendung schließen (Arbeitstag bleibt offen)" Margin="0,0,0,6" HorizontalAlignment="Stretch"/>
         <Button x:Name="BtnEndAndClose" Content="Arbeitstag beenden und Anwendung schließen" Margin="0,0,0,6" HorizontalAlignment="Stretch"/>
+        <TextBlock x:Name="TxtShutdownHint" Text="Der PC wird erst nach erfolgreichem Speichern heruntergefahren." Foreground="#FFAAB8C6" TextWrapping="Wrap" Visibility="Collapsed" Margin="0,4,0,4"/>
+        <Button x:Name="BtnShutdownClose" Visibility="Collapsed" Margin="0,0,0,6" HorizontalAlignment="Stretch"/>
         <Button x:Name="BtnCancel" Content="Abbrechen" IsCancel="True" Margin="0" HorizontalAlignment="Stretch"/>
     </StackPanel>
 </Window>
 '@
 
-# Liefert 'NurSchliessen' | 'BeendenUndSchliessen' | 'Abbrechen'
+# Liefert die Beschriftung der Shutdown-Auswahl des Schliessen-Dialogs oder
+# $null, wenn die Auswahl nicht angeboten wird (ShutdownOfferEnabled=false).
+# Die Beschriftung benennt bei aktivem Arbeitstag AUSDRUECKLICH auch den
+# Tagesabschluss - es gibt keine Auswahl, die den PC mit offenem Arbeitstag
+# herunterfaehrt.
+function Get-CloseShutdownOfferText {
+    param([bool]$HasActiveDay)
+    if ($null -eq $script:App.Settings -or -not [bool]$script:App.Settings['ShutdownOfferEnabled']) { return $null }
+    if ($HasActiveDay) { return 'Arbeitstag beenden, Anwendung schließen und PC herunterfahren' }
+    return 'Anwendung schließen und PC herunterfahren'
+}
+
+# Liefert 'NurSchliessen' | 'BeendenUndSchliessen' |
+# 'HerunterfahrenUndSchliessen' | 'Abbrechen'.
+# Die Shutdown-Auswahl erscheint NUR bei aktivierter Opt-in-Einstellung
+# ShutdownOfferEnabled (sonst vollstaendig ausgeblendet, kein reservierter
+# Platz), ist nie die Standardschaltflaeche und nie vorausgewaehlt;
+# "Abbrechen" bleibt per Escape/IsCancel erreichbar.
 function Show-CloseAppDialog {
     param($Day)
     $win = New-XamlWindow -Xaml $script:CloseAppXaml
@@ -5308,6 +5391,14 @@ function Show-CloseAppDialog {
     $win.FindName('BtnCloseOnly').Add_Click({ $state.Result = 'NurSchliessen'; $win.Close() })
     $win.FindName('BtnEndAndClose').Add_Click({ $state.Result = 'BeendenUndSchliessen'; $win.Close() })
     $win.FindName('BtnCancel').Add_Click({ $state.Result = 'Abbrechen'; $win.Close() })
+    $shutdownText = Get-CloseShutdownOfferText -HasActiveDay ($null -ne $Day)
+    if ($shutdownText) {
+        $btnShutdown = $win.FindName('BtnShutdownClose')
+        $btnShutdown.Content = $shutdownText
+        $btnShutdown.Visibility = 'Visible'
+        $win.FindName('TxtShutdownHint').Visibility = 'Visible'
+        $btnShutdown.Add_Click({ $state.Result = 'HerunterfahrenUndSchliessen'; $win.Close() })
+    }
     [void]$win.ShowDialog()
     return $state.Result
 }
@@ -5582,7 +5673,7 @@ $script:SettingsXaml = @'
                                         <TextBlock Text="Akustische Meldung bei 10:00 (Systemton)" TextWrapping="Wrap"/>
                                     </CheckBox>
                                     <CheckBox x:Name="ChkShutdownOffer">
-                                        <TextBlock Text="Beim Beenden des Arbeitstags Herunterfahren anbieten (die Auswahl gilt nur für den jeweiligen Tagesabschluss)" TextWrapping="Wrap"/>
+                                        <TextBlock Text="Beim Beenden des Arbeitstags und beim Schließen der Anwendung Herunterfahren anbieten (die Auswahl gilt nur für den jeweiligen Vorgang)" TextWrapping="Wrap"/>
                                     </CheckBox>
                                 </StackPanel>
                             </GroupBox>
@@ -8589,7 +8680,7 @@ function Initialize-AppState {
         # Benutzerinfo bei fehlgeschlagener Best-Effort-Backuprotation.
         # TestFail*: reine Testhooks fuer -RunTests (nur bei $script:TestMode
         # wirksam, im normalen Programmbetrieb vollstaendig inaktiv).
-        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailReplace = $false; TestFailFallbackMove = $false; TestFailFallbackRestore = $false; TestFailBackupCopy = $false; TestFailPrevToBackup1 = $false; TestFailPostCommitHash = $false }
+        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailReplace = $false; TestFailFallbackMove = $false; TestFailFallbackRestore = $false; TestFailBackupCopy = $false; TestFailPrevToBackup1 = $false; TestFailPostCommitHash = $false }
     }
 }
 
@@ -9727,7 +9818,23 @@ function Invoke-ToggleKeepAlive {
     Invoke-MainRefresh
 }
 
-# Liefert $true, wenn die Anwendung geschlossen werden darf.
+# Zentraler Close-Flow (Fensterschaltflaeche, Kontextmenue, Tray, Alt+F4).
+# Liefert genau eines der Ergebnisse:
+#   'Abbrechen'         - Fenster bleibt geoeffnet, CloseConfirmed bleibt false
+#   'NormalSchliessen'  - der Closing-Handler darf regulaer schliessen
+#   'ShutdownGestartet' - der gemeinsame Shutdownpfad hat CloseConfirmed und
+#                         das kontrollierte Schliessen bereits uebernommen;
+#                         der Closing-Handler darf KEINEN zweiten
+#                         Schliessvorgang ausloesen
+function Invoke-CloseFlow {
+    $day = $script:App.CurrentDay
+    $activeDay = $null
+    if ($day -and $day.Status -eq 'Aktiv') { $activeDay = $day }
+    $choice = Show-CloseAppDialog -Day $activeDay
+    return Invoke-CloseChoice -Choice $choice -ActiveDay $activeDay
+}
+
+# Fuehrt die im Schliessen-Dialog getroffene Auswahl aus (ohne UI testbar).
 # "Nur Anwendung schliessen": Der Tag bleibt Aktiv, der laufende Abschnitt
 # bleibt UNVERAENDERT (gleiche Segment-ID, Start unveraendert, End=null,
 # Running=true, keine neue Segmentanzahl) - im Betrieb zaehlt die Zeit des
@@ -9735,16 +9842,20 @@ function Invoke-ToggleKeepAlive {
 # CleanShutdown=true gesetzt und der finale Stand MIT Ergebnispruefung
 # gespeichert; schlaegt das fehl, kann der Benutzer wiederholen oder das
 # Schliessen abbrechen (keine stille Erfolgsannahme).
-function Invoke-CloseFlow {
-    $day = $script:App.CurrentDay
-    $activeDay = $null
-    if ($day -and $day.Status -eq 'Aktiv') { $activeDay = $day }
-    $choice = Show-CloseAppDialog -Day $activeDay
-    if ($choice -eq 'Abbrechen') { return $false }
-    if ($choice -eq 'BeendenUndSchliessen' -and $activeDay) {
-        if (-not (Complete-WorkDay -Day $activeDay -End (Get-Date) -Reason 'Manuell')) { return $false }
+function Invoke-CloseChoice {
+    param([string]$Choice, $ActiveDay)
+    if ($Choice -eq 'Abbrechen') { return 'Abbrechen' }
+    if ($Choice -eq 'HerunterfahrenUndSchliessen') {
+        # Sicherheitsnetz: Ohne aktivierte Opt-in-Einstellung gibt es keinen
+        # Shutdownpfad (der Dialog bietet die Auswahl dann gar nicht an).
+        if ($null -eq $script:App.Settings -or -not [bool]$script:App.Settings['ShutdownOfferEnabled']) { return 'Abbrechen' }
+        if (Invoke-CloseDialogShutdown -ActiveDay $ActiveDay) { return 'ShutdownGestartet' }
+        return 'Abbrechen'
     }
-    if ($null -eq $script:App.Vault -or -not $script:VaultSession.Unlocked) { return $true }
+    if ($Choice -eq 'BeendenUndSchliessen' -and $ActiveDay) {
+        if (-not (Complete-WorkDay -Day $ActiveDay -End (Get-Date) -Reason 'Manuell')) { return 'Abbrechen' }
+    }
+    if ($null -eq $script:App.Vault -or -not $script:VaultSession.Unlocked) { return 'NormalSchliessen' }
     # Tatsaechlichen Radio-Wiedergabestatus VOR dem gepruefteten finalen
     # Speichervorgang bestimmen (der spaetere Cleanup-Save ist nicht die
     # einzige Speicherung dieses Werts).
@@ -9757,9 +9868,38 @@ function Invoke-CloseFlow {
         $retry = Confirm-Question -Message ('Der finale Speichervorgang des Datentresors ist fehlgeschlagen. ' +
             "Die Daten wurden NICHT gespeichert.`r`n`r`nErneut versuchen? (Nein = Schließen abbrechen, die Anwendung bleibt geöffnet)") `
             -Title 'Speichern fehlgeschlagen'
-        if (-not $retry) { return $false }
+        if (-not $retry) { return 'Abbrechen' }
     }
-    return $true
+    return 'NormalSchliessen'
+}
+
+# Shutdown-Auswahl aus dem Schliessen-Dialog: Ein aktiver Arbeitstag wird
+# ZUERST vollstaendig validiert und beendet (Complete-WorkDay mit der
+# aktuellen Zeit als beabsichtigtem Arbeitsende, KEINE -SkipValidation);
+# NUR nach erfolgreichem, gespeichertem Tagesabschluss folgt der gemeinsame
+# sichere Shutdownablauf. Es gibt keinen Pfad, der den PC mit offenem bzw.
+# aktivem Arbeitstag herunterfaehrt. Liefert $true, wenn die
+# Shutdown-Anforderung erfolgreich gestartet wurde.
+function Invoke-CloseDialogShutdown {
+    param($ActiveDay)
+    if ($ActiveDay) {
+        if (-not (Complete-WorkDay -Day $ActiveDay -End (Get-Date) -Reason 'Manuell')) {
+            # Complete-WorkDay hat den konkreten Grund bereits gemeldet;
+            # hier nur die neutrale Folge: kein Shutdown, kein Schliessen.
+            Show-Warning -Message ('Der PC wird NICHT heruntergefahren, weil der Arbeitstag nicht beendet werden konnte. ' +
+                'Die Anwendung bleibt geöffnet.')
+            return $false
+        }
+        # UI-Zustand bestmoeglich aktualisieren (die Anwendung bleibt bei
+        # einem spaeteren Fehler des Shutdownablaufs geoeffnet und bedienbar)
+        try { Hide-PauseLockDetails } catch { }
+        try { Invoke-MainRefresh -ForceTables } catch { }
+        return Invoke-SafeApplicationShutdown
+    }
+    return Invoke-SafeApplicationShutdown `
+        -DayStateShort 'Es wurden keine Arbeitszeitdaten verändert' `
+        -DayStateSaved 'Es wurden keine Arbeitszeitdaten verändert' `
+        -SuccessLogText 'Windows-Herunterfahren angefordert, die Anwendung wird geschlossen.'
 }
 
 #endregion
@@ -10074,12 +10214,20 @@ function Register-CompactWindowEvents {
             if ($script:App.CloseConfirmed -or $script:App.ShuttingDown) { return }
             $e.Cancel = $true
             $sender.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action] {
-                    if (Invoke-CloseFlow) {
+                    $closeResult = Invoke-CloseFlow
+                    if ($closeResult -eq 'NormalSchliessen') {
                         $script:App.CloseConfirmed = $true
                         # Position vor dem regulaeren Beenden sichern
                         Save-CompactWindowPlacement -Window $script:App.Ui.Compact | Out-Null
                         $script:App.Ui.Compact.Close()
                     }
+                    # 'ShutdownGestartet': Der gemeinsame Shutdownpfad hat
+                    # CloseConfirmed gesetzt und das Fenster bereits
+                    # kontrolliert geschlossen - hier darf KEIN zweiter
+                    # Schliessvorgang folgen (kein doppelter Close-Flow,
+                    # kein doppelter Dispatcher-Shutdown).
+                    # 'Abbrechen': Das Fenster bleibt geoeffnet,
+                    # CloseConfirmed bleibt false.
                 }) | Out-Null
         })
 
@@ -12468,6 +12616,124 @@ function Invoke-InternalTests {
         & $assert 'Test 113e: fremde C:\Users-Pfade werden generisch anonymisiert' '[BENUTZERPROFIL]\Dokumente\a.txt' (Get-SanitizedLogMessage 'C:\Users\jemand\Dokumente\a.txt')
         & $assert 'Test 113f: normale technische Meldungen bleiben unveraendert lesbar' 'Der Stream wurde beendet (Code 42).' (Get-SanitizedLogMessage 'Der Stream wurde beendet (Code 42).')
         & $assert 'Test 113g: CSV-Formelinjektionsschutz gilt auch fuer bereinigte Meldungen' "'=SUMME(A1)" (Get-CsvEscaped -Value (Get-SanitizedLogMessage '=SUMME(A1)'))
+
+        # --- Tests 114: optionaler PC-Shutdown beim Anwendungsschliessen ------
+        # Saemtliche Shutdowns sind AUSSCHLIESSLICH simuliert (TestMode):
+        # shutdown.exe wird niemals gestartet, kein Radiostream, kein Netzwerk,
+        # keine Scroll-Lock-Eingaben, keine produktiven Dateien.
+        $origOffer114 = [bool]$script:App.Settings['ShutdownOfferEnabled']
+        $script:App.CurrentDay = $null
+        $script:App.CloseConfirmed = $false
+        # 1) Opt-in deaktiviert: Auswahl wird logisch nicht angeboten; der
+        #    bisherige Schliessen-Dialog bleibt unveraendert (kein Shutdown)
+        $script:App.Settings['ShutdownOfferEnabled'] = $false
+        & $assert 'Test 114a: ohne Opt-in wird im Schliessen-Dialog keine Shutdown-Auswahl angeboten' 'True|True' ("$($null -eq (Get-CloseShutdownOfferText -HasActiveDay $true))|$($null -eq (Get-CloseShutdownOfferText -HasActiveDay $false))")
+        $script:App.Flags.SimulatedShutdownRequested = $false
+        $res114b = Invoke-CloseChoice -Choice 'HerunterfahrenUndSchliessen' -ActiveDay $null
+        & $assert 'Test 114b: ohne Opt-in fuehrt selbst eine Shutdown-Auswahl niemals zum Shutdown' 'Abbrechen|False|False' ("$res114b|$($script:App.Flags.SimulatedShutdownRequested)|$($script:App.CloseConfirmed)")
+        # 2) Opt-in aktiv: Beschriftungen benennen den Shutdown ausdruecklich;
+        #    bei aktivem Tag AUCH den Tagesabschluss
+        $script:App.Settings['ShutdownOfferEnabled'] = $true
+        & $assert 'Test 114c: Beschriftung bei aktivem Tag nennt Tagesabschluss UND Shutdown' 'Arbeitstag beenden, Anwendung schließen und PC herunterfahren' (Get-CloseShutdownOfferText -HasActiveDay $true)
+        & $assert 'Test 114d: Beschriftung ohne aktiven Tag nennt Schliessen UND Shutdown' 'Anwendung schließen und PC herunterfahren' (Get-CloseShutdownOfferText -HasActiveDay $false)
+        # 3) Abbruch im Dialog: keine Aenderung, kein Shutdown
+        $script:App.Flags.SimulatedShutdownRequested = $false
+        $res114e = Invoke-CloseChoice -Choice 'Abbrechen' -ActiveDay $null
+        & $assert 'Test 114e: Abbrechen loest weder Shutdown noch Schliessen aus' 'Abbrechen|False|False' ("$res114e|$($script:App.Flags.SimulatedShutdownRequested)|$($script:App.CloseConfirmed)")
+        # 4) Erfolgspfad MIT aktivem Tag: Tag wird ZUERST vollstaendig beendet,
+        #    erst danach folgt die (simulierte) Shutdown-Anforderung
+        $fakeCompact114 = [pscustomobject]@{}
+        $fakeCompact114 | Add-Member -MemberType ScriptMethod -Name Close -Value { }
+        $script:App.Ui.Compact = $fakeCompact114
+        $d114 = New-TestDay -DateText ((Get-Date).ToString('yyyy-MM-dd'))
+        Add-TestSegment -Day $d114 -Mode 'Betrieb' -StartText ((Get-Date).AddHours(-2).ToString('HH:mm')) | Out-Null
+        [void]$script:App.Data.Days.Add($d114)
+        Save-Vault | Out-Null
+        $script:App.CloseConfirmed = $false
+        $script:App.Flags.SimulatedShutdownRequested = $false
+        $script:App.Flags.SimulatedShutdownRequestCount = 0
+        $res114f = Invoke-CloseChoice -Choice 'HerunterfahrenUndSchliessen' -ActiveDay $d114
+        & $assert 'Test 114f: Shutdown-Auswahl beendet den aktiven Tag vollstaendig VOR dem (simulierten) Shutdown' 'ShutdownGestartet|Beendet|True' ("$res114f|$($d114['Status'])|$($null -ne $d114['EndedAt'])")
+        & $assert 'Test 114g: nach erfolgreichem finalem Speichern: CleanShutdown, Shutdownanforderung und CloseConfirmed gesetzt' 'True|True|True' ("$($script:App.Vault['CleanShutdown'])|$($script:App.Flags.SimulatedShutdownRequested)|$($script:App.CloseConfirmed)")
+        $reload114 = Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
+        $reDay114 = $null
+        foreach ($d in @($reload114['WorkData']['Days'])) { if ([string]$d['Id'] -eq [string]$d114['Id']) { $reDay114 = $d } }
+        & $assert 'Test 114h: der finale Tresorstand enthaelt den beendeten Tag und CleanShutdown=true' 'Beendet|True' ("$($reDay114['Status'])|$($reload114['CleanShutdown'])")
+        & $assert 'Test 114i: Reentranz - genau EINE simulierte Shutdownanforderung, kein Dispatcher-Stopp im Testlauf' '1|False' ("$($script:App.Flags.SimulatedShutdownRequestCount)|$($script:App.ShuttingDown)")
+        [void]$script:App.Data.Days.Remove($d114)
+        $script:App.CloseConfirmed = $false
+        $script:App.Radio.IsShuttingDown = $false
+        Save-Vault | Out-Null
+        # 5) Erfolgspfad OHNE aktiven Tag: keine Tagesdaten erzeugt/veraendert
+        $daysBefore114 = @($script:App.Data.Days).Count
+        $script:App.Flags.SimulatedShutdownRequested = $false
+        $script:App.Flags.SimulatedShutdownRequestCount = 0
+        $res114j = Invoke-CloseChoice -Choice 'HerunterfahrenUndSchliessen' -ActiveDay $null
+        & $assert 'Test 114j: ohne aktiven Tag - simulierter Shutdown ohne neue oder veraenderte Tagesdaten' "ShutdownGestartet|$daysBefore114|True|True|1" ("$res114j|$(@($script:App.Data.Days).Count)|$($script:App.Vault['CleanShutdown'])|$($script:App.Flags.SimulatedShutdownRequested)|$($script:App.Flags.SimulatedShutdownRequestCount)")
+        & $assert 'Test 114k: CloseConfirmed wird erst nach erfolgreich gestarteter Shutdownanforderung gesetzt' 'True' ([string]$script:App.CloseConfirmed)
+        $script:App.CloseConfirmed = $false
+        $script:App.Radio.IsShuttingDown = $false
+        # 6) Aktiver Tag kann nicht beendet werden (Speicherfehler beim
+        #    Tagesabschluss): kein Shutdown, Tag bleibt Aktiv
+        $d114l = New-TestDay -DateText ((Get-Date).ToString('yyyy-MM-dd'))
+        Add-TestSegment -Day $d114l -Mode 'Betrieb' -StartText ((Get-Date).AddHours(-2).ToString('HH:mm')) | Out-Null
+        [void]$script:App.Data.Days.Add($d114l)
+        Save-Vault | Out-Null
+        $script:App.Flags.SimulatedShutdownRequested = $false
+        $script:Paths.VaultPending = Join-Path $testRoot3 'gibtsnicht114\pending.azt'
+        $res114l = Invoke-CloseChoice -Choice 'HerunterfahrenUndSchliessen' -ActiveDay $d114l
+        $script:Paths.VaultPending = $goodPending102
+        Clear-VaultSaveFailedState
+        & $assert 'Test 114l: nicht beendbarer Tag - kein Shutdown, Tag bleibt Aktiv, Anwendung bleibt logisch geoeffnet' 'Abbrechen|Aktiv|False|False|False' ("$res114l|$($d114l['Status'])|$($script:App.Flags.SimulatedShutdownRequested)|$($script:App.CloseConfirmed)|$($script:App.ShuttingDown)")
+        [void]$script:App.Data.Days.Remove($d114l)
+        Save-Vault | Out-Null
+        # 7) Finaler Save-Vault schlaegt fehl: kein Shutdown, CleanShutdown
+        #    bleibt bzw. wird wieder false, Anwendung bleibt geoeffnet
+        $script:App.Flags.SimulatedShutdownRequested = $false
+        $script:Paths.VaultPending = Join-Path $testRoot3 'gibtsnicht114b\pending.azt'
+        $res114m = Invoke-CloseChoice -Choice 'HerunterfahrenUndSchliessen' -ActiveDay $null
+        $script:Paths.VaultPending = $goodPending102
+        Clear-VaultSaveFailedState
+        & $assert 'Test 114m: fehlgeschlagener finaler Save-Vault - kein Shutdown, CleanShutdown wieder false' 'Abbrechen|False|False|False' ("$res114m|$($script:App.Flags.SimulatedShutdownRequested)|$($script:App.Vault['CleanShutdown'])|$($script:App.CloseConfirmed)")
+        Save-Vault | Out-Null
+        # 8) Simulierter Startfehler des Shutdownprozesses: Zustand wird
+        #    vollstaendig wiederhergestellt und erneut gespeichert
+        $script:App.Flags.SimulatedShutdownRequested = $false
+        $script:App.Flags.SimulatedShutdownStartFails = $true
+        $res114n = Invoke-CloseChoice -Choice 'HerunterfahrenUndSchliessen' -ActiveDay $null
+        $script:App.Flags.SimulatedShutdownStartFails = $false
+        $reload114n = Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
+        & $assert 'Test 114n: Startfehler - kein Shutdown, CloseConfirmed/ShuttingDown false, Radio wieder initialisierbar' 'Abbrechen|False|False|False|False' ("$res114n|$($script:App.Flags.SimulatedShutdownRequested)|$($script:App.CloseConfirmed)|$($script:App.ShuttingDown)|$($script:App.Radio.IsShuttingDown)")
+        & $assert 'Test 114o: Startfehler - CleanShutdown wieder false (Speicher UND Datei), korrigierter Status gespeichert' 'False|False|False' ("$($script:App.Vault['CleanShutdown'])|$($reload114n['CleanShutdown'])|$($script:App.Flags.UnsavedChanges)")
+        # 9) "Nur Anwendung schliessen" bei aktivem Tag: laufender Abschnitt
+        #    bleibt UNVERAENDERT, kein Shutdown
+        $d114p = New-TestDay -DateText ((Get-Date).ToString('yyyy-MM-dd'))
+        $seg114p = Add-TestSegment -Day $d114p -Mode 'Betrieb' -StartText ((Get-Date).AddHours(-1).ToString('HH:mm'))
+        [void]$script:App.Data.Days.Add($d114p)
+        Save-Vault | Out-Null
+        $segId114p = [string]$seg114p['Id']
+        $segStart114p = [string]$seg114p['Start']
+        $script:App.Flags.SimulatedShutdownRequested = $false
+        $res114p = Invoke-CloseChoice -Choice 'NurSchliessen' -ActiveDay $d114p
+        & $assert 'Test 114p: "Nur Anwendung schliessen" - Tag bleibt Aktiv, kein Shutdown, finaler Stand gespeichert' 'NormalSchliessen|Aktiv|False|True' ("$res114p|$($d114p['Status'])|$($script:App.Flags.SimulatedShutdownRequested)|$($script:App.Vault['CleanShutdown'])")
+        & $assert 'Test 114q: laufender Abschnitt bleibt unveraendert (ID, Start, End=null, Running, Anzahl)' "1|$segId114p|$segStart114p|True|True" ("$(@($d114p['Segments']).Count)|$($seg114p['Id'])|$($seg114p['Start'])|$($null -eq $seg114p['End'])|$($seg114p['Running'])")
+        [void]$script:App.Data.Days.Remove($d114p)
+        # 10) Wrapperkompatibilitaet: Invoke-EndDayShutdown nutzt weiterhin den
+        #     gemeinsamen Shutdownpfad (identisches Erfolgsverhalten)
+        $script:App.Flags.SimulatedShutdownRequested = $false
+        $script:App.Flags.SimulatedShutdownRequestCount = 0
+        $script:App.CloseConfirmed = $false
+        $sd114r = Invoke-EndDayShutdown
+        & $assert 'Test 114r: Invoke-EndDayShutdown bleibt kompatibler Wrapper des gemeinsamen Shutdownpfads' 'True|True|1|True' ("$sd114r|$($script:App.Flags.SimulatedShutdownRequested)|$($script:App.Flags.SimulatedShutdownRequestCount)|$($script:App.CloseConfirmed)")
+        # Aufraeumen: Testzustand vollstaendig zuruecksetzen
+        $script:App.Ui.Compact = $null
+        $script:App.CloseConfirmed = $false
+        $script:App.Radio.IsShuttingDown = $false
+        $script:App.Flags.SimulatedShutdownRequested = $false
+        $script:App.Flags.SimulatedShutdownRequestCount = 0
+        $script:App.Settings['ShutdownOfferEnabled'] = $origOffer114
+        $script:App.Vault['CleanShutdown'] = $false
+        Save-Vault | Out-Null
 
         Clear-VaultKeys -Keys $keys
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($testPwdBytes)
