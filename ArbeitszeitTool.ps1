@@ -1859,7 +1859,7 @@ function Get-DefaultSettings {
         CompactFields        = @('Beginn', 'Netto', 'SollRestOderUeberstunden', 'MaxEnde')
         Topmost              = $true
         TopmostReassert      = $true
-        KeepAliveEnabled     = $true
+        KeepAliveEnabled     = $false
         KeepAliveIntervalSec = 60
         TrayIconEnabled      = $true
         ShowSeconds          = $true

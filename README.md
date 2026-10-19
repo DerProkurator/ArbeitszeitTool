@@ -1,13 +1,15 @@
 ﻿# ArbeitszeitTool
 
 Lokale Arbeitszeit-Erfassung für Windows 10/11 als portables PowerShell-Skript mit WPF-Oberfläche.
-Keine Installation, keine externen Module, keine Internetverbindung, keine Telemetrie, keine Adminrechte.
+Keine Installation, keine externen Module, keine Telemetrie, keine Adminrechte. Die Anwendung
+läuft vollständig offline — einzige Ausnahme ist das optionale Internetradio (siehe Abschnitt
+„Internetradio, Netzwerk und Datenschutz"); ohne gestartetes Radio findet keine Netzwerkverbindung statt.
 
 **Alle gespeicherten Daten sind verschlüsselt.** Arbeitstage, Arbeitsabschnitte, Pausen- und
 Sperrzeiten, Korrekturen, Soll-/Überstundenwerte, Einstellungen (inkl. Regelarbeitszeit),
 Anwendungsprotokolle, Backups und Wiederherstellungsdaten liegen ausschließlich in einem
-verschlüsselten Datentresor. Die einzige erlaubte unverschlüsselte Ausnahme sind bewusst
-erstellte CSV-Exporte (nach ausdrücklicher Warnung und Bestätigung).
+verschlüsselten Datentresor. Die einzigen erlaubten unverschlüsselten Ausnahmen sind bewusst
+erstellte CSV- und Protokoll-Exporte (jeweils nur nach ausdrücklicher Warnung und Bestätigung).
 
 ## Voraussetzungen
 
@@ -388,21 +390,23 @@ Windows-Sperre, wird der Zeitraum nur **einmal** abgezogen.
 
 ## Scroll-Lock-Aktivhaltung
 
-Optional (standardmäßig aktiv) betätigt die Anwendung bei laufendem Arbeitstag alle
-60 Sekunden die Rollen-Taste (Scroll Lock) per `SendInput`, zwei Umschaltungen im Abstand
-von ca. 300 ms, nicht blockierend über Timer. Die Zustandsmaschine ist abgesichert:
+Optional (**standardmäßig deaktiviert**) betätigt die Anwendung bei laufendem Arbeitstag
+alle 60 Sekunden die Rollen-Taste (Scroll Lock) über einen einfachen, vollständig
+entkoppelten **Doppelpuls**: Tastendruck (Down+Up) → ca. 200 ms → Tastendruck (Down+Up),
+ausgeführt per `SendInput` in C# auf einem ThreadPool-Thread (nie auf dem WPF-UI-Thread),
+mit Interlocked-Parallelschutz gegen überlappende Pulse.
 
-- Vor jedem Zyklus wird der tatsächliche Zustand gelesen und gemerkt; das Ergebnis
-  **jeder** `SendInput`-Umschaltung wird geprüft.
-- Weicht der Endzustand vom Ausgangszustand ab, erfolgt sofort ein begrenzter
-  Wiederherstellungsversuch; schlägt auch dieser fehl, wird die Aktivhaltung automatisch
-  **deaktiviert**, eine sichtbare Warnung angezeigt und der Fehler verschlüsselt
-  protokolliert.
-- Beim Programmende wird der Ausgangszustand mit einer begrenzten Anzahl Wiederholungen
-  wiederhergestellt (keine Endlosschleife).
-- **Grenze:** Bei Prozessabsturz, erzwungenem `Stop-Process`, Stromausfall oder
-  Windows-Absturz ist keine Wiederherstellungsgarantie möglich — dann ggf. die
-  Rollen-Taste manuell prüfen.
+- Im Produktivbetrieb findet **keine** Scroll-Lock-Zustandsabfrage statt. Fehler werden
+  nur gedrosselt im verschlüsselten Protokoll erfasst und **deaktivieren die Funktion
+  nicht** automatisch.
+- Der automatische Testlauf (`-RunTests`) sendet **niemals** echte Eingaben
+  (vollständige Simulation); echte Tastendrücke gibt es nur im normalen Betrieb und im
+  ausdrücklich bestätigten `-RunScrollLockManualTest`.
+- **Ehrliche Grenze:** Bei `Stop-Process -Force`, Stromausfall oder einem
+  Prozess-/Systemabsturz exakt zwischen den beiden Tastendrücken — ebenso bei einem
+  fehlgeschlagenen zweiten `SendInput` — kann der Scroll-Lock-Zustand verändert
+  zurückbleiben. Das ist bei einem zustandslosen Doppelpuls nicht vollständig
+  ausschließbar und beeinträchtigt die Arbeitszeiterfassung nicht.
 
 > **Wichtig:** Die Nutzung dieser Funktion muss mit den IT- und Sicherheitsvorgaben des
 > jeweiligen Unternehmens abgestimmt sein. Die Anwendung verändert keine
@@ -411,7 +415,8 @@ von ca. 300 ms, nicht blockierend über Timer. Die Zustandsmaschine ist abgesich
 ## CSV-Export
 
 Erweiterte Ansicht bzw. Kontextmenü → **Export**: aktueller Tag, frei wählbarer Zeitraum
-oder alle Daten. CSV-Dateien sind die **einzige unverschlüsselte Ausnahme**. Vor jedem
+oder alle Daten. CSV-Dateien sind neben den optionalen Protokoll-Exporten (siehe Abschnitt
+„Protokoll-Viewer") die **einzigen unverschlüsselten Ausnahmen**. Vor jedem
 Export erscheint die Warnung: „Die exportierte CSV-Datei ist nicht verschlüsselt und kann
 von anderen Personen oder Cloud-Diensten gelesen werden." — der Export erfolgt nur nach
 ausdrücklicher Bestätigung und niemals automatisch. Passwort und Schlüssel werden niemals
@@ -446,7 +451,7 @@ angeboten — stille Korrekturen finden nicht statt.
 
 ## Testmodus
 
-`-RunTests` führt 69 Testfälle (160 Prüfungen) ohne Oberfläche aus, u. a.: Berechnungs-
+`-RunTests` führt 113 Testfälle (397 Prüfungen) ohne Oberfläche aus, u. a.: Berechnungs-
 Engine (Betriebspause inkl. Randwerte 05:59:59/06:00:00/06:44:59/06:45:00, Homeoffice-
 Abzüge, Überlappungen, Überstunden, 09:45/10:00), Verschlüsselung (Roundtrip inkl.
 Unicode und deutscher Prüftexte, falsches Passwort, manipulierter Ciphertext/HMAC/Header,
@@ -468,9 +473,10 @@ gelten daher für 100/125/150 % gleichermaßen — die Fensterhöhe wird zur Lau
 MaxHeight und einen ScrollViewer begrenzt). Exit-Code 0 = alle bestanden.
 
 Die Tests arbeiten ausschließlich in temporären Testordnern und verändern keine echten
-Benutzerdaten. Hinweis: Die Scroll-Lock-Tests 15/16 betätigen die Taste tatsächlich kurz
-und stellen den Ausgangszustand wieder her; die Krypto-Tests dauern wegen der 600.000
-PBKDF2-Iterationen einige Sekunden.
+Benutzerdaten. Hinweis: Die automatisierten Scroll-Lock-Tests senden ausschließlich
+simulierte Eingaben (siehe Abschnitt „Scroll-Lock-Aktivhaltung"); echte Tastendrücke gibt
+es nur im normalen Betrieb oder im gesondert bestätigten `-RunScrollLockManualTest`. Die
+Krypto-Tests dauern wegen der 600.000 PBKDF2-Iterationen einige Sekunden.
 
 ## Zeichenkodierung
 
@@ -490,9 +496,9 @@ und nach der Entschlüsselung als UTF-8 dekodiert (unabhängig von der ANSI-Code
 - Die kompakte Ansicht passt ihre Größe automatisch an; die gespeicherte Breite wird als
   Mindestbreite wieder angewendet (kein freies Aufziehen per Maus).
 - Ein Arbeitstag entspricht einem Kalendertag; um 00:00 Uhr wird automatisch beendet.
-- Bei sehr restriktiven Unternehmensrichtlinien kann `SendInput` unterbunden sein; die
-  Aktivhaltung deaktiviert sich dann mit sichtbarer Warnung, die übrige Anwendung
-  arbeitet normal weiter.
+- Bei sehr restriktiven Unternehmensrichtlinien kann `SendInput` unterbunden sein; ein
+  Fehlschlag wird dann gedrosselt verschlüsselt protokolliert, ohne die Funktion
+  automatisch zu deaktivieren — die übrige Anwendung arbeitet normal weiter.
 - Verschlüsselung ersetzt kein Backup: den Ordner regelmäßig sichern (die Tresordateien
   sind auch im Backup verschlüsselt).
 
@@ -594,24 +600,6 @@ Platzhalter (`••:••`). Beschriftungen bleiben lesbar.
 - Die Absturzwiederherstellung (`CleanShutdown=false`) bleibt unverändert
   erhalten (Homeoffice-Lücke, offene Pausen, offene Sperrintervalle,
   10-Stunden-Grenze, voriger Tracking-Checkpoint).
-
-## Scroll-Lock-Aktivhaltung (finaler Stand)
-
-Die Aktivhaltung ist ein einfacher, vollständig entkoppelter **Doppelpuls**:
-Tastendruck (Down+Up) → ca. 200 ms → Tastendruck (Down+Up), ausgeführt in C#
-auf einem ThreadPool-Thread (nie auf dem WPF-UI-Thread), mit
-Interlocked-Parallelschutz. Im Produktivbetrieb findet **keine**
-Scroll-Lock-Zustandsabfrage statt; Fehler werden nur gedrosselt im
-verschlüsselten Protokoll erfasst und deaktivieren die Funktion nicht.
-Der automatische Testlauf (`-RunTests`) sendet **niemals** echte Eingaben
-(vollständige Simulation); echte Tastendrücke gibt es nur im normalen
-Betrieb und im ausdrücklich bestätigten `-RunScrollLockManualTest`.
-
-**Ehrliche Grenze:** Bei `Stop-Process -Force`, Stromausfall oder einem
-Prozess-/Systemabsturz exakt zwischen den beiden Tastendrücken – ebenso bei
-einem fehlgeschlagenen zweiten SendInput – kann der Scroll-Lock-Zustand
-verändert zurückbleiben. Das ist bei einem zustandslosen Doppelpuls nicht
-vollständig ausschließbar und beeinträchtigt die Arbeitszeiterfassung nicht.
 
 ## Transaktionsdatei `vault.txn`
 
