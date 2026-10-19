@@ -1,0 +1,9 @@
+# Laufzeitdaten / Nutzerdaten
+Data/
+Logs/
+Exports/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
