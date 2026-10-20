@@ -243,6 +243,11 @@ Deshalb verwendet die Anwendung stabile, neutrale Dateinamen ohne Datums-/Uhrzei
   im reinen Betriebsmodus läuft die Zeit anhand der Zeitstempel ohnehin korrekt weiter.
   Es läuft immer nur **ein** Speichervorgang gleichzeitig (keine Überlappung), und ein
   Checkpoint wird übersprungen, wenn in den letzten 30 Sekunden bereits gespeichert wurde.
+  Diese Checkpoints (ebenso das Nachspeichern der Radiolautstärke) aktualisieren **nur die
+  Hauptdatei** — `vault.backup1.azt`/`vault.backup2.azt` rotieren ausschließlich bei
+  fachlichen Speichervorgängen (Moduswechsel, Pause, Windows-Sperre/-Entsperrung,
+  Arbeitsende, Korrekturen, Einstellungen, Schließen). So erzeugt ein Cloud-Ordner wie
+  OneDrive nicht alle 30 Sekunden neue Backup-Versionen bzw. Papierkorbeinträge.
 - Jeder Speichervorgang: im Speicher validieren → Metadaten-Snapshot anlegen → Revision
   erhöhen → verschlüsseln → `vault.pending.azt` schreiben → Pending-Datei erneut lesen,
   HMAC prüfen, entschlüsseln und strukturell validieren → prüfen, ob `vault.azt` seit dem

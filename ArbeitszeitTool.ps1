@@ -1364,10 +1364,18 @@ function Protect-TextToRecovery {
 #  -NoTrackingCheckpoint: WorkData.LastSavedAt (fachlicher Tracking-
 #   Checkpoint fuer die Homeoffice-Wiederherstellung) NICHT aktualisieren.
 #  -Quiet: keine Fehlerdialoge (fuer automatische Wiederholungsversuche).
+#  -NoBackupRotation: reine Zwischenspeicherung (30-Sekunden-Checkpoint,
+#   Radiolautstaerke). Die Hauptdatei wird ohne Beiseitelegen des alten
+#   Standes ersetzt, backup1/backup2 bleiben unveraendert. Backups rotieren
+#   damit nur bei fachlichen Wechseln (Modus, Pause, Sperre, Arbeitsende,
+#   Korrekturen, Schliessen) - in Cloud-Ordnern (OneDrive) entstehen so nicht
+#   alle 30 s neue Backup-Versionen bzw. Papierkorbeintraege. Wurde der Stand
+#   aus Pending/Backup geladen, wird trotzdem regulaer rotiert.
 function Save-Vault {
     param(
         [switch]$NoTrackingCheckpoint,
-        [switch]$Quiet
+        [switch]$Quiet,
+        [switch]$NoBackupRotation
     )
     if ($null -eq $script:App -or $null -eq $script:App.Vault) { return $false }
     if (-not $script:VaultSession.Unlocked) { return $false }
@@ -1514,6 +1522,7 @@ function Save-Vault {
         #    kein gewoehnlicher Speichervorgang. Die alte Hauptdatei gelangt
         #    nur nach vollstaendiger Pruefung in die Backupkette.
         $mainKnownGood = ($mainExists -and $script:App.LoadedFrom -eq 'Haupt')
+        $skipRotation = ($NoBackupRotation -and $mainKnownGood)
         if ($mainExists -and $script:App.LoadedFrom -ne 'Haupt') {
             Write-AppLog -Level 'WARN' -Message ("Wiederherstellungsvorgang: Der aus '{0}' geladene Stand ersetzt die unveränderte bisherige Hauptdatei." -f $script:App.LoadedFrom)
         }
@@ -1538,7 +1547,14 @@ function Save-Vault {
                 if ($script:TestMode -and $script:App.Flags.TestFailReplace) {
                     throw (New-Object System.IO.IOException 'TESTHOOK: File.Replace deaktiviert')
                 }
-                [System.IO.File]::Replace($script:Paths.VaultPending, $script:Paths.VaultFile, $prevAside)
+                if ($skipRotation) {
+                    # Ohne Sicherungsdatei: kein vault.prev.azt, keine
+                    # Backuprotation (Schritt 9 entfaellt mangels prev).
+                    [System.IO.File]::Replace($script:Paths.VaultPending, $script:Paths.VaultFile, [NullString]::Value)
+                }
+                else {
+                    [System.IO.File]::Replace($script:Paths.VaultPending, $script:Paths.VaultFile, $prevAside)
+                }
                 $replaceOk = $true
             }
             catch { $replaceOk = $false }
@@ -1837,10 +1853,10 @@ function New-EmptyWorkData {
 # ohne entsperrten Tresor gibt es nichts zu speichern - die Aenderung im
 # Arbeitsspeicher gilt dann als erfolgreich uebernommen ($true).
 function Save-WorkData {
-    param([switch]$Quiet)
+    param([switch]$Quiet, [switch]$NoBackupRotation)
     if ($null -eq $script:App -or $null -eq $script:App.Data) { return $true }
     if ($null -eq $script:App.Vault -or -not $script:VaultSession.Unlocked) { return $true }
-    return [bool](Save-Vault -Quiet:$Quiet)
+    return [bool](Save-Vault -Quiet:$Quiet -NoBackupRotation:$NoBackupRotation)
 }
 
 #endregion
@@ -8737,6 +8753,8 @@ function Invoke-MainTick {
         #    Homeoffice-Abschnitt oder offenes Sperr-/Pausenintervall. Im
         #    reinen Betriebsmodus laeuft die Zeit anhand der Zeitstempel
         #    weiter; jede fachliche Aenderung speichert ohnehin sofort.
+        #  - ohne Backuprotation: Backups entstehen nur bei fachlichen
+        #    Wechseln, nicht bei jedem Checkpoint (OneDrive-Datenmenge)
         if ($day -and $day.Status -eq 'Aktiv' -and ($script:App.Counters.Tick % 30) -eq 0 -and
             -not $script:App.Flags.SaveInProgress -and
             ($script:App.Counters.Tick - $script:App.Counters.LastSaveTick) -ge 30) {
@@ -8744,7 +8762,7 @@ function Invoke-MainTick {
             $checkpointNeeded = ($comp.RunningMode -eq 'Homeoffice' -or $null -ne $comp.OpenLock -or $null -ne $comp.OpenPause)
             if ($checkpointNeeded) {
                 Update-DayTotals -Day $day | Out-Null
-                Save-WorkData -Quiet | Out-Null
+                Save-WorkData -Quiet -NoBackupRotation | Out-Null
                 $script:App.Counters.LastSaveTick = $script:App.Counters.Tick
             }
         }
@@ -8769,7 +8787,7 @@ function Invoke-MainTick {
         # Radiolautstaerke (kein Tresor-Schreiben pro Pixelbewegung)
         if ($script:App.Radio.VolumeSavePending -and -not $script:App.Flags.SaveInProgress -and ($script:App.Counters.Tick % 10) -eq 0) {
             $script:App.Radio.VolumeSavePending = $false
-            Save-Vault -Quiet | Out-Null
+            Save-Vault -Quiet -NoBackupRotation | Out-Null
         }
     }
     catch {
@@ -10859,6 +10877,13 @@ function Invoke-InternalTests {
         & $assert 'Test 25b: vault.azt vorhanden, keine Pending-Datei zurueckgeblieben' 'True False' ("$(Test-Path -LiteralPath $script:Paths.VaultFile) $(Test-Path -LiteralPath $script:Paths.VaultPending)")
         & $assert 'Test 25c: Backup1 nach zweitem Speichern vorhanden' 'True' ([string](Test-Path -LiteralPath $script:Paths.VaultBackup1))
         & $assert 'Test 25d: Revision monoton steigend' '2' ([string]$script:App.Vault['Revision'])
+        $b1HashBefore = Get-FileSha256Hex -Path $script:Paths.VaultBackup1
+        $b2ExistsBefore = Test-Path -LiteralPath $script:Paths.VaultBackup2
+        $savedNoRot = Save-Vault -NoBackupRotation
+        $b1HashAfter = Get-FileSha256Hex -Path $script:Paths.VaultBackup1
+        & $assert 'Test 25f: Checkpoint ohne Backuprotation - gespeichert, Backup1 unveraendert, kein Backup2, kein prev' "True|True|$b2ExistsBefore|False|3" ("$savedNoRot|$($b1HashBefore -eq $b1HashAfter)|$(Test-Path -LiteralPath $script:Paths.VaultBackup2)|$(Test-Path -LiteralPath $script:Paths.VaultPrev)|$(([long](Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey)['Revision']))")
+        $savedRot = Save-Vault
+        & $assert 'Test 25g: fachliches Speichern rotiert wieder (Backup1 = Stand des Checkpoints)' 'True|False|True' ("$savedRot|$($b1HashAfter -eq (Get-FileSha256Hex -Path $script:Paths.VaultBackup1))|$(Test-Path -LiteralPath $script:Paths.VaultBackup2)")
         $leakFound = $false
         $plainStructureFound = $false
         foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $testRoot 'Data') -File)) {
