@@ -11,6 +11,14 @@ Anwendungsprotokolle, Backups und Wiederherstellungsdaten liegen ausschließlich
 verschlüsselten Datentresor. Die einzigen erlaubten unverschlüsselten Ausnahmen sind bewusst
 erstellte CSV- und Protokoll-Exporte (jeweils nur nach ausdrücklicher Warnung und Bestätigung).
 
+> **Zweck und Haftungsausschluss:** Das Werkzeug ist ausschließlich für die **persönliche**
+> Arbeitszeiterfassung gedacht – als eigene Übersicht für sich selbst. Es ist **kein**
+> rechtsverbindlicher Arbeitszeitnachweis und ersetzt kein betriebliches
+> Zeiterfassungssystem. Die eingebauten Pausen- und Höchstarbeitszeitregeln (siehe
+> „Feste Grenzen") bilden eine bestimmte betriebliche Praxis ab und sind **keine
+> Rechtsberatung**. Die Nutzung erfolgt auf eigene Verantwortung und ohne Gewähr
+> (siehe [Lizenz](#lizenz)).
+
 ## Voraussetzungen
 
 - Windows 10 oder Windows 11
@@ -52,6 +60,7 @@ oder eine für den Benutzer freigegebene Richtlinie).
 ArbeitszeitTool\
     ArbeitszeitTool.ps1        Hauptanwendung (alles in einer Datei, UTF-8 mit BOM)
     README.md                  diese Datei (UTF-8 mit BOM)
+    LICENSE                    MIT-Lizenz
     Data\
         vault.azt              verschlüsselter Datentresor (Arbeitszeiten, Einstellungen, Protokolle)
         vault.backup1.azt      verschlüsseltes Backup (vorletzter gültiger Stand)
@@ -178,8 +187,8 @@ bisherige Tresor mit dem bisherigen Passwort vollständig erhalten.
 
 ## Migration vorhandener Klartextdaten
 
-Beim ersten Start der neuen Version erkennt die Anwendung vorhandene Klartextdateien der
-Vorversion (`worktime.json`, `worktime.backup.json`, `settings.json`, `application.log`,
+Beim ersten Start erkennt die Anwendung vorhandene Klartextdateien einer früheren,
+unverschlüsselten Version (`worktime.json`, `worktime.backup.json`, `settings.json`, `application.log`,
 `worktime.corrupt.*.json`) automatisch:
 
 1. Information über die bevorstehende Migration
@@ -316,7 +325,7 @@ kein Backup — der gesamte Ordner sollte regelmäßig gesichert werden. Cloud-D
 
 ## Verschlüsseltes Protokoll
 
-Es gibt keine `application.log` mehr. Sämtliche Ereignisse (Programmstart/-ende,
+Es gibt keine unverschlüsselte Protokolldatei. Sämtliche Ereignisse (Programmstart/-ende,
 Tagesstart/-abschluss, Moduswechsel, Sperren/Entsperren, Pausen, Korrekturen, Warnungen,
 Fehler, Speichervorgänge, Migrationen, Passwortänderungen) werden **im Tresor**
 gespeichert. Passwörter, Schlüssel, Salts oder Ciphertexte erscheinen niemals im
@@ -366,7 +375,10 @@ nachträglich korrigiert werden („Tag bearbeiten").
 
 **Feste Grenzen** (nicht über die Einstellungen änderbar): Warnung ab 09:45,
 automatischer Stopp bei exakt 10:00 Netto-Stunden, Betriebspause 00:45 ab exakt 06:00
-Betriebszeit. Die **Regelarbeitszeit** ist einstellbar, muss größer als 00:00 sein und
+Betriebszeit. Diese Werte sind im Skript zentral als Konstanten hinterlegt
+(`$script:Const`) und entsprechen nicht automatisch dem Arbeitszeitgesetz (dort u. a.
+30 Minuten Pause bei mehr als 6 Stunden und 45 Minuten bei mehr als 9 Stunden) oder
+einem Tarif-/Betriebsvertrag — bitte für den eigenen Fall prüfen. Die **Regelarbeitszeit** ist einstellbar, muss größer als 00:00 sein und
 darf höchstens 10:00 betragen; ungültige Eingaben werden abgelehnt und der bisherige
 Wert bleibt erhalten.
 
@@ -396,6 +408,12 @@ Netto-Arbeitszeit des Tages. Überlappen sich im Homeoffice eine manuelle Pause 
 Windows-Sperre, wird der Zeitraum nur **einmal** abgezogen.
 
 ## Scroll-Lock-Aktivhaltung
+
+**Hintergrund:** Die Funktion entstand für einen Arbeitsplatz, an dem parallel mit zwei
+Systemen gearbeitet wurde: Während der Arbeit am zweiten System sollte sich der erste PC
+nicht automatisch sperren. Sie ist **standardmäßig deaktiviert** und sollte nur
+eingeschaltet werden, wenn genau so ein Bedarf besteht — sie ist nicht dafür gedacht,
+Anwesenheit vorzutäuschen.
 
 Optional (**standardmäßig deaktiviert**) betätigt die Anwendung bei laufendem Arbeitstag
 alle 60 Sekunden die Rollen-Taste (Scroll Lock) über einen einfachen, vollständig
@@ -458,7 +476,7 @@ angeboten — stille Korrekturen finden nicht statt.
 
 ## Testmodus
 
-`-RunTests` führt 113 Testfälle (397 Prüfungen) ohne Oberfläche aus, u. a.: Berechnungs-
+`-RunTests` führt über 110 Testfälle mit rund 400 Einzelprüfungen ohne Oberfläche aus, u. a.: Berechnungs-
 Engine (Betriebspause inkl. Randwerte 05:59:59/06:00:00/06:44:59/06:45:00, Homeoffice-
 Abzüge, Überlappungen, Überstunden, 09:45/10:00), Verschlüsselung (Roundtrip inkl.
 Unicode und deutscher Prüftexte, falsches Passwort, manipulierter Ciphertext/HMAC/Header,
@@ -509,126 +527,128 @@ und nach der Entschlüsselung als UTF-8 dekodiert (unabhängig von der ANSI-Code
 - Verschlüsselung ersetzt kein Backup: den Ordner regelmäßig sichern (die Tresordateien
   sind auch im Backup verschlüsselt).
 
-## Hinweis zu betrieblichen IT- und Sicherheitsvorgaben
+## Internetradio, Netzwerk und Datenschutz
 
-Dieses Werkzeug dient der persönlichen Arbeitszeiterfassung. Der Einsatz auf
-Firmengeräten — insbesondere die Scroll-Lock-Aktivhaltung — sollte vorab mit den
-geltenden IT-, Sicherheits- und Arbeitszeitregelungen des Unternehmens abgestimmt
-werden. Die Anwendung sendet keine Daten nach außen und protokolliert keine Inhalte
-anderer Anwendungen.
+Das optionale **Internetradio** ist die einzige ausgehende Netzwerkfunktion der
+Anwendung. Für alle Arbeitszeitdaten gilt weiterhin „keine Cloud":
 
+- **Arbeitszeitdaten, Einstellungen und Protokolle werden nicht übertragen**; sie liegen
+  ausschließlich im lokalen, verschlüsselten Datentresor.
+- **Es sind keine Sender voreingestellt.** Eigene Sender werden unter
+  Einstellungen → Internetradio angelegt; solange keine Sender eingetragen sind, ist die
+  Wiedergabe deaktiviert.
+- Abgerufen wird **ausschließlich der ausgewählte Radiostream** direkt vom
+  Streamanbieter (ein zentraler `System.Windows.Media.MediaPlayer`, keine externen Player
+  oder Bibliotheken). Der Anbieter sieht dabei die technisch üblichen Verbindungsdaten
+  (IP-Adresse, Zeitpunkt, Playeranfrage).
+- Unternehmensproxy, Firewall oder Virenschutz können den Stream blockieren – das löst
+  nur einen neutralen Radiofehler aus und beeinträchtigt die Arbeitszeiterfassung nicht.
+- **Ohne gestartetes Radio findet keine Streamverbindung statt.** Beim Programmstart
+  erfolgt standardmäßig keine automatische Wiedergabe.
 
----
+### Bedienung des Radios
 
-## Internetradio, Netzwerk und Datenschutz (neu)
-
-Die Anwendung besitzt mit dem optionalen **Internetradio** erstmals eine
-ausgehende Netzwerkfunktion. Die Aussage „keine Cloud" gilt weiterhin für
-alle Arbeitszeitdaten – ergänzend gilt eindeutig:
-
-- **Arbeitszeitdaten werden nicht übertragen.** Auch Einstellungen und
-  Protokolle werden nicht übertragen; sie liegen ausschließlich im lokalen,
-  verschlüsselten Datentresor.
-- Es wird **ausschließlich der ausgewählte Radiostream** direkt vom
-  Streamanbieter abgerufen (ein zentraler `System.Windows.Media.MediaPlayer`,
-  keine externen Player oder Bibliotheken).
-- Der Streamanbieter sieht dabei technisch übliche Verbindungsdaten:
-  IP-Adresse, Zeitpunkt und die Playeranfrage.
-- Unternehmensproxy, Firewall oder Virenschutz können den Stream blockieren –
-  das löst nur einen neutralen Radiofehler aus und beeinträchtigt die
-  Arbeitszeiterfassung nicht.
-- **Ohne gestartetes Radio findet aufgrund dieser Funktion keine
-  Streamverbindung statt.** Beim Programmstart erfolgt standardmäßig keine
-  automatische Wiedergabe.
-- Die Nutzung von Internetradio und Scroll-Lock-Aktivhaltung muss mit den
-  betrieblichen Vorgaben vereinbar sein.
-
-### Bedienung
-
-- **Kompakte Ansicht:** Play-/Pause-Symbol und Lautsprechersymbol oben rechts;
-  das Lautsprechersymbol öffnet ein kleines Lautstärke-Popup (0–100 %),
-  Mausrad über dem Symbol ändert die Lautstärke ebenfalls.
-- **Erweiterte Ansicht:** Sender-Auswahl, Play/Pause, Lautstärkeregler und
-  Statusanzeige (Gestoppt / Verbinden / Wiedergabe / Puffern / Pausiert / Fehler).
-- **Einstellungen → Internetradio:** Sender anzeigen, hinzufügen, bearbeiten,
-  entfernen, verschieben, Standardsender festlegen; Lautstärke; „nach dem
-  Entsperren automatisch fortsetzen"; „Wiedergabestatus beim Beenden merken".
+- **Kompakte Ansicht:** Play-/Pause-Symbol und Lautsprechersymbol oben rechts; das
+  Lautsprechersymbol öffnet ein kleines Lautstärke-Popup (0–100 %), auch das Mausrad über
+  dem Symbol ändert die Lautstärke.
+- **Erweiterte Ansicht:** Senderauswahl, Play/Pause, Lautstärkeregler und Statusanzeige
+  (Gestoppt / Verbinden / Wiedergabe / Puffern / Pausiert / Fehler).
+- **Einstellungen → Internetradio:** Sender hinzufügen, bearbeiten, entfernen, verschieben,
+  Standardsender festlegen; Lautstärke; „nach dem Entsperren automatisch fortsetzen";
+  „Wiedergabestatus beim Beenden merken".
 - **Tray-/Kontextmenü:** Radio starten/pausieren und Senderwahl.
-- Die Senderliste wird **ausschließlich verschlüsselt im Tresor** gespeichert
-  (keine separate Klartextdatei). Zulässig sind nur absolute http-/https-URLs
-  ohne eingebettete Zugangsdaten; Hinweis: http-Streams sind nicht
-  transportverschlüsselt. Stream-URLs werden nicht protokolliert (nur
-  Sendername/-ID und neutrale Fehlermeldungen).
-- Bei Bildschirmsperre pausiert das Radio; nach dem Entsperren wird es nur
-  fortgesetzt, wenn es unmittelbar vor dem Sperren lief und die Option aktiv
-  ist. „Pause" bei Livestreams bedeutet: Beim erneuten Start wird der Stream
-  neu geöffnet und läuft an der aktuellen Live-Position (kein alter Puffer).
+- Die Senderliste wird **ausschließlich verschlüsselt im Tresor** gespeichert. Zulässig
+  sind nur absolute http-/https-URLs ohne eingebettete Zugangsdaten (http-Streams sind
+  nicht transportverschlüsselt). Stream-URLs werden nicht protokolliert, nur Sendername/-ID
+  und neutrale Fehlermeldungen.
+- Bei Bildschirmsperre pausiert das Radio; nach dem Entsperren wird es nur fortgesetzt,
+  wenn es unmittelbar vor dem Sperren lief und die Option aktiv ist. „Pause" bedeutet bei
+  Livestreams: Beim erneuten Start wird der Stream neu geöffnet und läuft an der aktuellen
+  Live-Position weiter.
 
-## Sichtschutz für Pausen- und Sperrzeiten (neu)
+## Sichtschutz für Pausen- und Sperrzeiten
 
-In der **erweiterten Ansicht** werden die konkreten Pausen- und
-Sperrzeitwerte (Summen, Intervall-Beginn/-Ende/-Dauer) standardmäßig
-**verborgen** dargestellt: die Tabelle „Pausen und Sperrzeiten" wird
-unscharf gezeichnet (WPF-BlurEffect), die Summenwerte zeigen neutrale
+In der **erweiterten Ansicht** werden die konkreten Pausen- und Sperrzeitwerte (Summen,
+Intervall-Beginn/-Ende/-Dauer) standardmäßig **verborgen**: Die Tabelle „Pausen und
+Sperrzeiten" wird unscharf gezeichnet (WPF-BlurEffect), die Summen zeigen neutrale
 Platzhalter (`••:••`). Beschriftungen bleiben lesbar.
 
-- Das **Auge-Symbol** neben „Pausen und Sperrzeiten" blendet die Werte
-  bewusst ein bzw. wieder aus (nur Darstellung – keine Daten- oder
-  Speicheränderung, keine Neuberechnung, keine Größenänderung des Fensters).
-- Automatisch **wieder verborgen** wird bei: Windows-Sperre, Schließen oder
-  Minimieren der erweiterten Ansicht, Ausblenden in den Infobereich,
-  Tagesabschluss, Programmende sowie 60 Sekunden nach Fokusverlust.
-- Nach dem Entsperren von Windows bleiben die Werte verborgen, bis das Auge
-  erneut angeklickt wird. Der Zustand „gerade sichtbar" wird niemals
+- Das **Auge-Symbol** neben „Pausen und Sperrzeiten" blendet die Werte bewusst ein bzw.
+  wieder aus (nur Darstellung – keine Daten- oder Speicheränderung).
+- Automatisch **wieder verborgen** wird bei: Windows-Sperre, Schließen oder Minimieren
+  der erweiterten Ansicht, Ausblenden in den Infobereich, Tagesabschluss, Programmende
+  sowie 60 Sekunden nach Fokusverlust. Der Zustand „sichtbar" wird nie
   sitzungsübergreifend gespeichert.
 - Verborgene Werte werden auch nicht über Tooltips, Auswahl/Fokus oder
-  AutomationProperties (Screenreader) offengelegt; die Berechnung verwendet
-  die Werte intern unverändert weiter.
+  AutomationProperties (Screenreader) offengelegt.
 
-## Verhalten bei regulärem Neustart (präzisiert)
+Das Ansicht-Preset **„Minimum"** der kompakten Ansicht (nur Uhrzeit, Datum,
+Kalenderwoche und Status) verbirgt Werte ebenfalls nur in der Oberfläche — es ist keine
+Verschlüsselungs- oder Zugriffssperre.
 
-- „**Nur Anwendung schließen (Arbeitstag bleibt offen)**": Der laufende
-  Abschnitt bleibt vollständig unverändert (gleiche Segment-ID, Start
-  unverändert, kein Ende). Vor dem Schließen wird `CleanShutdown=true`
-  gesetzt und der Tresor final gespeichert – schlägt das fehl, kann
-  wiederholt oder das Schließen abgebrochen werden.
-- „**Fortsetzen**" nach einem regulären Neustart verwendet denselben Tag und
-  denselben laufenden Abschnitt weiter – im **Betrieb** zählt die Zeit des
-  geplanten Neustarts normal als Arbeitszeit; es entsteht **kein** neuer
-  Timeslot. Im **Homeoffice** wird nur die nicht beobachtete Zeitlücke
-  behandelt (Arbeitszeit / Pause / Sperrzeit / Aufteilen / ausdrückliches
-  Abschnittsende / Bearbeiten) – auch hier entsteht nie automatisch ein
-  neuer Abschnitt.
-- Ein neuer Abschnitt entsteht ausschließlich über den ausdrücklichen
-  „**Modus wechseln**"-Weg (auch direkt im Fortsetzen-Dialog wählbar).
-- Schlägt die Speicherung der neuen Sitzungsmarkierung beim Start fehl,
-  startet die Anwendung nicht produktiv, sondern meldet den Fehler und
-  beendet sich kontrolliert.
-- Die Absturzwiederherstellung (`CleanShutdown=false`) bleibt unverändert
-  erhalten (Homeoffice-Lücke, offene Pausen, offene Sperrintervalle,
-  10-Stunden-Grenze, voriger Tracking-Checkpoint).
+## Schließen, Neustart und Fortsetzen
+
+- **„Nur Anwendung schließen (Arbeitstag bleibt offen)":** Der laufende Abschnitt bleibt
+  vollständig unverändert (gleiche Segment-ID, unveränderter Start, kein Ende). Vor dem
+  Schließen wird `CleanShutdown=true` gesetzt und der Tresor final gespeichert – schlägt
+  das fehl, kann wiederholt oder das Schließen abgebrochen werden.
+- **„Fortsetzen"** nach einem regulären Neustart verwendet denselben Tag und denselben
+  laufenden Abschnitt weiter. Im **Betrieb** zählt die Zeit des Neustarts normal als
+  Arbeitszeit; es entsteht **kein** neuer Abschnitt. Im **Homeoffice** wird nur die nicht
+  beobachtete Lücke behandelt (Arbeitszeit / Pause / Sperrzeit / Aufteilen /
+  ausdrückliches Abschnittsende / Bearbeiten).
+- Ein neuer Abschnitt entsteht ausschließlich über „**Modus wechseln**" (auch direkt im
+  Fortsetzen-Dialog wählbar).
+- Schlägt das Speichern der neuen Sitzungsmarkierung beim Start fehl, startet die
+  Anwendung nicht produktiv, sondern meldet den Fehler und beendet sich kontrolliert.
+- Die Absturzwiederherstellung (`CleanShutdown=false`) bleibt davon unberührt
+  (Homeoffice-Lücke, offene Pausen, offene Sperrintervalle, 10-Stunden-Grenze, voriger
+  Tracking-Checkpoint).
+
+## Einstellungen und Infobereich
+
+- **Einstellungen mit Tabs:** Allgemein / Kompakte Ansicht / Aktivhaltung /
+  Internetradio, feste Ausgangsgröße (780×620), begrenzt auf den Arbeitsbereich des
+  Monitors. Speichern/Abbrechen bleiben immer sichtbar; erst „Speichern" übernimmt die
+  Änderungen aller Tabs, „Abbrechen" verwirft sie. Sender werden links in einer
+  scrollenden Liste verwaltet und rechts über ein gemeinsames Name/URL-Feldpaar bearbeitet
+  („Übernehmen").
+- **In den Infobereich ausblenden:** Die Anwendung läuft unsichtbar weiter (Timer,
+  Erfassung, Radio, Aktivhaltung, Sperr-/Entsperrverarbeitung). Wieder angezeigt wird sie
+  per Doppelklick auf das Tray-Symbol oder über dessen Menü. Ist kein Tray-Symbol
+  verfügbar, wird stattdessen über die Taskleiste minimiert.
+
+## Protokoll-Viewer
+
+Unter **Einstellungen → Allgemein → Sicherheit (Datentresor)** öffnet „Verschlüsselte
+Protokolle anzeigen..." einen schreibgeschützten Viewer: aktuelle und archivierte
+Einträge gemeinsam (neueste zuerst, zunächst 500, „Weitere 500 anzeigen"), mit Suchfeld
+und INFO/WARN/ERROR-Filtern. Die Daten werden ausschließlich aus dem entschlüsselten
+Tresor im Arbeitsspeicher gelesen – es entsteht keine temporäre Klartextdatei, und der
+Viewer verändert keine Protokolle. Optional können die angezeigten Einträge nach
+ausdrücklicher Warnung **unverschlüsselt** in den Ordner `Exports` exportiert werden
+(UTF-8 mit BOM; vollständige Internetadressen wie Stream-URLs werden dabei entfernt).
 
 ## Transaktionsdatei `vault.txn`
 
-`vault.txn` enthält nur noch neutrale logische Bezeichnungen
-(`Haupt`, `Backup1`, `Backup2`) – keine absoluten Pfade mehr, die
-Benutzername oder Cloud-Ordnernamen offenlegen könnten. Beim Einlesen werden
-ausschließlich die intern fest bekannten Pfade verwendet.
+`vault.txn` enthält nur neutrale logische Bezeichnungen (`Haupt`, `Backup1`, `Backup2`) –
+keine absoluten Pfade, die Benutzernamen oder Cloud-Ordnernamen offenlegen könnten. Beim
+Einlesen werden ausschließlich die intern fest bekannten Pfade verwendet.
 
-## Bedienoberflaeche (Aktualisierung)
+## Hinweis zu betrieblichen IT- und Sicherheitsvorgaben
 
-- **Einstellungen mit Tabs:** Das Einstellungsfenster ist in vier Bereiche gegliedert (Allgemein / Kompakte Ansicht / Aktivhaltung / Internetradio) mit fester Ausgangsgroesse (780x620), begrenzt auf den Monitor-Arbeitsbereich. Speichern/Abbrechen bleiben immer sichtbar; erst "Speichern" uebernimmt Aenderungen aus allen Tabs, "Abbrechen" verwirft sie. Die Sender werden links in einer scrollenden Liste verwaltet und rechts ueber ein gemeinsames Name/URL-Feldpaar bearbeitet ("Uebernehmen").
-- **In den Infobereich ausblenden:** Das Ausblenden beendet die Anwendung nicht mehr (nichtmodale Fensterlebensdauer). Timer, Arbeitszeiterfassung, Radio, Aktivhaltung und Lock-/Unlock-Verarbeitung laufen unsichtbar weiter; die Wiederanzeige erfolgt per Tray-Doppelklick oder Tray-Menue. Ist kein Tray-Symbol verfuegbar, wird stattdessen ueber die Taskleiste minimiert.
-- **Radio-Senderauswahl:** Die Sender-ComboBox der erweiterten Ansicht verwendet jetzt das dunkle Anwendungsthema (inkl. Dropdown, max. Hoehe 280, Tooltip fuer lange Sendernamen).
-## Protokoll-Viewer (neu)
+Der Einsatz auf Firmengeräten — insbesondere von Scroll-Lock-Aktivhaltung und
+Internetradio — sollte vorab mit den geltenden IT-, Sicherheits- und
+Arbeitszeitregelungen abgestimmt werden. Die Anwendung sendet keine Arbeitszeitdaten nach
+außen und protokolliert keine Inhalte anderer Anwendungen.
 
-Unter **Einstellungen -> Allgemein -> Sicherheit (Datentresor)** oeffnet
-"Verschluesselte Protokolle anzeigen..." einen schreibgeschuetzten Viewer:
-aktuelle und archivierte Eintraege gemeinsam (neueste zuerst, zunaechst 500,
-"Weitere 500 anzeigen"), mit Suchfeld und INFO/WARN/ERROR-Filtern. Die Daten
-werden ausschliesslich aus dem entschluesselten Tresor im Arbeitsspeicher
-gelesen - es entsteht keine temporaere Klartextdatei, und der Viewer
-veraendert keine Protokolle. Optional koennen die aktuell angezeigten
-Eintraege nach ausdruecklicher Warnung UNVERSCHLUESSELT in den Ordner
-"Exports" exportiert werden (UTF-8 mit BOM; vollstaendige Internetadressen
-wie Stream-URLs werden dabei entfernt). Die Loeschfunktion bleibt unveraendert.
+## Entstehung
+
+Das ArbeitszeitTool wurde gemeinsam mit dem KI-Assistenten Claude (Anthropic)
+entwickelt.
+
+## Lizenz
+
+Veröffentlicht unter der [MIT-Lizenz](LICENSE): Nutzung, Veränderung und Weitergabe sind
+frei erlaubt, solange der Lizenz- und Copyright-Hinweis erhalten bleibt. Die Software wird
+ohne jegliche Gewährleistung bereitgestellt.
