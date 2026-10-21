@@ -1903,7 +1903,7 @@ function Get-DefaultSettings {
         # Internetradio (optional; Streams werden NUR bei aktiver Wiedergabe
         # abgerufen - beim Programmstart keine automatische Wiedergabe)
         RadioStations              = (Get-DefaultRadioStations)
-        RadioSelectedStationId     = 'bob-live'
+        RadioSelectedStationId     = $null
         RadioVolume                = 20     # 0..100 (fuer MediaPlayer auf 0.0..1.0 umgerechnet)
         RadioResumeAfterUnlock     = $true
         RadioRememberPlaybackState = $false
@@ -4121,7 +4121,10 @@ $script:CompactXaml = @'
             BorderBrush="#66FFFFFF" Background="#F2131820" Padding="12,4,12,6">
         <StackPanel>
             <Grid>
-                <TextBlock x:Name="HeaderLine" FontFamily="Consolas" FontSize="13" Foreground="#FFAAB8C6" Text="--:--:--" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="30,0,30,0"/>
+                <!-- Seitenabstand = Breite von PnlRadio (24+2+24) + 6 Abstand, beidseitig
+                     fuer die Zentrierung. Sonst ueberdeckt der Play-Button die Kopfzeile,
+                     sobald die Statuszeile schmaler ist (z. B. Preset "Minimum"). -->
+                <TextBlock x:Name="HeaderLine" FontFamily="Consolas" FontSize="13" Foreground="#FFAAB8C6" Text="--:--:--" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="56,0,56,0"/>
                 <StackPanel x:Name="PnlRadio" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
                     <Button x:Name="BtnRadioPlay" Width="24" Height="18" MinWidth="0" Padding="0" Margin="0"
                             Background="Transparent" BorderThickness="0" ToolTip="Radio starten">
@@ -8976,14 +8979,10 @@ $script:RadioGlyphs = @{
     Pause = 'M 2,1 L 5.5,1 L 5.5,13 L 2,13 Z M 8.5,1 L 12,1 L 12,13 L 8.5,13 Z'
 }
 
-# Initiale Standard-Senderliste (Streamadressen koennen sich aendern; ein
-# nicht erreichbarer Sender loest nur einen Radiofehler aus)
+# Initiale Senderliste: bewusst LEER - es werden keine Sender voreingestellt.
+# Eigene Sender werden in den Einstellungen (Tab Internetradio) angelegt.
 function Get-DefaultRadioStations {
     $list = New-Object System.Collections.ArrayList
-    [void]$list.Add([ordered]@{ Id = 'bob-live'; Name = 'RADIO BOB!'; Url = 'http://streams.radiobob.de/bob-live/mp3-192/mediaplayer' })
-    [void]$list.Add([ordered]@{ Id = 'bob-mittelalter'; Name = 'RADIO BOB! Mittelalter'; Url = 'http://streams.radiobob.de/mittelalter/mp3-192/streams.radiobob.de/' })
-    [void]$list.Add([ordered]@{ Id = 'bob-gothic'; Name = 'RADIO BOB! Gothic'; Url = 'http://streams.radiobob.de/gothic/mp3-192/streams.radiobob.de/' })
-    [void]$list.Add([ordered]@{ Id = 'bob-national'; Name = 'RADIO BOB! National'; Url = 'http://streams.radiobob.de/bob-national/mp3-192/streams.radiobob.de/' })
     return ,$list
 }
 
@@ -11608,7 +11607,7 @@ function Invoke-InternalTests {
 
         # --- Test 77: Radioeinstellungen verschluesselt speichern/laden ---
         $legacySettings77 = Get-ValidatedSettings -Loaded ([ordered]@{ RegularTime = '07:00' })
-        & $assert 'Test 77a: Tresore ohne Radioeinstellungen erhalten Standardwerte (keine Schemaerhoehung)' '4|20|True|False' ("$(@($legacySettings77['RadioStations']).Count)|$($legacySettings77['RadioVolume'])|$($legacySettings77['RadioResumeAfterUnlock'])|$($legacySettings77['RadioRememberPlaybackState'])")
+        & $assert 'Test 77a: Tresore ohne Radioeinstellungen erhalten Standardwerte (keine Schemaerhoehung, keine voreingestellten Sender)' '0|20|True|False' ("$(@($legacySettings77['RadioStations']).Count)|$($legacySettings77['RadioVolume'])|$($legacySettings77['RadioResumeAfterUnlock'])|$($legacySettings77['RadioRememberPlaybackState'])")
         $customStations = New-Object System.Collections.ArrayList
         [void]$customStations.Add([ordered]@{ Id = 'eigener'; Name = 'Mein Sender äöü'; Url = 'http://radio.example.de/stream' })
         $script:App.Settings['RadioStations'] = $customStations
