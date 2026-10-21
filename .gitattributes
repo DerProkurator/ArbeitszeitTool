@@ -1,0 +1,3 @@
+# Windows PowerShell 5.1 erwartet CRLF (siehe Test 101) - unabhaengig von core.autocrlf
+*.ps1 text eol=crlf
+*.md  text eol=crlf

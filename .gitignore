@@ -1,0 +1,12 @@
+# Laufzeitdaten / Nutzerdaten
+Data/
+Logs/
+Exports/
+Recovery/
+*.azt
+vault.txn
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
