@@ -3132,16 +3132,72 @@ function Close-DayPartsAt {
     return ''
 }
 
+# Vorschlag fuer das tatsaechliche Ende eines nicht ordnungsgemaess oder
+# automatisch (Tageswechsel um 00:00) beendeten Tages. Statt Mitternacht wird
+# der letzte belegbare Arbeitszeitpunkt vorgeschlagen:
+#  1. spaetestes Abschnittsende (laufende Abschnitte bis $Cutoff, hoechstens
+#     bis zum gespeicherten EndedAt)
+#  2. frueher, falls die 10-Stunden-Grenze vorher erreicht wurde
+#  3. reicht eine Sperre oder Pause bis an diesen Zeitpunkt heran (z. B. PC
+#     gesperrt und bis Mitternacht weitergelaufen), deren Beginn - direkt
+#     aneinander anschliessende Intervalle werden dabei verkettet
+# Nie vor dem Arbeitsbeginn. Reine, nebenwirkungsfreie Funktion.
+function Get-AutoEndSuggestedEnd {
+    param([Parameter(Mandatory)]$Day, [Parameter(Mandatory)][datetime]$Cutoff)
+    $limit = $Cutoff
+    if ($Day.EndedAt) {
+        $ended = $null
+        try { $ended = ConvertFrom-DateTimeString $Day.EndedAt } catch { }
+        if ($null -ne $ended -and $ended -lt $limit) { $limit = $ended }
+    }
+    $beginn = $null
+    $workEnd = $null
+    foreach ($seg in @(Get-ParsedSegments -Day $Day -Now $limit)) {
+        if ($null -eq $beginn -or $seg.Start -lt $beginn) { $beginn = $seg.Start }
+        $e = $seg.End
+        if ($e -gt $limit) { $e = $limit }
+        if ($null -eq $workEnd -or $e -gt $workEnd) { $workEnd = $e }
+    }
+    if ($null -eq $workEnd) { return $limit }
+    $tenAt = Get-DayTenHourStopTime -Day $Day -Cutoff $workEnd
+    if ($null -ne $tenAt -and $tenAt -lt $workEnd) { $workEnd = $tenAt }
+    $intervals = New-Object System.Collections.ArrayList
+    foreach ($listName in @('ManualPauses', 'LockIntervals')) {
+        foreach ($iv in @($Day[$listName])) {
+            if ($null -eq $iv) { continue }
+            $s = $null
+            try { $s = ConvertFrom-DateTimeString $iv.Start } catch { }
+            if ($null -eq $s) { continue }
+            $e = $limit
+            if ($iv.End) { try { $e = ConvertFrom-DateTimeString $iv.End } catch { $e = $limit } }
+            if ($null -eq $e) { $e = $limit }
+            [void]$intervals.Add(@{ Start = $s; End = $e })
+        }
+    }
+    $changed = $true
+    while ($changed) {
+        $changed = $false
+        foreach ($iv in @($intervals)) {
+            if ($iv.Start -lt $workEnd -and $iv.End -ge $workEnd -and $iv.Start -ge $beginn) {
+                $workEnd = $iv.Start
+                $changed = $true
+            }
+        }
+    }
+    return $workEnd
+}
+
 # Bestaetigung der 10-Stunden-Wertung eines nicht ordnungsgemaess beendeten
 # Tages: Das Ende wird exakt auf den Zeitpunkt gesetzt, an dem die
 # Netto-Arbeitszeit 10:00 erreicht hat (manuelle Pausen, Sperrintervalle und
 # die automatische Betriebspause sind in der Berechnung enthalten). Wurde die
-# Grenze nie erreicht, wird das bisher angenommene Ende (Mitternacht bzw.
-# letztes Segmentende) bestaetigt. Liefert '' oder eine Fehlermeldung; die
+# Grenze nie erreicht, wird das bisher angenommene Ende bestaetigt: der im
+# Dialog angezeigte Vorschlag (-AssumedEnd, siehe Get-AutoEndSuggestedEnd),
+# ohne Vorschlag Mitternacht bzw. das gespeicherte Ende. Liefert '' oder eine Fehlermeldung; die
 # Aenderung wird genau EINMAL gespeichert und bei Fehlern vollstaendig
 # zurueckgenommen (einschliesslich Review-Status).
 function Complete-AutoEndTenHours {
-    param([Parameter(Mandatory)]$Day, [datetime]$Now = (Get-Date))
+    param([Parameter(Mandatory)]$Day, [datetime]$Now = (Get-Date), $AssumedEnd = $null)
     $dayDate = [datetime]::ParseExact([string]$Day.Date, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
     $cutoff = $dayDate.Date.AddDays(1)
     if ($cutoff -gt $Now) { $cutoff = $Now }
@@ -3158,7 +3214,8 @@ function Complete-AutoEndTenHours {
     $tenReached = ($null -ne $stopTime)
     if (-not $tenReached) {
         # 10:00 wurde nicht erreicht: das bisher angenommene Ende bestaetigen
-        if ($Day.EndedAt) { try { $stopTime = ConvertFrom-DateTimeString $Day.EndedAt } catch { } }
+        if ($AssumedEnd -is [datetime]) { $stopTime = $AssumedEnd }
+        elseif ($Day.EndedAt) { try { $stopTime = ConvertFrom-DateTimeString $Day.EndedAt } catch { } }
         if ($null -eq $stopTime) { $stopTime = $cutoff }
     }
     $closeError = Close-DayPartsAt -Day $Day -End $stopTime
@@ -4870,19 +4927,17 @@ function Invoke-AutoEndReviewFlow {
         $cutoff = $dayDate.Date.AddDays(1)
         if ($cutoff -gt $now) { $cutoff = $now }
         $comp = Get-DayComputation -Day $Day -Now $cutoff
-        $assumedEnd = $null
-        if ($Day.EndedAt) { try { $assumedEnd = ConvertFrom-DateTimeString $Day.EndedAt } catch { } }
-        if ($null -eq $assumedEnd) {
-            $tenAt = Get-DayTenHourStopTime -Day $Day -Cutoff $cutoff
-            if ($null -ne $tenAt) { $assumedEnd = $tenAt } else { $assumedEnd = $cutoff }
-        }
+        # Vorschlag = letzter belegbarer Arbeitszeitpunkt (10:00-Grenze,
+        # Abschnittsende oder Beginn einer bis zum Ende reichenden Sperre/
+        # Pause) - nicht pauschal 00:00 des Folgetages nach dem Tageswechsel.
+        $assumedEnd = Get-AutoEndSuggestedEnd -Day $Day -Cutoff $cutoff
         $tenReached = ($comp.Netto.TotalMinutes -ge ([int]$Day.MaxMinutes - 0.02))
         $choice = $null
         if ($null -ne $ChoiceResolver) { $choice = & $ChoiceResolver $Day $comp $assumedEnd }
         else { $choice = Show-AutoEndReviewDialog -Day $Day -Comp $comp -AssumedEnd $assumedEnd -TenReached $tenReached }
         switch ([string]$choice.Choice) {
             'Bestaetigen' {
-                $err = Complete-AutoEndTenHours -Day $Day -Now $now
+                $err = Complete-AutoEndTenHours -Day $Day -Now $now -AssumedEnd $assumedEnd
                 if ($err -eq '') { return $true }
                 Show-Warning -Message $err
             }
@@ -12421,6 +12476,29 @@ function Invoke-InternalTests {
         Add-TestSegment -Day $d107b -Mode 'Betrieb' -StartText '22:00' | Out-Null  # nur 2:00 bis Mitternacht
         $err107b = Complete-AutoEndTenHours -Day $d107b
         & $assert 'Test 107b: bei weniger als zehn Stunden wird das angenommene Ende als Grund gespeichert' '|Automatisch angenommenes Ende bestätigt|False' ("$err107b|$($d107b['EndReason'])|$($d107b['MaxReached'])")
+
+        # --- Test 107c-f: Endvorschlag nach automatischem Tageswechsel (00:00) -
+        # Homeoffice, PC ab 16:30 gesperrt und bis Mitternacht weitergelaufen
+        $d107c = New-TestDay -DateText $yesterdayText
+        Add-TestSegment -Day $d107c -Mode 'Homeoffice' -StartText '08:00' | Out-Null
+        Add-TestInterval -Day $d107c -ListName 'LockIntervals' -StartText '16:30' | Out-Null
+        Invoke-MidnightRolloverIfNeeded -Day $d107c | Out-Null
+        $midnight107 = (Get-DayDateTime -DayDate $yesterdayText -TimeText '00:00').AddDays(1)
+        $sugg107c = Get-AutoEndSuggestedEnd -Day $d107c -Cutoff $midnight107
+        & $assert 'Test 107c: Tageswechsel beendet um 00:00, vorgeschlagen wird aber der Beginn der letzten Sperre (16:30)' "$(ConvertTo-DateTimeString $midnight107)|$yesterdayText 16:30:00" ("$($d107c['EndedAt'])|$(ConvertTo-DateTimeString $sugg107c)")
+        $flow107c = Invoke-AutoEndReviewFlow -Day $d107c -ChoiceResolver { param($d, $c, $a) @{ Choice = 'Bestaetigen'; EndTime = $null } }
+        $comp107c = Get-DayComputation -Day $d107c -Now (ConvertFrom-DateTimeString $d107c.EndedAt)
+        & $assert 'Test 107d: Bestaetigen uebernimmt den Vorschlag (Ende 16:30, Sperre bis 00:00 entfernt, Netto 08:30)' "True|$yesterdayText 16:30:00|0|08:30" ("$flow107c|$($d107c['EndedAt'])|$(@($d107c['LockIntervals']).Count)|$(Format-Duration $comp107c.Netto)")
+        # Betrieb, 10:00 vor Mitternacht erreicht: Vorschlag = 16:45
+        $d107e = New-TestDay -DateText $yesterdayText
+        Add-TestSegment -Day $d107e -Mode 'Betrieb' -StartText '06:00' | Out-Null
+        Invoke-MidnightRolloverIfNeeded -Day $d107e | Out-Null
+        & $assert 'Test 107e: Betrieb mit erreichter 10:00-Grenze schlaegt 16:45 vor (nicht 00:00)' "$yesterdayText 16:45:00" (ConvertTo-DateTimeString (Get-AutoEndSuggestedEnd -Day $d107e -Cutoff $midnight107))
+        # Ohne Sperre und ohne 10:00: kein besserer Anhaltspunkt -> Mitternacht
+        $d107f = New-TestDay -DateText $yesterdayText
+        Add-TestSegment -Day $d107f -Mode 'Betrieb' -StartText '22:00' | Out-Null
+        Invoke-MidnightRolloverIfNeeded -Day $d107f | Out-Null
+        & $assert 'Test 107f: ohne Sperre/Pause und ohne 10:00 bleibt Mitternacht der Vorschlag' (ConvertTo-DateTimeString $midnight107) (ConvertTo-DateTimeString (Get-AutoEndSuggestedEnd -Day $d107f -Cutoff $midnight107))
 
         # =====================================================================
         # Tests 108/109 (Stabilitaetsdurchlauf): Save-Vault-Commit-Punkt,

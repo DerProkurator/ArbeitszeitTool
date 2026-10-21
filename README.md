@@ -521,6 +521,11 @@ und nach der Entschlüsselung als UTF-8 dekodiert (unabhängig von der ANSI-Code
 - Die kompakte Ansicht passt ihre Größe automatisch an; die gespeicherte Breite wird als
   Mindestbreite wieder angewendet (kein freies Aufziehen per Maus).
 - Ein Arbeitstag entspricht einem Kalendertag; um 00:00 Uhr wird automatisch beendet.
+  Beim nächsten Start muss das Ende bestätigt oder korrigiert werden. Vorgeschlagen wird
+  dabei nicht 00:00, sondern der letzte belegbare Arbeitszeitpunkt: der Beginn einer
+  Sperre oder Pause, die bis zum Tagesende lief, sonst das Erreichen der
+  10-Stunden-Grenze bzw. das letzte Abschnittsende. Gleiches gilt nach einem Absturz oder
+  harten Herunterfahren.
 - Bei sehr restriktiven Unternehmensrichtlinien kann `SendInput` unterbunden sein; ein
   Fehlschlag wird dann gedrosselt verschlüsselt protokolliert, ohne die Funktion
   automatisch zu deaktivieren — die übrige Anwendung arbeitet normal weiter.
