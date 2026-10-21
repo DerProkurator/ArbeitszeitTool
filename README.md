@@ -247,7 +247,9 @@ Deshalb verwendet die Anwendung stabile, neutrale Dateinamen ohne Datums-/Uhrzei
   Hauptdatei** — `vault.backup1.azt`/`vault.backup2.azt` rotieren ausschließlich bei
   fachlichen Speichervorgängen (Moduswechsel, Pause, Windows-Sperre/-Entsperrung,
   Arbeitsende, Korrekturen, Einstellungen, Schließen). So erzeugt ein Cloud-Ordner wie
-  OneDrive nicht alle 30 Sekunden neue Backup-Versionen bzw. Papierkorbeinträge.
+  OneDrive nicht alle 30 Sekunden neue Backup-Versionen. Bei der Rotation werden die
+  Backups per `File.Replace` bzw. Kopie ersetzt und nie vorher gelöscht, damit Cloud-Dienste
+  keine Löschungen in den Papierkorb übernehmen.
 - Jeder Speichervorgang: im Speicher validieren → Metadaten-Snapshot anlegen → Revision
   erhöhen → verschlüsseln → `vault.pending.azt` schreiben → Pending-Datei erneut lesen,
   HMAC prüfen, entschlüsseln und strukturell validieren → prüfen, ob `vault.azt` seit dem

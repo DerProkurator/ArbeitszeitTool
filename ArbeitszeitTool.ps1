@@ -1696,7 +1696,16 @@ function Save-Vault {
                     if ($script:TestMode -and $script:App.Flags.TestFailPrevToBackup1) {
                         throw (New-Object System.IO.IOException 'TESTHOOK: Prev-nach-Backup1 deaktiviert')
                     }
-                    Move-Item -LiteralPath $prevAside -Destination $script:Paths.VaultBackup1 -Force
+                    # Vorhandenes Backup1 per File.Replace ersetzen statt per
+                    # Move-Item -Force: Letzteres LOESCHT das Ziel zuerst, was
+                    # Cloud-Ordner (OneDrive) als Loeschung in den Papierkorb
+                    # uebernehmen. File.Replace wird als neue Version erkannt.
+                    if (Test-Path -LiteralPath $script:Paths.VaultBackup1) {
+                        [System.IO.File]::Replace($prevAside, $script:Paths.VaultBackup1, [NullString]::Value)
+                    }
+                    else {
+                        Move-Item -LiteralPath $prevAside -Destination $script:Paths.VaultBackup1
+                    }
                 }
                 else {
                     # Eine beschaedigte alte Hauptdatei wird NICHT als Backup1 weiterkopiert

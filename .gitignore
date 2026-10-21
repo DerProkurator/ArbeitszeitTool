@@ -2,6 +2,9 @@
 Data/
 Logs/
 Exports/
+Recovery/
+*.azt
+vault.txn
 
 # OS
 .DS_Store
