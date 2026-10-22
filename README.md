@@ -67,7 +67,8 @@ ArbeitszeitTool\
         vault.backup2.azt      verschlüsseltes Backup (vorvorletzter gültiger Stand)
         vault.pending.azt      Schreibjournal: verschlüsselter Spiegel der Hauptdatei (bleibt dauerhaft liegen)
         vault.txn              nur kurzzeitig: neutraler Transaktionsstatus einer Passwortänderung
-                               (enthält keine Arbeitszeitdaten)
+                               (Übernahme- bzw. Recovery-Phase; enthält keine Arbeitszeitdaten,
+                               keine Pfade und keine Dateinamen)
     Recovery\
         vault-unreadable-<GUID>.azt   archivierte, weiterhin verschlüsselte unbrauchbare Tresordateien
         vault-<GUID>.azt              verschlüsselte Konfliktkopien (z. B. nach externer Dateiänderung)
@@ -186,11 +187,33 @@ Vorgang ist ein nachvollziehbarer mehrstufiger Ablauf:
 5. Danach werden alle Dateien im Ordner `Recovery`, die sich mit dem **bisherigen**
    Passwort öffnen lassen (Konfliktkopien, `legacy-`/`import-day-`-Archive, beiseitegelegte
    Tresorstände), mit dem neuen Passwort neu verschlüsselt — der Inhalt bleibt
-   zeichengenau erhalten. Je Datei wird zuerst eine geprüfte Kopie `<Datei>.new`
-   geschrieben, dann das Original in-place überschrieben und erneut geprüft, zuletzt die
-   Kopie entfernt. Dateien eines anderen Passworts (z. B. nach „Passwort vergessen"
-   archivierte Tresore) und beschädigte Dateien bleiben unverändert. Nicht umgestellte
-   Dateien werden namentlich gemeldet und protokolliert.
+   zeichengenau erhalten. Je Datei wird zuerst ein SHA-256-Referenzwert gebildet, dann eine
+   geprüfte Kopie `<Datei>.new` neu angelegt (eine vorhandene wird nie überschrieben), das
+   Original nur bei **unverändertem Referenzwert** in-place überschrieben (Prüfung und
+   Schreiben über denselben exklusiv geöffneten Dateihandle) und erneut geprüft, zuletzt
+   die Kopie entfernt. Eine zwischenzeitlich extern (z. B. durch OneDrive/SharePoint)
+   veränderte Datei wird nicht überschrieben, sondern als Konflikt gemeldet.
+   Jede Datei wird genau einer Kategorie zugeordnet und protokolliert: *neu
+   verschlüsselt*, *anderes Passwort* (z. B. nach „Passwort vergessen" bewusst archivierte
+   Tresore), *beschädigt*, *keine Tresordatei* — diese drei bleiben bewusst unverändert —
+   oder *fehlgeschlagen* (gesperrt, Zugriff verweigert, Ordner nicht auflistbar, extern
+   verändert). Technische Fehler werden nie als reguläres Überspringen gewertet.
+6. Verbliebene `*.old`-Reste im Ordner `Data` (bisheriges Passwort) werden vor Schritt 5
+   wie bei der Startbereinigung nach `Recovery` gesichert und dort mit umgestellt.
+   Abschließend wird geprüft, ob im Ordner `Data` noch eine Datei liegt, die nicht mit dem
+   neuen Passwort verschlüsselt ist.
+
+Die Abschlussmeldung gibt den tatsächlichen Zustand wieder:
+
+| Ergebnis | Bedeutung |
+|---|---|
+| erfolgreich | alle mit dem bisherigen Passwort lesbaren und erreichbaren Dateien sind umgestellt |
+| erfolgreich, Bereinigung offen | alles umgestellt; nur temporäre Kopien (`*.new`, bereits **neues** Passwort) ließen sich nicht entfernen — sie werden beim nächsten Start entfernt |
+| nur teilweise erfolgreich | mindestens eine Datei konnte nicht geprüft oder umgestellt werden und ist möglicherweise weiterhin mit dem **bisherigen** Passwort lesbar; sie wird namentlich genannt und bleibt unverändert erhalten |
+| fehlgeschlagen | der Tresor wurde nicht umgestellt, das bisherige Passwort bleibt gültig |
+| Rücknahme unvollständig | Neustart erforderlich; die Startreparatur stellt den Dateisatz wieder her |
+
+Zusätzlich wird ein fehlgeschlagener abschließender Speichervorgang angezeigt.
 
 Scheitert die Übernahme (z. B. weil ein Sync-Client eine Datei geöffnet hält), wird sie
 zurückgenommen; nur wenn die Rücknahme vollständig gelungen ist, meldet die Anwendung
@@ -204,6 +227,18 @@ kontrolliert übernommen oder verschlüsselt in den `Recovery`-Ordner archiviert
 verbleibt kein gemischter, dauerhaft unklarer Dateisatz, und es wird nichts gelöscht,
 bevor die aktuelle Hauptdatei validiert wurde. Schlägt ein Schritt fehl, bleibt der
 bisherige Tresor mit dem bisherigen Passwort vollständig erhalten.
+
+Für die Neuverschlüsselung des Ordners `Recovery` gilt beim nächsten Start nach dem
+Entsperren: Reste `<Datei>.azt.new` werden **nur dann** automatisch aufgelöst, wenn
+eindeutig feststeht, welcher Stand gültig ist — eine Kopie mit identischem Inhalt neben
+einem bereits umgestellten Original wird entfernt; ein beim Überschreiben zerstörtes
+Original wird aus der vollständig geprüften Kopie wiederhergestellt. Alle anderen
+Zwischenstände (unvollständige Kopie, Original noch mit dem bisherigen Passwort, Original
+fehlt, abweichender Inhalt, Zugriffsfehler) bleiben byteidentisch erhalten und werden
+gemeldet. Wurde die Recovery-Phase selbst unterbrochen, weist der Start darauf hin und
+nennt die Dateien in `Recovery`, die nicht mit dem aktuellen Passwort verschlüsselt sind.
+Zu jedem Zeitpunkt bleibt je Datei mindestens ein vollständiger, entschlüsselbarer Stand
+erhalten.
 
 **Hinweis Cloud-Ordner:** Der Versionsverlauf bzw. Papierkorb des Cloud-Dienstes
 (OneDrive/SharePoint) enthält weiterhin ältere Versionen der Tresordateien, die mit dem
@@ -501,7 +536,10 @@ zufällige IVs, unterschiedliche Ciphertexte bei gleichem Klartext), kein Klarte
 Passwort in Dateien, Migration (inkl. `worktime.backup.json` als alternative Quelle,
 Erhalt nicht übernommener Dateien, verschlüsselte Archivierung), Importkonflikte bei
 gleichem Datum mit vollständigem Rollback, Passwortänderung inkl. Unterbrechung
-(`.new`-/`.old`-Reste, Startreparatur), Backup-Wiederherstellung aus Backup2 mit
+(`.new`-/`.old`-Reste, Startreparatur), Recovery-Neuverschlüsselung (gesperrte Datei,
+fehlende Leseberechtigung, Auflistungsfehler, beschädigter/fremder Container, externe
+Änderung während des Vorgangs, Abbruch in jeder Phase, fehlgeschlagene Bereinigung,
+Neustart nach Unterbrechung, Ergebnisbewertung), Backup-Wiederherstellung aus Backup2 mit
 anschließendem Speichern (der einzige gültige Backupstand wird nicht überschrieben),
 Metadaten-Rollback bei Speicherfehlern, Erkennung externer Dateiänderungen,
 Container-Härtung (übergroße Dateien, falsche Salt-Länge), Pending-/Revision-/
