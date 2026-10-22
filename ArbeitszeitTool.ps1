@@ -18,20 +18,32 @@
  technisch uebliche Verbindungsdaten (IP-Adresse, Zeitpunkt, Playeranfrage).
  Unternehmensproxy, Firewall oder Virenschutz koennen den Stream blockieren.
  Ohne gestartetes Radio findet aufgrund dieser Funktion keine
- Streamverbindung statt. Die Nutzung von Internetradio und Scroll-Lock-
- Aktivhaltung muss mit den betrieblichen Vorgaben vereinbar sein.
+ Streamverbindung statt. Die Nutzung des Internetradios muss mit den
+ betrieblichen Vorgaben vereinbar sein.
 
  Start:    powershell.exe -Sta -NoProfile -File .\ArbeitszeitTool.ps1
  Tests:    powershell.exe -NoProfile -File .\ArbeitszeitTool.ps1 -RunTests
- Manuell:  powershell.exe -NoProfile -File .\ArbeitszeitTool.ps1 -RunScrollLockManualTest
-           (optionaler, systemabhaengiger Scroll-Lock-Integrationstest mit
-            ECHTEN Tastendruecken - laeuft nur nach ausdruecklicher Bestaetigung)
 
  Hinweis: Es wird keine ExecutionPolicy umgangen oder veraendert.
  Verhindert die Unternehmensrichtlinie die Skriptausfuehrung, ist der
  zulaessige Startweg mit der zustaendigen IT abzustimmen.
 ==================================================================
  AENDERUNGSJOURNAL
+--------------------------------------------------
+22.10.2026 - VERSION 1.1.0: SCROLL-LOCK-AKTIVHALTUNG
+ENTFERNT
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (Test 118a-118d);
+         Menues/Einstellungsdialog manuell NICHT getestet.
+ - Aktivhaltung vollstaendig entfernt: C#-Tastatureingabe,
+   Timer, Einstellungen (Tab, Kontext-/Tray-Menue, Kompaktfeld)
+   und der manuelle Integrationstest samt Startparameter.
+ - Die Anwendung simuliert keine Eingaben mehr und beeinflusst
+   die automatische Bildschirmsperre nicht.
+ - Rueckwaertskompatibel: alte Werte KeepAliveEnabled/
+   KeepAliveIntervalSec und das Kompaktfeld 'ScrollLock' werden
+   beim Laden verworfen (auch in eigenen Presets).
+ - Entfallene Tests: 15/16 und 70.
 --------------------------------------------------
 22.10.2026 - SECURITY-REVIEW: PASSWORTAENDERUNG UND
 RECOVERY
@@ -86,8 +98,7 @@ ANWENDUNGSSCHLIESSEN
 #>
 [CmdletBinding()]
 param(
-    [switch]$RunTests,
-    [switch]$RunScrollLockManualTest
+    [switch]$RunTests
 )
 
 $ErrorActionPreference = 'Stop'
@@ -100,7 +111,7 @@ Set-StrictMode -Off
 # Bewusst ohne -ExecutionPolicy: geltende Richtlinien werden nicht umgangen.
 # Fester Systempfad statt Suchpfad (keine fremde powershell.exe aus dem
 # aktuellen Verzeichnis oder PATH).
-if (-not $RunTests -and -not $RunScrollLockManualTest -and [System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
+if (-not $RunTests -and [System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
     $psExe = Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)) 'WindowsPowerShell\v1.0\powershell.exe'
     Start-Process -FilePath $psExe -ArgumentList @('-Sta', '-NoProfile', '-File', "`"$PSCommandPath`"")
     exit
@@ -115,14 +126,11 @@ Add-Type -AssemblyName System.Drawing
 # C#-Interop:
 #  - SessionMonitor: puffert Lock/Unlock-Zeitstempel threadsicher (wird vom
 #    UI-Timer ausgelesen -> keine Runspace-Probleme mit PowerShell-Events)
-#  - NativeInput:    Scroll-Lock-Doppelpuls via SendInput auf einem
-#                    ThreadPool-Thread (Zustandsabfrage nur im manuellen Test)
 #  - NativeWindow:   Topmost erneut setzen ohne Aktivierung (SWP_NOACTIVATE)
 $interopSource = @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
-using System.Threading;
 using Microsoft.Win32;
 
 namespace ArbeitszeitTool
@@ -173,276 +181,6 @@ namespace ArbeitszeitTool
         }
     }
 
-    // Scroll-Lock-Doppelpuls: vollstaendig gekapselt, laeuft auf einem
-    // ThreadPool-Thread (niemals auf dem WPF-Dispatcher-Thread). KEINE
-    // Zustandsabfrage im Produktivbetrieb - GetScrollLockState existiert nur
-    // noch fuer den optionalen manuellen Diagnosetest. Ergebnisse werden als
-    // Diagnosezeilen gepuffert und vom UI-Timer abgeholt (Drain), damit der
-    // Hintergrundthread niemals PowerShell-/WPF-Objekte beruehrt.
-    public static class NativeInput
-    {
-        [StructLayout(LayoutKind.Sequential)]
-        private struct KEYBDINPUT
-        {
-            public ushort wVk;
-            public ushort wScan;
-            public uint dwFlags;
-            public uint time;
-            public IntPtr dwExtraInfo;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct MOUSEINPUT
-        {
-            public int dx;
-            public int dy;
-            public uint mouseData;
-            public uint dwFlags;
-            public uint time;
-            public IntPtr dwExtraInfo;
-        }
-
-        [StructLayout(LayoutKind.Explicit)]
-        private struct INPUTUNION
-        {
-            [FieldOffset(0)] public KEYBDINPUT ki;
-            [FieldOffset(0)] public MOUSEINPUT mi;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct INPUT
-        {
-            public uint type;
-            public INPUTUNION u;
-        }
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-
-        [DllImport("user32.dll")]
-        private static extern short GetKeyState(int nVirtKey);
-
-        private const int VK_SCROLL = 0x91;
-        private const uint INPUT_KEYBOARD = 1;
-        private const uint KEYEVENTF_KEYUP = 0x0002;
-
-        // Abstand der beiden Tastendruecke: Standard 200 ms, zulaessig 100-300 ms
-        public const int DefaultPulseGapMs = 200;
-        public const int MinPulseGapMs = 100;
-        public const int MaxPulseGapMs = 300;
-
-        // 0 = kein Puls aktiv, 1 = Puls laeuft (ausschliesslich via Interlocked)
-        private static int _pulseRunning = 0;
-
-        // 1 = Anwendung faehrt herunter: keine neuen Pulse mehr starten
-        private static int _shutdown = 0;
-
-        // Nur fuer -RunTests: 0 = normal (echte Eingaben),
-        // 1 = erster Tastendruck schlaegt fehl (simuliert),
-        // 2 = zweiter Tastendruck schlaegt fehl (simuliert),
-        // 3 = simulierter ERFOLG (fuer den normalen automatischen Testfall),
-        // 4 = simulierte Ablehnung des Hintergrundauftrags (QueueUserWorkItem=false).
-        // In JEDEM Testmodus (!= 0) werden KEINE echten Eingaben gesendet.
-        public static volatile int TestFailMode = 0;
-
-        // Beim regulaeren Programmende aufrufen: ab dann werden keine neuen
-        // Pulse mehr gestartet; ein laufender Puls beendet sich regulaer.
-        public static void BeginShutdown()
-        {
-            Interlocked.Exchange(ref _shutdown, 1);
-        }
-
-        private static readonly object PulseGate = new object();
-        private static readonly List<string> PulseResults = new List<string>();
-
-        // NUR fuer den optionalen manuellen Diagnosetest - der normale
-        // Produktivbetrieb fragt den Scroll-Lock-Zustand nicht ab.
-        public static bool GetScrollLockState()
-        {
-            return (GetKeyState(VK_SCROLL) & 1) == 1;
-        }
-
-        // Erwartete Groesse der INPUT-Struktur: 28 Byte (x86) / 40 Byte (x64)
-        public static int GetExpectedInputSize()
-        {
-            return (IntPtr.Size == 8) ? 40 : 28;
-        }
-
-        public static int GetActualInputSize()
-        {
-            return Marshal.SizeOf(typeof(INPUT));
-        }
-
-        public static bool IsPulseRunning()
-        {
-            return Interlocked.CompareExchange(ref _pulseRunning, 0, 0) == 1;
-        }
-
-        // Diagnosezeilen abgeschlossener Pulse abholen (threadsicher)
-        public static string[] DrainPulseResults()
-        {
-            lock (PulseGate)
-            {
-                string[] result = PulseResults.ToArray();
-                PulseResults.Clear();
-                return result;
-            }
-        }
-
-        private static void AddResult(string text)
-        {
-            lock (PulseGate)
-            {
-                PulseResults.Add(text);
-                if (PulseResults.Count > 100) { PulseResults.RemoveAt(0); }
-            }
-        }
-
-        // Ein vollstaendiger Tastendruck (Key Down + Key Up). Liefert die
-        // Anzahl der von SendInput uebernommenen Ereignisse (0..2).
-        // which: 1 = erster, 2 = zweiter Tastendruck des Doppelpulses.
-        private static uint SendFullKeyPress(int failMode, int which)
-        {
-            if (failMode != 0)
-            {
-                // Testmodus: keine echten Eingaben senden
-                if (failMode == which) { return (uint)((which == 1) ? 1 : 0); }
-                return 2;
-            }
-            INPUT[] inputs = new INPUT[2];
-            inputs[0].type = INPUT_KEYBOARD;
-            inputs[0].u.ki.wVk = VK_SCROLL;
-            inputs[1].type = INPUT_KEYBOARD;
-            inputs[1].u.ki.wVk = VK_SCROLL;
-            inputs[1].u.ki.dwFlags = KEYEVENTF_KEYUP;
-            return SendInput(2, inputs, Marshal.SizeOf(typeof(INPUT)));
-        }
-
-        // Bestmoeglich ein einzelnes Key-Up nachsenden (schaltet nicht um),
-        // damit keine Taste logisch gedrueckt haengen bleibt.
-        private static void SendKeyUpBestEffort(int failMode)
-        {
-            if (failMode != 0) { return; }
-            try
-            {
-                INPUT[] inputs = new INPUT[1];
-                inputs[0].type = INPUT_KEYBOARD;
-                inputs[0].u.ki.wVk = VK_SCROLL;
-                inputs[0].u.ki.dwFlags = KEYEVENTF_KEYUP;
-                SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
-            }
-            catch { }
-        }
-
-        // Startet den Doppelpuls im Hintergrund (ThreadPool). Liefert false,
-        // wenn bereits ein Puls laeuft oder die INPUT-Groesse unerwartet ist -
-        // dann passiert nichts weiter (nur Diagnoseeintrag): kein Dialog,
-        // keine Einstellungsaenderung, naechster regulaerer Intervall.
-        public static bool StartScrollLockPulse(int gapMs)
-        {
-            if (gapMs < MinPulseGapMs) { gapMs = MinPulseGapMs; }
-            if (gapMs > MaxPulseGapMs) { gapMs = MaxPulseGapMs; }
-            if (Interlocked.CompareExchange(ref _shutdown, 0, 0) == 1)
-            {
-                return false; // Programmende: keine neuen Pulse mehr
-            }
-            if (Marshal.SizeOf(typeof(INPUT)) != GetExpectedInputSize())
-            {
-                AddResult("FEHLER|INPUT-Struktur " + Marshal.SizeOf(typeof(INPUT)) +
-                    " statt " + GetExpectedInputSize() + " Byte - SendInput nicht ausgefuehrt");
-                return false;
-            }
-            if (Interlocked.CompareExchange(ref _pulseRunning, 1, 0) != 0)
-            {
-                return false; // es laeuft bereits ein Puls
-            }
-            int captured = gapMs;
-            bool queued = false;
-            try
-            {
-                if (TestFailMode == 4)
-                {
-                    queued = false; // Testmodus: Ablehnung des Auftrags simulieren
-                }
-                else
-                {
-                    queued = ThreadPool.QueueUserWorkItem(delegate(object unused) { RunPulse(captured); });
-                }
-            }
-            catch (Exception ex)
-            {
-                Interlocked.Exchange(ref _pulseRunning, 0);
-                AddResult("FEHLER|Hintergrundstart fehlgeschlagen: " + ex.Message);
-                return false;
-            }
-            if (!queued)
-            {
-                // Rueckgabewert von QueueUserWorkItem auswerten: der Pulsstatus
-                // darf unter keinem Fehlerpfad dauerhaft auf 1 haengen bleiben.
-                Interlocked.Exchange(ref _pulseRunning, 0);
-                AddResult("FEHLER|Hintergrundauftrag wurde nicht angenommen");
-                return false;
-            }
-            return true;
-        }
-
-        // Vollstaendiger Doppelpuls auf dem Hintergrundthread:
-        // Tastendruck 1 -> Wartezeit (Thread.Sleep) -> Tastendruck 2.
-        // Der Laufstatus wird in JEDEM Fall wieder freigegeben (finally).
-        // Schlaegt der erste Tastendruck fehl, wird KEIN zweiter
-        // Umschaltvorgang erzwungen; nach einem Teilerfolg wird bestmoeglich
-        // ein separates Key-Up nachgesendet.
-        private static void RunPulse(int gapMs)
-        {
-            try
-            {
-                int failMode = TestFailMode;
-                bool pool = Thread.CurrentThread.IsThreadPoolThread;
-                uint accepted1 = SendFullKeyPress(failMode, 1);
-                if (accepted1 != 2)
-                {
-                    // Marshal.GetLastWin32Error NUR auswerten, wenn SendInput
-                    // nicht die erwartete Ereigniszahl uebernommen hat - nach
-                    // einem Erfolg kann der Fehlercode ein alter Wert sein.
-                    int err1 = Marshal.GetLastWin32Error();
-                    SendKeyUpBestEffort(failMode);
-                    AddResult("FEHLER|Erster Tastendruck unvollstaendig: uebernommen=" +
-                        accepted1 + " Win32=" + err1 + " pool=" + pool + " test=" + (failMode != 0));
-                    return;
-                }
-                int t0 = Environment.TickCount;
-                Thread.Sleep(gapMs);
-                int elapsed = Environment.TickCount - t0;
-                uint accepted2 = SendFullKeyPress(failMode, 2);
-                if (accepted2 != 2)
-                {
-                    int err2 = Marshal.GetLastWin32Error();
-                    SendKeyUpBestEffort(failMode);
-                    AddResult("FEHLER|Zweiter Tastendruck unvollstaendig: uebernommen=" +
-                        accepted2 + " Win32=" + err2 + " pool=" + pool + " test=" + (failMode != 0));
-                    return;
-                }
-                AddResult("OK|accepted1=2 accepted2=2 gapMs=" + gapMs +
-                    " elapsedMs=" + elapsed + " pool=" + pool + " test=" + (failMode != 0));
-            }
-            catch (Exception ex)
-            {
-                AddResult("FEHLER|Ausnahme im Doppelpuls: " + ex.Message);
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _pulseRunning, 0);
-            }
-        }
-
-        // NUR fuer den optionalen manuellen Diagnosetest (einmalige
-        // Wiederherstellung): ein einzelner vollstaendiger Tastendruck.
-        public static bool ToggleScrollLock()
-        {
-            return SendFullKeyPress(0, 0) == 2;
-        }
-    }
-
     public static class NativeWindow
     {
         [DllImport("user32.dll")]
@@ -466,7 +204,7 @@ namespace ArbeitszeitTool
 }
 '@
 
-if (-not ('ArbeitszeitTool.NativeInput' -as [type])) {
+if (-not ('ArbeitszeitTool.NativeWindow' -as [type])) {
     Add-Type -TypeDefinition $interopSource -ReferencedAssemblies @('System') -Language CSharp
 }
 
@@ -1973,8 +1711,6 @@ function Get-DefaultSettings {
         CompactFields        = @('Beginn', 'Netto', 'SollRestOderUeberstunden', 'MaxEnde')
         Topmost              = $true
         TopmostReassert      = $true
-        KeepAliveEnabled     = $false
-        KeepAliveIntervalSec = 60
         TrayIconEnabled      = $true
         ShowSeconds          = $true
         Warn945Enabled       = $true
@@ -2026,11 +1762,21 @@ function Get-ValidatedSettings {
     $defaults['WindowWidth'] = $null
     $defaults['Transparency'] = [math]::Max(30, [math]::Min(100, [int]$defaults['Transparency']))
     $defaults['FontSize'] = [math]::Max(9, [math]::Min(28, [int]$defaults['FontSize']))
-    $defaults['KeepAliveIntervalSec'] = [math]::Max(10, [math]::Min(600, [int]$defaults['KeepAliveIntervalSec']))
     if (@('Kompakt', 'Erweitert') -notcontains $defaults['StartView']) { $defaults['StartView'] = 'Kompakt' }
     $defaults['ShutdownOfferEnabled'] = [bool]$defaults['ShutdownOfferEnabled']
-    if ($defaults['CompactFields'] -isnot [System.Collections.IList] -or @($defaults['CompactFields']).Count -eq 0) {
+    # Unbekannte Felder (z. B. das entfernte 'ScrollLock' aus Version 1.0.0)
+    # werden verworfen; bleibt nichts uebrig, gilt die Standardauswahl.
+    $knownFields = New-Object System.Collections.ArrayList
+    if ($defaults['CompactFields'] -is [System.Collections.IList]) {
+        foreach ($f in @($defaults['CompactFields'])) {
+            if ($script:CompactFieldDefs.Contains([string]$f)) { [void]$knownFields.Add([string]$f) }
+        }
+    }
+    if ($knownFields.Count -eq 0) {
         $defaults['CompactFields'] = @('Beginn', 'Netto', 'SollRestOderUeberstunden', 'MaxEnde')
+    }
+    else {
+        $defaults['CompactFields'] = $knownFields
     }
     # Eigene Presets der kompakten Ansicht: bestehende Tresore ohne Presets
     # erhalten automatisch eine leere, kompatible Liste (rueckwaertskompatibel)
@@ -4218,7 +3964,7 @@ function Save-CompactWindowPlacement {
 # Tray-Symbol). Ohne Tray-Symbol wird stattdessen minimiert.
 # Kompaktes Fenster in den Infobereich ausblenden. AUSNAHMESICHER und
 # reentranzgeschuetzt: Hide() beendet die Anwendung NICHT (nichtmodale
-# Lebensdauer ueber den Dispatcher; Timer, Radio, Aktivhaltung und
+# Lebensdauer ueber den Dispatcher; Timer, Radio und
 # Lock-/Unlock-Verarbeitung laufen unsichtbar weiter). Steht kein
 # funktionierendes Tray-Symbol zur Verfuegung, wird stattdessen ueber die
 # Taskleiste minimiert - die Anwendung bleibt in jedem Fall erreichbar.
@@ -4406,11 +4152,6 @@ function Get-CompactStatusText {
                 elseif ($Comp.OpenLock) { $status = 'gesperrt' }
                 elseif ($Comp.InFesterPause) { $status = 'Betriebspause' }
                 [void]$parts.Add('Pause: ' + $status)
-            }
-            'ScrollLock' {
-                $state = 'aus'
-                if ($script:App.Settings['KeepAliveEnabled']) { $state = 'an' }
-                [void]$parts.Add('Aktivhaltung: ' + $state)
             }
             'Warnstatus' {
                 $state = 'OK'
@@ -5742,7 +5483,6 @@ $script:CompactFieldDefs = [ordered]@{
     'MaxEnde'                  = 'Max-Ende'
     'Modus'                    = 'Aktueller Modus'
     'Pausenstatus'             = 'Pausenstatus'
-    'ScrollLock'               = 'Scroll-Lock-Aktivhaltung'
     'Warnstatus'               = 'Warnstatus'
 }
 
@@ -5850,8 +5590,8 @@ function Set-CompactFieldsPreset {
 }
 
 # Hinweise zum Layout des Einstellungsfensters:
-#  - Die Einstellungen sind in ein dunkles TabControl mit vier Bereichen
-#    gegliedert (Allgemein / Kompakte Ansicht / Aktivhaltung / Internetradio) -
+#  - Die Einstellungen sind in ein dunkles TabControl mit drei Bereichen
+#    gegliedert (Allgemein / Kompakte Ansicht / Internetradio) -
 #    kein einziges langes vertikales Formular mehr.
 #  - Feste sinnvolle Ausgangsgroesse (780 x 620 DIP) mit Min-Grenzen; die
 #    maximale Hoehe wird beim Oeffnen auf den Monitor-Arbeitsbereich begrenzt
@@ -6009,24 +5749,6 @@ $script:SettingsXaml = @'
                     </StackPanel>
                 </ScrollViewer>
             </TabItem>
-            <TabItem Header="Aktivhaltung">
-                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <StackPanel Margin="10">
-                        <GroupBox Header="Scroll-Lock-Aktivhaltung">
-                            <StackPanel>
-                                <CheckBox x:Name="ChkKeepAlive">
-                                    <TextBlock Text="Aktivhaltung aktiv (Standard: ein)" TextWrapping="Wrap"/>
-                                </CheckBox>
-                                <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                                    <TextBlock Text="Intervall (Sekunden):  " VerticalAlignment="Center"/>
-                                    <TextBox x:Name="TxtKeepAliveInterval" Width="60" FontFamily="Consolas"/>
-                                </StackPanel>
-                                <TextBlock Text="Die Aktivhaltung sendet in jedem Intervall einen kurzen Scroll-Lock-Doppelpuls (Taste kurz umschalten und wieder zurück), damit der Rechner als aktiv gilt. Es findet keine Zustandsabfrage statt; Fehler werden nur im verschlüsselten Protokoll erfasst. Hinweis: Bei einem harten Absturz exakt zwischen den beiden Tastendrücken kann die Rollen-Taste verändert bleiben. Die Nutzung muss mit den betrieblichen Vorgaben vereinbar sein." TextWrapping="Wrap" Foreground="#FFAAB8C6" Margin="0,10,0,0"/>
-                            </StackPanel>
-                        </GroupBox>
-                    </StackPanel>
-                </ScrollViewer>
-            </TabItem>
             <TabItem Header="Internetradio">
                 <Grid Margin="10">
                     <Grid.ColumnDefinitions>
@@ -6136,8 +5858,6 @@ function Show-SettingsDialog {
     $win.FindName('ChkSeconds').IsChecked = [bool]$s['ShowSeconds']
     if ([string]$s['StartView'] -eq 'Erweitert') { $win.FindName('RbStartErweitert').IsChecked = $true }
     else { $win.FindName('RbStartKompakt').IsChecked = $true }
-    $win.FindName('ChkKeepAlive').IsChecked = [bool]$s['KeepAliveEnabled']
-    $win.FindName('TxtKeepAliveInterval').Text = [string]$s['KeepAliveIntervalSec']
     $win.FindName('TxtRadioVolume').Text = [string]$s['RadioVolume']
     $win.FindName('ChkRadioResume').IsChecked = [bool]$s['RadioResumeAfterUnlock']
     $win.FindName('ChkRadioRemember').IsChecked = [bool]$s['RadioRememberPlaybackState']
@@ -6405,11 +6125,6 @@ function Show-SettingsDialog {
                 Show-Warning -Message 'Die Schriftgröße muss eine Zahl zwischen 9 und 28 sein.'
                 return
             }
-            $interval = 0
-            if (-not [int]::TryParse(([string]$win.FindName('TxtKeepAliveInterval').Text).Trim(), [ref]$interval) -or $interval -lt 10 -or $interval -gt 600) {
-                Show-Warning -Message 'Das Scroll-Lock-Intervall muss zwischen 10 und 600 Sekunden liegen.'
-                return
-            }
             $fields = New-Object System.Collections.ArrayList
             foreach ($key in $script:CompactFieldDefs.Keys) {
                 if ($fieldChecks[$key].IsChecked) { [void]$fields.Add($key) }
@@ -6459,8 +6174,6 @@ function Show-SettingsDialog {
             $s['ShowSeconds'] = [bool]$win.FindName('ChkSeconds').IsChecked
             $s['StartView'] = 'Kompakt'
             if ($win.FindName('RbStartErweitert').IsChecked) { $s['StartView'] = 'Erweitert' }
-            $s['KeepAliveEnabled'] = [bool]$win.FindName('ChkKeepAlive').IsChecked
-            $s['KeepAliveIntervalSec'] = $interval
             $s['CompactFields'] = $fields
             $s['CompactPresets'] = $validatedPresets
             $s['RadioStations'] = $radioWork
@@ -9010,16 +8723,6 @@ function Invoke-PasswordChangeFlow {
 
 #region ===== Anwendungszustand =====
 
-# Zustand der Scroll-Lock-Aktivhaltung: nur noch die Protokolldrosselung.
-# Es gibt KEINE Zustandsmaschine mehr - der Doppelpuls laeuft vollstaendig
-# gekapselt im C#-Hintergrund; der Parallelschutz liegt ebenfalls im C#
-# (Interlocked.CompareExchange in NativeInput).
-function New-KeepAliveState {
-    return @{
-        ConsecutiveErrors = 0   # aufeinanderfolgende fehlgeschlagene Pulse (Drosselung)
-    }
-}
-
 function Initialize-AppState {
     $script:App = @{
         Vault               = $null   # entschluesselter Tresorinhalt (nur im Arbeitsspeicher)
@@ -9046,8 +8749,7 @@ function Initialize-AppState {
         # Speichervorgang der neuen Sitzung befuellt.
         RecoveryState       = $null
         Ui                  = @{ Compact = $null; Extended = $null; ExtendedStamp = ''; ExtendedSegTable = $null; ExtendedRunningRow = -1; Tray = $null; TrayItems = @{}; MenuItems = @{}; Handle = [IntPtr]::Zero; HideInProgress = $false }
-        Timers              = @{ Main = $null; KeepAlive = $null }
-        KeepAlive           = (New-KeepAliveState)
+        Timers              = @{ Main = $null }
         # Zentraler Zustand des Internetradios: Es ist zu jedem Zeitpunkt
         # hoechstens EIN MediaPlayer aktiv. Jede Oeffnungsanforderung erhaelt
         # einen eigenen Playerkontext (Instanz + RequestId + Sender + Stream),
@@ -9225,110 +8927,6 @@ function Invoke-SessionEventDrain {
         }
     }
     Invoke-MainRefresh -ForceTables
-}
-
-#endregion
-
-#region ===== Scroll-Lock-Aktivhaltung =====
-
-# Einfacher, entkoppelter Doppelpuls OHNE Zustandspruefung im Produktivbetrieb:
-# Der periodische Timer stoesst lediglich einen vollstaendig in C# gekapselten
-# Hintergrund-Doppelpuls an (Key Down/Up, ca. 200 ms Pause, Key Down/Up) -
-# ausserhalb des WPF-Dispatcher-Threads (ThreadPool), Parallelschutz ueber
-# Interlocked.CompareExchange. Die zwei Tastendruecke stellen im Normalfall
-# den vorherigen Umschaltzustand wieder her; eine explizite
-# Zustandsvalidierung (Vorher-/Nachher-Abfrage des Tastenzustands) findet im
-# normalen Betrieb NICHT statt - sie ist ausschliesslich dem optionalen
-# manuellen Diagnosetest (-RunScrollLockManualTest) vorbehalten.
-# Fehler (SendInput, INPUT-Struktur) dienen nur der Diagnose: sie werden
-# gedrosselt im verschluesselten Protokoll erfasst, beenden weder Anwendung
-# noch Haupttimer, deaktivieren KeepAliveEnabled nicht, speichern keine
-# Einstellungen, oeffnen keinen Dialog und beeinflussen die
-# Arbeitszeiterfassung nicht.
-# AKZEPTIERTE TECHNISCHE GRENZE (ehrlich dokumentiert): Bei hartem
-# Prozessabbruch, Stromausfall oder Betriebssystemabsturz GENAU zwischen den
-# beiden Tastendruecken - ebenso bei einem fehlgeschlagenen zweiten
-# SendInput-Aufruf - kann Scroll Lock veraendert zurueckbleiben. Das
-# beeintraechtigt die Arbeitszeiterfassung nicht.
-
-$script:KeepAliveConst = @{
-    PulseGapMs     = 200   # Abstand der beiden Tastendruecke (Standard 200 ms; das C# klemmt auf 100-300 ms)
-    ShutdownWaitMs = 500   # maximale Wartezeit auf einen laufenden Puls beim Programmende
-}
-
-function Test-KeepAliveShouldRun {
-    if (-not [bool]$script:App.Settings['KeepAliveEnabled']) { return $false }
-    if ([ArbeitszeitTool.SessionMonitor]::IsLocked) { return $false }
-    $day = $script:App.CurrentDay
-    if ($null -eq $day -or $day.Status -ne 'Aktiv') { return $false }
-    if ($day.MaxReached) { return $false }
-    foreach ($seg in @($day.Segments)) {
-        if ($seg.Running) { return $true }
-    }
-    return $false
-}
-
-# Holt die Diagnoseergebnisse abgeschlossener Doppelpulse aus dem C#-Puffer
-# und protokolliert sie GEDROSSELT im verschluesselten Protokoll:
-#  - der erste fehlgeschlagene Puls wird protokolliert
-#  - danach nur jeder zehnte aufeinanderfolgende Fehler
-#  - der erste danach wieder erfolgreiche Puls wird einmal protokolliert
-# ($Entries ist fuer Tests injizierbar; sonst wird der C#-Puffer geleert.)
-function Invoke-ScrollLockPulseLogDrain {
-    param($Entries = $null)
-    if ($null -eq $Entries) {
-        try { $Entries = [ArbeitszeitTool.NativeInput]::DrainPulseResults() } catch { return }
-    }
-    $ka = $script:App.KeepAlive
-    foreach ($entry in @($Entries)) {
-        $text = [string]$entry
-        if ($text.StartsWith('OK')) {
-            if ($ka.ConsecutiveErrors -gt 0) {
-                Write-AppLog -Message ('Scroll-Lock-Puls nach ' + $ka.ConsecutiveErrors + ' Fehler(n) wieder erfolgreich (' + $text + ').')
-            }
-            $ka.ConsecutiveErrors = 0
-        }
-        else {
-            $ka.ConsecutiveErrors++
-            if ($ka.ConsecutiveErrors -eq 1 -or ($ka.ConsecutiveErrors % 10) -eq 0) {
-                Write-AppLog -Level 'WARN' -Message ('Scroll-Lock-Puls fehlgeschlagen (' + $ka.ConsecutiveErrors + '. Mal in Folge): ' + $text)
-            }
-        }
-    }
-}
-
-# Wird vom periodischen Timer aufgerufen und stoesst NUR den C#-Doppelpuls
-# an. Laeuft bereits ein Puls oder ist die INPUT-Groesse unerwartet, passiert
-# nichts weiter - kein Fehlerdialog, keine Einstellungsaenderung, keine
-# automatische Deaktivierung; der naechste regulaere Intervall versucht es
-# erneut.
-function Invoke-KeepAliveCycle {
-    try {
-        Invoke-ScrollLockPulseLogDrain
-        if (-not (Test-KeepAliveShouldRun)) { return }
-        [void][ArbeitszeitTool.NativeInput]::StartScrollLockPulse([int]$script:KeepAliveConst.PulseGapMs)
-    }
-    catch {
-        # Nur protokollieren - weder Haupttimer noch Anwendung beenden
-        Write-AppLog -Level 'ERROR' -Message ('Scroll-Lock-Puls konnte nicht gestartet werden: ' + $_.Exception.Message)
-    }
-}
-
-# Beim regulaeren Programmende: keine neuen Pulse mehr (die Timer sind dann
-# gestoppt), hoechstens KURZ auf einen laufenden Doppelpuls warten - das
-# Beenden wird nicht dauerhaft blockiert. Es wird kein Tastenzustand
-# abgefragt und keine Umschaltung anhand eines vermuteten Zustands
-# durchgefuehrt.
-function Wait-ScrollLockPulseCompletion {
-    param([int]$MaxWaitMs = -1)
-    if ($MaxWaitMs -lt 0) { $MaxWaitMs = [int]$script:KeepAliveConst.ShutdownWaitMs }
-    try {
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        while ([ArbeitszeitTool.NativeInput]::IsPulseRunning() -and $sw.ElapsedMilliseconds -lt $MaxWaitMs) {
-            Start-Sleep -Milliseconds 25
-        }
-    }
-    catch { }
 }
 
 #endregion
@@ -10206,25 +9804,6 @@ function Invoke-AddSegmentFlow {
     Invoke-MainRefresh -ForceTables
 }
 
-function Invoke-ToggleKeepAlive {
-    # Deaktivieren startet keine neuen Pulse mehr (Test-KeepAliveShouldRun);
-    # ein bereits begonnener Doppelpuls beendet sich regulaer im Hintergrund.
-    # Es wird KEIN Tastenzustand abgefragt und keine zusaetzliche Umschaltung
-    # anhand eines vermuteten Zustands durchgefuehrt.
-    $oldValue = [bool]$script:App.Settings['KeepAliveEnabled']
-    $script:App.Settings['KeepAliveEnabled'] = -not $oldValue
-    if (-not (Save-Settings)) {
-        # Benutzeraktion: bei fehlgeschlagenem Speichern zuruecknehmen
-        $script:App.Settings['KeepAliveEnabled'] = $oldValue
-        Invoke-MainRefresh
-        return
-    }
-    $state = 'deaktiviert'
-    if ($script:App.Settings['KeepAliveEnabled']) { $state = 'aktiviert' }
-    Write-AppLog -Message "Scroll-Lock-Aktivhaltung $state."
-    Invoke-MainRefresh
-}
-
 # Zentraler Close-Flow (Fensterschaltflaeche, Kontextmenue, Tray, Alt+F4).
 # Liefert genau eines der Ergebnisse:
 #   'Abbrechen'         - Fenster bleibt geoeffnet, CloseConfirmed bleibt false
@@ -10329,8 +9908,6 @@ function New-CompactContextMenu {
     Add-WpfMenuItem -Menu $menu -Key 'StartDay' -Header 'Arbeitstag starten...' -OnClick { Invoke-StartDayFlow } | Out-Null
     Add-WpfMenuItem -Menu $menu -Key 'SwitchMode' -Header 'Modus wechseln...' -OnClick { Invoke-ModeSwitchFlow } | Out-Null
     Add-WpfMenuItem -Menu $menu -Key 'Pause' -Header 'Pause starten' -OnClick { Invoke-TogglePauseFlow } | Out-Null
-    $keepAliveItem = Add-WpfMenuItem -Menu $menu -Key 'KeepAlive' -Header 'Scroll-Lock-Aktivhaltung' -OnClick { Invoke-ToggleKeepAlive }
-    $keepAliveItem.IsCheckable = $true
     # Ansichts-Presets der kompakten Ansicht (fest eingebaute inkl. 'Minimum'
     # und eigene Presets; das Untermenue wird bei jedem Oeffnen neu aufgebaut)
     $presetSub = New-Object System.Windows.Controls.MenuItem
@@ -10382,7 +9959,6 @@ function Update-MenuState {
         $items['SwitchMode'].IsEnabled = ($hasActive -and $comp -and $null -ne $comp.RunningMode -and -not $comp.MaxReached)
         $items['Pause'].Header = $pauseHeader
         $items['Pause'].IsEnabled = $pauseEnabled
-        $items['KeepAlive'].IsChecked = [bool]$script:App.Settings['KeepAliveEnabled']
         $items['EndDay'].IsEnabled = $hasActive
     }
 
@@ -10392,7 +9968,6 @@ function Update-MenuState {
         $trayItems['SwitchMode'].Enabled = ($hasActive -and $comp -and $null -ne $comp.RunningMode -and -not $comp.MaxReached)
         $trayItems['Pause'].Text = $pauseHeader
         $trayItems['Pause'].Enabled = $pauseEnabled
-        $trayItems['KeepAlive'].Checked = [bool]$script:App.Settings['KeepAliveEnabled']
         $trayItems['EndDay'].Enabled = $hasActive
     }
 
@@ -10467,7 +10042,6 @@ function Enable-TrayIcon {
         & $addItem 'StartDay' 'Arbeitstag starten...' { Invoke-OnUiDispatcher -Action { Invoke-StartDayFlow } }
         & $addItem 'SwitchMode' 'Modus wechseln...' { Invoke-OnUiDispatcher -Action { Invoke-ModeSwitchFlow } }
         & $addItem 'Pause' 'Pause starten' { Invoke-OnUiDispatcher -Action { Invoke-TogglePauseFlow } }
-        & $addItem 'KeepAlive' 'Scroll-Lock-Aktivhaltung' { Invoke-OnUiDispatcher -Action { Invoke-ToggleKeepAlive } }
         & $addItem 'RadioPlay' 'Radio starten' { Invoke-OnUiDispatcher -Action { Switch-RadioPlayback } }
         $radioTraySub = New-Object System.Windows.Forms.ToolStripMenuItem
         $radioTraySub.Text = 'Radiosender'
@@ -10730,23 +10304,14 @@ function Register-ExtendedWindowEvents {
 #region ===== Timer, Einstellungen anwenden, Bereinigung =====
 
 function Start-AppTimers {
-    # Es existiert genau EINE Timerinstanz mit genau EINEM Tick-Handler je
-    # Timer. Mehrfache Aufrufe (z. B. durch wiederholtes Aktivieren der
-    # Aktivhaltung) duerfen keine zusaetzlichen Timer oder Handler anlegen.
+    # Es existiert genau EINE Timerinstanz mit genau EINEM Tick-Handler.
+    # Mehrfache Aufrufe duerfen keine zusaetzlichen Timer oder Handler anlegen.
     if ($script:App.Timers.Main) { return }
     $main = New-Object System.Windows.Threading.DispatcherTimer
     $main.Interval = [TimeSpan]::FromSeconds(1)
     $main.Add_Tick({ Invoke-MainTick })
     $main.Start()
     $script:App.Timers.Main = $main
-
-    # Der Minuten-Timer darf dauerhaft laufen: Test-KeepAliveShouldRun prueft
-    # in jedem Zyklus sauber, ob er arbeiten darf.
-    $keepAlive = New-Object System.Windows.Threading.DispatcherTimer
-    $keepAlive.Interval = [TimeSpan]::FromSeconds([int]$script:App.Settings['KeepAliveIntervalSec'])
-    $keepAlive.Add_Tick({ Invoke-KeepAliveCycle })
-    $keepAlive.Start()
-    $script:App.Timers.KeepAlive = $keepAlive
 }
 
 function Stop-AppTimers {
@@ -10761,13 +10326,6 @@ function Stop-AppTimers {
 # Wird nach dem Speichern der Einstellungen aufgerufen
 function Invoke-SettingsApplied {
     Set-CompactAppearance
-    if ($script:App.Timers.KeepAlive) {
-        $script:App.Timers.KeepAlive.Interval = [TimeSpan]::FromSeconds([int]$script:App.Settings['KeepAliveIntervalSec'])
-    }
-    # Eine ueber die Einstellungen deaktivierte Rollen-Funktion startet keine
-    # neuen Pulse mehr (Test-KeepAliveShouldRun); ein bereits laufender
-    # Doppelpuls beendet sich regulaer im Hintergrund. Kein Tastenzustand
-    # wird abgefragt, keine zusaetzliche Umschaltung durchgefuehrt.
     if ([bool]$script:App.Settings['TrayIconEnabled']) { Enable-TrayIcon }
     else { Disable-TrayIcon }
     $win = $script:App.Ui.Compact
@@ -10833,13 +10391,8 @@ function Stop-ApplicationDispatcher {
 
 function Invoke-AppCleanup {
     $script:App.ShuttingDown = $true
-    # Ab jetzt keine neuen Scroll-Lock-Pulse mehr (threadsicher im C#)
-    try { [ArbeitszeitTool.NativeInput]::BeginShutdown() } catch { }
     Stop-AppTimers
     try { [ArbeitszeitTool.SessionMonitor]::Stop() } catch { }
-    # Hoechstens kurz (max. ~500 ms) auf einen laufenden Doppelpuls warten;
-    # das Beenden wird nicht dauerhaft blockiert (siehe Wait-Funktion).
-    Wait-ScrollLockPulseCompletion
     # Internetradio kontrolliert beenden - eine Ausnahme hier darf den
     # finalen Speichervorgang NICHT verhindern
     try { Clear-RadioPlayer } catch { }
@@ -10916,10 +10469,6 @@ function Invoke-InternalTests {
     Initialize-AppState
     $script:App.Settings = Get-DefaultSettings
     $script:App.Data = $null   # verhindert echte Speicherzugriffe waehrend der Tests
-    # WICHTIG: Der automatische Testlauf sendet NIEMALS echte Scroll-Lock-
-    # Eingaben - saemtliche SendInput-Aufrufe werden im C# simuliert
-    # (TestFailMode=3 = simulierter Erfolg; 1/2/4 = simulierte Fehler).
-    [ArbeitszeitTool.NativeInput]::TestFailMode = 3
 
     $results = New-Object System.Collections.ArrayList
     $assert = {
@@ -11061,83 +10610,6 @@ function Invoke-InternalTests {
     & $assert 'Test 14c: Abschlussgrund Tageswechsel' 'Tageswechsel' ([string]$day.EndReason)
     & $assert 'Test 14d: Netto bis 00:00 = 02:00' '02:00' (Format-Duration $comp.Netto)
     & $assert 'Test 14e: kein neuer Tag automatisch gestartet' 'True' ([string]($null -eq (Get-ActiveDayFromList @($day))))
-
-    # --- Tests 15/16: Scroll-Lock-Doppelpuls (entkoppelt, ohne Zustandspruefung) ---
-    # Der komplette Doppelpuls laeuft im SIMULATIONSMODUS (TestFailMode=3):
-    # der automatische Testlauf sendet keine echten Scroll-Lock-Eingaben.
-    # Zeitablauf (Thread.Sleep), ThreadPool und Interlocked sind dabei echt;
-    # bewertet wird anhand der C#-Diagnose - ohne Tastenzustandsabfrage.
-    [void][ArbeitszeitTool.NativeInput]::DrainPulseResults()
-    $pulseStartSw = [System.Diagnostics.Stopwatch]::StartNew()
-    $pulseStarted = [ArbeitszeitTool.NativeInput]::StartScrollLockPulse(200)
-    $pulseStartMs = $pulseStartSw.ElapsedMilliseconds
-    if ($pulseStarted) {
-        & $assert 'Test 15a: Pulsstart kehrt sofort zurueck (blockiert den UI-Thread nicht)' 'True' ([string]($pulseStartMs -lt 100))
-        $parallelBlocked = -not [ArbeitszeitTool.NativeInput]::StartScrollLockPulse(200)
-        & $assert 'Test 15b: paralleler Puls wird verhindert (Interlocked)' 'True' ([string]$parallelBlocked)
-        $deadline = [System.Diagnostics.Stopwatch]::StartNew()
-        while ([ArbeitszeitTool.NativeInput]::IsPulseRunning() -and $deadline.ElapsedMilliseconds -lt 2000) { Start-Sleep -Milliseconds 25 }
-        & $assert 'Test 15c: Doppelpuls beendet sich selbststaendig und gibt den Laufstatus frei' 'False' ([string][ArbeitszeitTool.NativeInput]::IsPulseRunning())
-        $okEntry = ''
-        foreach ($pe in @([ArbeitszeitTool.NativeInput]::DrainPulseResults())) {
-            if (([string]$pe).StartsWith('OK')) { $okEntry = [string]$pe }
-        }
-        & $assert 'Test 15d: genau zwei vollstaendige Tastendruecke (je Key Down + Key Up uebernommen)' 'True' ([string]($okEntry -match 'accepted1=2 accepted2=2'))
-        $gapOk = $false
-        if ($okEntry -match 'elapsedMs=(\d+)') { $gapOk = ([int]$Matches[1] -ge 150 -and [int]$Matches[1] -le 350) }
-        & $assert 'Test 15e: Abstand zwischen den Tastendruecken ~200 ms' 'True' ([string]$gapOk)
-        & $assert 'Test 15f: Doppelpuls laeuft auf einem Hintergrund-Thread (ThreadPool, nicht WPF-UI)' 'True' ([string]($okEntry -match 'pool=True'))
-        & $assert 'Test 15g: der Testlauf hat die Simulation verwendet (keine echten Eingaben)' 'True' ([string]($okEntry -match 'test=True'))
-        # Nach Abschluss kann der naechste Puls regulaer starten
-        $secondStart = [ArbeitszeitTool.NativeInput]::StartScrollLockPulse(100)
-        & $assert 'Test 16a: nach Abschluss startet der naechste Puls regulaer' 'True' ([string]$secondStart)
-        $deadline = [System.Diagnostics.Stopwatch]::StartNew()
-        while ([ArbeitszeitTool.NativeInput]::IsPulseRunning() -and $deadline.ElapsedMilliseconds -lt 2000) { Start-Sleep -Milliseconds 25 }
-        [void][ArbeitszeitTool.NativeInput]::DrainPulseResults()
-    }
-    else {
-        Write-Host '[SKIP] Test 15: Scroll-Lock-Puls in dieser Umgebung nicht startbar (z. B. Dienst-Sitzung).' -ForegroundColor Yellow
-        [void][ArbeitszeitTool.NativeInput]::DrainPulseResults()
-    }
-    # Test 16b-16e: Fehlerpfade (simuliert ueber TestFailMode - es werden
-    # KEINE echten Eingaben gesendet und keine Nebenwirkungen ausgeloest)
-    $script:App.Settings['KeepAliveEnabled'] = $true
-    $script:App.KeepAlive.ConsecutiveErrors = 0
-    foreach ($failMode in @(1, 2)) {
-        [ArbeitszeitTool.NativeInput]::TestFailMode = $failMode
-        [void][ArbeitszeitTool.NativeInput]::StartScrollLockPulse(100)
-        $deadline = [System.Diagnostics.Stopwatch]::StartNew()
-        while ([ArbeitszeitTool.NativeInput]::IsPulseRunning() -and $deadline.ElapsedMilliseconds -lt 2000) { Start-Sleep -Milliseconds 25 }
-        [ArbeitszeitTool.NativeInput]::TestFailMode = 3
-        $failEntries = @([ArbeitszeitTool.NativeInput]::DrainPulseResults())
-        Invoke-ScrollLockPulseLogDrain -Entries $failEntries
-        $hasError = $false
-        foreach ($fe in $failEntries) { if (([string]$fe).StartsWith('FEHLER')) { $hasError = $true } }
-        & $assert ('Test 16b: Fehler beim ' + $failMode + '. Tastendruck wird nur als Diagnose erfasst') 'True' ([string]$hasError)
-    }
-    & $assert 'Test 16c: SendInput-Fehler deaktivieren die Funktion NICHT (KeepAliveEnabled unveraendert)' 'True' ([string]$script:App.Settings['KeepAliveEnabled'])
-    & $assert 'Test 16d: SendInput-Fehler loesen keinen Tresorspeichervorgang aus' 'False False' ("$($script:App.Flags.SaveInProgress) $($script:App.Flags.UnsavedChanges)")
-    # Test 16e: Drosselung identischer Fehler (1., 10., 20. Fehler; erster
-    # spaeterer Erfolg einmalig) - injizierte Eintraege, keine echten Pulse
-    $script:App.KeepAlive.ConsecutiveErrors = 0
-    $logCountBefore = @($script:StartupLogBuffer).Count
-    $fakeErrors = New-Object System.Collections.ArrayList
-    for ($i = 0; $i -lt 25; $i++) { [void]$fakeErrors.Add('FEHLER|Simulierter identischer Fehler') }
-    Invoke-ScrollLockPulseLogDrain -Entries $fakeErrors
-    $afterErrors = @($script:StartupLogBuffer).Count
-    Invoke-ScrollLockPulseLogDrain -Entries @('OK|accepted1=2 accepted2=2 gapMs=200 elapsedMs=200 pool=True')
-    Invoke-ScrollLockPulseLogDrain -Entries @('OK|accepted1=2 accepted2=2 gapMs=200 elapsedMs=200 pool=True')
-    $afterSuccess = @($script:StartupLogBuffer).Count
-    & $assert 'Test 16e: 25 identische Fehler ergeben nur 3 Protokolleintraege (1., 10., 20.)' '3' ([string]($afterErrors - $logCountBefore))
-    & $assert 'Test 16f: erster wieder erfolgreicher Puls wird genau einmal protokolliert' '1' ([string]($afterSuccess - $afterErrors))
-    # Test 16g: Der normale Produktivbetrieb fragt den Scroll-Lock-Zustand
-    # nicht ab (Quelltextpruefung der produktiven Scroll-Lock-Region;
-    # GetScrollLockState ist dem manuellen Diagnosetest vorbehalten).
-    $slSource = [System.IO.File]::ReadAllText($PSCommandPath)
-    $slStart = $slSource.IndexOf('#region ===== Scroll-Lock-Aktivhaltung')
-    $slEnd = $slSource.IndexOf('#endregion', $slStart)
-    $slRegion = $slSource.Substring($slStart, $slEnd - $slStart)
-    & $assert 'Test 16g: produktive Scroll-Lock-Logik ohne Zustandsabfrage (kein GetScrollLockState/GetKeyState)' 'False False' ("$($slRegion.Contains('GetScrollLockState')) $($slRegion.Contains('GetKeyState'))")
 
     # --- Test 17: Fensterposition ausserhalb der Monitore wird korrigiert ---
     $oneScreen = @(@{ Left = 0; Top = 0; Width = 1920; Height = 1080 })
@@ -11515,10 +10987,10 @@ function Invoke-InternalTests {
         & $assert 'Test 40f: Semikolon wird weiterhin maskiert' '"a;b"' (Get-CsvEscaped -Value 'a;b')
 
         # --- Test 41: entfallen ---
-        # Die frueheren Wiederherstellungs-Kerntests sind mit der Entkopplung
-        # der Scroll-Lock-Funktion (einfacher C#-Doppelpuls ohne
-        # Zustandspruefung) gegenstandslos; die Doppelpuls-Tests befinden
-        # sich in den Tests 15/16.
+        # Die frueheren Wiederherstellungs-Kerntests der Scroll-Lock-Funktion
+        # sind gegenstandslos. Ebenso entfallen mit Version 1.1.0 die Tests
+        # 15/16 und 70: die Scroll-Lock-Aktivhaltung wurde vollstaendig
+        # entfernt (Kompatibilitaet alter Einstellungen: Test 118).
 
         # --- Test 42: Feste Betriebspause bei exakt 06:00 (Randwerte) ---
         $day = New-TestDay
@@ -11908,7 +11380,7 @@ function Invoke-InternalTests {
             $content.Arrange((New-Object System.Windows.Rect(0, 0, $contentWidth, $content.DesiredSize.Height)))
             $content.UpdateLayout()
             $wrapOk = $true
-            foreach ($name in @('ChkTopmostReassert', 'ChkWarn', 'ChkSound', 'ChkTray', 'ChkSeconds', 'ChkKeepAlive')) {
+            foreach ($name in @('ChkTopmostReassert', 'ChkWarn', 'ChkSound', 'ChkTray', 'ChkSeconds')) {
                 $cb = $setWin.FindName($name)
                 if ($null -eq $cb -or $cb.Content -isnot [System.Windows.Controls.TextBlock] -or $cb.Content.TextWrapping -ne [System.Windows.TextWrapping]::Wrap) { $wrapOk = $false }
             }
@@ -11956,26 +11428,10 @@ function Invoke-InternalTests {
         }
 
         # =====================================================================
-        # Tests 70-83: Scroll-Lock-Feinschliff, Startablauf, Neustartverhalten,
+        # Tests 71-83: Startablauf, Neustartverhalten,
         # Internetradio und Sichtschutz - ohne echte Tastendruecke und ohne
         # echte Netzwerk-/Streamzugriffe.
         # =====================================================================
-
-        # --- Test 70: abgelehnter Hintergrundauftrag gibt den Pulsstatus frei ---
-        [ArbeitszeitTool.NativeInput]::TestFailMode = 4
-        $rejectedStart = [ArbeitszeitTool.NativeInput]::StartScrollLockPulse(200)
-        [ArbeitszeitTool.NativeInput]::TestFailMode = 3
-        $rejectLogged = $false
-        foreach ($re in @([ArbeitszeitTool.NativeInput]::DrainPulseResults())) {
-            if (([string]$re).Contains('nicht angenommen')) { $rejectLogged = $true }
-        }
-        & $assert 'Test 70a: QueueUserWorkItem=false liefert false und neutralen Diagnoseeintrag' 'False True' ("$rejectedStart $rejectLogged")
-        & $assert 'Test 70b: _pulseRunning bleibt nicht haengen (kein Puls aktiv)' 'False' ([string][ArbeitszeitTool.NativeInput]::IsPulseRunning())
-        $retryStart = [ArbeitszeitTool.NativeInput]::StartScrollLockPulse(100)
-        & $assert 'Test 70c: naechster regulaerer Versuch startet wieder' 'True' ([string]$retryStart)
-        $deadline = [System.Diagnostics.Stopwatch]::StartNew()
-        while ([ArbeitszeitTool.NativeInput]::IsPulseRunning() -and $deadline.ElapsedMilliseconds -lt 2000) { Start-Sleep -Milliseconds 25 }
-        [void][ArbeitszeitTool.NativeInput]::DrainPulseResults()
 
         # --- Test 71: Regulaeres Schliessen laesst den laufenden Abschnitt unveraendert ---
         $closeDay = New-TestDay -DateText ((Get-Date).ToString('yyyy-MM-dd'))
@@ -12082,9 +11538,9 @@ function Invoke-InternalTests {
         $radio78.DesiredState = 'Playing'
         & $assert 'Test 79c: nur die aktuellste gueltige Open-Anforderung darf starten' 'True' ([string](Test-RadioOpenStillValid -RequestId 5))
         $fp79 = Get-DayContentFingerprint -Day $closeDay
-        $keep79 = [bool]$script:App.Settings['KeepAliveEnabled']
+        $keep79 = [bool]$script:App.Settings['TrayIconEnabled']
         Invoke-RadioMediaFailed
-        & $assert 'Test 79d: Radiofehler veraendert weder Arbeitstag noch Einstellungen noch Speicherstatus' "$fp79|$keep79|False" ("$(Get-DayContentFingerprint -Day $closeDay)|$($script:App.Settings['KeepAliveEnabled'])|$($script:App.Flags.SaveInProgress)")
+        & $assert 'Test 79d: Radiofehler veraendert weder Arbeitstag noch Einstellungen noch Speicherstatus' "$fp79|$keep79|False" ("$(Get-DayContentFingerprint -Day $closeDay)|$([bool]$script:App.Settings['TrayIconEnabled'])|$($script:App.Flags.SaveInProgress)")
 
         # --- Test 80: vault.txn enthaelt keine absoluten Pfade ---
         $prepared80 = @(
@@ -12162,7 +11618,7 @@ function Invoke-InternalTests {
             $script:App.Ui.Compact = $cwin84
             $script:App.Ui.Tray = [pscustomobject]@{ Visible = $true }   # funktionierendes Tray-Symbol simulieren
             Start-AppTimers
-            $timersBefore84 = @($script:App.Timers.Main, $script:App.Timers.KeepAlive)
+            $timersBefore84 = @($script:App.Timers.Main)
             $script:App.Radio.DesiredState = 'Paused'
             $cycleOk = $true
             for ($i = 1; $i -le 10; $i++) {
@@ -12173,8 +11629,8 @@ function Invoke-InternalTests {
             }
             Show-CompactWindow
             & $assert 'Test 84b: 10x Verbergen/Anzeigen DERSELBEN Fensterinstanz funktioniert' 'True True' ("$cycleOk $($cwin84.IsVisible)")
-            & $assert 'Test 84c: Ausblenden beendet nichts - Timer, Arbeitstag und Radiozustand laufen unveraendert weiter' 'True|True|False|Aktiv|Paused' ("$($script:App.Timers.Main.IsEnabled)|$($script:App.Timers.KeepAlive.IsEnabled)|$($script:App.ShuttingDown)|$($hideDay['Status'])|$($script:App.Radio.DesiredState)")
-            & $assert 'Test 84d: Verbergen/Anzeigen erzeugt keine neuen Timerinstanzen' 'True True' ("$([object]::ReferenceEquals($timersBefore84[0], $script:App.Timers.Main)) $([object]::ReferenceEquals($timersBefore84[1], $script:App.Timers.KeepAlive))")
+            & $assert 'Test 84c: Ausblenden beendet nichts - Timer, Arbeitstag und Radiozustand laufen unveraendert weiter' 'True|False|Aktiv|Paused' ("$($script:App.Timers.Main.IsEnabled)|$($script:App.ShuttingDown)|$($hideDay['Status'])|$($script:App.Radio.DesiredState)")
+            & $assert 'Test 84d: Verbergen/Anzeigen erzeugt keine neue Timerinstanz' 'True' ("$([object]::ReferenceEquals($timersBefore84[0], $script:App.Timers.Main))")
             # Fallback ohne funktionierendes Tray-Symbol: minimieren statt verstecken
             $script:App.Ui.Tray = [pscustomobject]@{ Visible = $false }
             Hide-CompactWindow
@@ -12197,7 +11653,7 @@ function Invoke-InternalTests {
             $setWin85 = New-XamlWindow -Xaml $script:SettingsXaml
             $tab85 = $setWin85.FindName('TabSettings')
             $headers85 = (@($tab85.Items | ForEach-Object { [string]$_.Header }) -join '|')
-            & $assert 'Test 85a: alle Einstellungsbereiche sind als Tabs erreichbar' 'Allgemein|Kompakte Ansicht|Aktivhaltung|Internetradio' $headers85
+            & $assert 'Test 85a: alle Einstellungsbereiche sind als Tabs erreichbar' 'Allgemein|Kompakte Ansicht|Internetradio' $headers85
             $sizeOk85 = ($setWin85.Width -ge 720 -and $setWin85.Width -le 820 -and $setWin85.Height -ge 560 -and $setWin85.Height -le 680 -and $setWin85.MinWidth -gt 0 -and $setWin85.MinHeight -gt 0 -and $setWin85.ResizeMode -eq [System.Windows.ResizeMode]::CanResize)
             & $assert 'Test 85b: feste sinnvolle Ausgangsgroesse mit Min-Grenzen, Fenster bleibt verkleinerbar' 'True' ([string]$sizeOk85)
             # Speichern/Abbrechen liegen AUSSERHALB des TabControls (immer sichtbar)
@@ -13111,7 +12567,7 @@ function Invoke-InternalTests {
         # --- Tests 114: optionaler PC-Shutdown beim Anwendungsschliessen ------
         # Saemtliche Shutdowns sind AUSSCHLIESSLICH simuliert (TestMode):
         # shutdown.exe wird niemals gestartet, kein Radiostream, kein Netzwerk,
-        # keine Scroll-Lock-Eingaben, keine produktiven Dateien.
+        # keine produktiven Dateien.
         $origOffer114 = [bool]$script:App.Settings['ShutdownOfferEnabled']
         $script:App.CurrentDay = $null
         $script:App.CloseConfirmed = $false
@@ -13381,6 +12837,31 @@ function Invoke-InternalTests {
         $repaired117 = Repair-VaultTransactionState
         Complete-VaultTransactionCleanup
         & $assert 'Test 117c: Startreparatur stellt den Dateisatz mit dem aktuellen Passwort vollstaendig wieder her' 'True|True|True|True|0' ("$repaired117|$(& $readable29 $script:Paths.VaultFile $newKeys116)|$(& $readable29 $script:Paths.VaultBackup1 $newKeys116)|$(& $readable29 $script:Paths.VaultBackup2 $newKeys116)|$(& $leftovers117)")
+
+        # --- Test 118: Tresor aus 1.0.0 mit Scroll-Lock-Einstellungen bleibt ladbar ---
+        $old118 = New-VaultDataObject
+        $old118['Settings']['KeepAliveEnabled'] = $true
+        $old118['Settings']['KeepAliveIntervalSec'] = 30
+        $old118['Settings']['CompactFields'] = @('Beginn', 'ScrollLock', 'Netto')
+        $old118['Settings']['CompactPresets'] = @(
+            [ordered]@{ Id = 'p1'; Name = 'Nur Scroll'; Fields = @('ScrollLock') },
+            [ordered]@{ Id = 'p2'; Name = 'Gemischt'; Fields = @('Netto', 'ScrollLock') })
+        $old118Path = Join-Path $script:Paths.Data 'alt118.azt'
+        Write-VaultToFile -Path $old118Path -Vault $old118 -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey -Salt $script:VaultSession.Salt -Iterations $script:VaultSession.Iterations
+        $loaded118 = Read-VaultFromFile -Path $old118Path -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
+        Remove-Item -LiteralPath $old118Path -Force
+        Set-ActiveVault -Vault $loaded118
+        $s118 = $script:App.Settings
+        $presets118 = (@($s118['CompactPresets']) | ForEach-Object { "$($_['Name'])=$(@($_['Fields']) -join '+')" }) -join ','
+        & $assert 'Test 118a: alte Aktivhaltungswerte verworfen, Feld ScrollLock aus Auswahl und Presets entfernt' 'False|False|Beginn+Netto|Gemischt=Netto' ("$($s118.Contains('KeepAliveEnabled'))|$($s118.Contains('KeepAliveIntervalSec'))|$(@($s118['CompactFields']) -join '+')|$presets118")
+        $onlyOld118 = Get-ValidatedSettings -Loaded ([ordered]@{ CompactFields = @('ScrollLock') })
+        & $assert 'Test 118b: nur unbekannte Felder gespeichert -> Standardauswahl' 'Beginn+Netto+SollRestOderUeberstunden+MaxEnde' (@($onlyOld118['CompactFields']) -join '+')
+        $save118 = Save-Vault
+        $raw118 = Unprotect-VaultContainer -Container (Read-VaultContainerFromFile -Path $script:Paths.VaultFile) -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
+        & $assert 'Test 118c: gespeicherter Tresor enthaelt keine Aktivhaltungswerte mehr' 'True|False|False' ("$save118|$($raw118.Contains('KeepAlive'))|$($raw118.Contains('ScrollLock'))")
+        $src118 = [System.IO.File]::ReadAllText($PSCommandPath)
+        & $assert 'Test 118d: Quelltext enthaelt keine Tastatureingabe-Simulation mehr' 'False|False|False' ("$($src118.Contains('Send' + 'Input'))|$($src118.Contains('Native' + 'Input'))|$($src118.Contains('keybd' + '_event'))")
+
         Clear-VaultKeys -Keys $newKeys116
         Clear-VaultKeys -Keys $keysF116
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($newPwd116)
@@ -13391,7 +12872,6 @@ function Invoke-InternalTests {
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($wrongPwdBytes)
     }
     finally {
-        [ArbeitszeitTool.NativeInput]::TestFailMode = 0
         Clear-VaultSessionKeys
         $script:Paths = $origPaths
         Initialize-AppState
@@ -13419,88 +12899,6 @@ function Get-ActiveDayFromList {
         if ($day.Status -eq 'Aktiv') { return $day }
     }
     return $null
-}
-
-# AUSDRUECKLICH OPTIONALER manueller Windows-Integrationstest der Scroll-Lock-
-# Aktivhaltung (-RunScrollLockManualTest). Er loest ECHTE Doppelpulse aus und
-# laeuft nur nach ausdruecklicher Bestaetigung. NUR HIER ist die
-# Zustandsabfrage (GetScrollLockState) zulaessig - der normale
-# Produktivbetrieb fragt den Scroll-Lock-Zustand nicht ab. Das Ergebnis ist
-# ehrlich als manuell bzw. systemabhaengig gekennzeichnet; es werden keine
-# Arbeitszeitdaten und keine Tresordateien veraendert.
-function Invoke-ScrollLockManualTest {
-    $script:TestMode = $true   # keine Dialoge
-    Write-Host ''
-    Write-Host '=== ArbeitszeitTool - manueller Scroll-Lock-Integrationstest ===' -ForegroundColor Cyan
-    Write-Host 'Dieser Test loest mehrere ECHTE Scroll-Lock-Doppelpulse aus. Die zwei' -ForegroundColor Yellow
-    Write-Host 'Tastendruecke je Puls heben sich im Normalfall gegenseitig auf.' -ForegroundColor Yellow
-    Write-Host 'Das Ergebnis ist systemabhaengig (Treiber, Sitzungsart, Remotezugriff).' -ForegroundColor Yellow
-    $confirm = Read-Host 'Zum Starten JA eingeben (alles andere bricht ab)'
-    if ($confirm -ne 'JA') {
-        Write-Host 'Abgebrochen - es wurde nichts veraendert.'
-        return 0
-    }
-    $actualSize = [int][ArbeitszeitTool.NativeInput]::GetActualInputSize()
-    $expectedSize = [int][ArbeitszeitTool.NativeInput]::GetExpectedInputSize()
-    Write-Host ('INPUT-Strukturgroesse: {0} Byte (erwartet {1})' -f $actualSize, $expectedSize)
-    if ($actualSize -ne $expectedSize) {
-        Write-Host 'Unerwartete Strukturgroesse - der Test wird nicht ausgefuehrt.' -ForegroundColor Red
-        return 1
-    }
-    $readState = {
-        try { return @{ Ok = $true; State = [bool][ArbeitszeitTool.NativeInput]::GetScrollLockState() } }
-        catch { return @{ Ok = $false; State = $false } }
-    }
-    $initialRead = & $readState
-    if (-not $initialRead.Ok) {
-        Write-Host 'Zustandsabfrage nicht moeglich - Test abgebrochen.' -ForegroundColor Red
-        return 1
-    }
-    $initialState = [bool]$initialRead.State
-    Write-Host ('Ausgangszustand der Rollen-Taste: {0}' -f $(if ($initialState) { 'AN' } else { 'AUS' }))
-    [void][ArbeitszeitTool.NativeInput]::DrainPulseResults()
-    $failures = 0
-    for ($cycle = 1; $cycle -le 3; $cycle++) {
-        $started = [ArbeitszeitTool.NativeInput]::StartScrollLockPulse([int]$script:KeepAliveConst.PulseGapMs)
-        if (-not $started) {
-            Write-Host ('Zyklus {0}: Puls konnte nicht gestartet werden.' -f $cycle) -ForegroundColor Red
-            $failures++
-            continue
-        }
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        while ([ArbeitszeitTool.NativeInput]::IsPulseRunning() -and $sw.ElapsedMilliseconds -lt 3000) {
-            Start-Sleep -Milliseconds 25
-        }
-        Start-Sleep -Milliseconds 100
-        $after = & $readState
-        $ok = ($after.Ok -and ([bool]$after.State -eq $initialState))
-        if (-not $ok) { $failures++ }
-        $color = 'Green'
-        if (-not $ok) { $color = 'Red' }
-        Write-Host ('Zyklus {0}: Zustand nach dem Doppelpuls {1}' -f $cycle, $(if ($ok) { 'UNVERAENDERT (OK)' } else { 'ABWEICHEND' })) -ForegroundColor $color
-    }
-    foreach ($entry in @([ArbeitszeitTool.NativeInput]::DrainPulseResults())) {
-        Write-Host ('  Diagnose: ' + $entry) -ForegroundColor DarkGray
-    }
-    # Bestmoegliche Wiederherstellung, falls ein Puls den Zustand veraendert
-    # hat (Umschaltung anhand des gelesenen Zustands ist NUR hier zulaessig)
-    $final = & $readState
-    if ($final.Ok -and ([bool]$final.State -ne $initialState)) {
-        Write-Host 'Zustand weicht ab - einmalige Wiederherstellung per Tastendruck...' -ForegroundColor Yellow
-        [void][ArbeitszeitTool.NativeInput]::ToggleScrollLock()
-        Start-Sleep -Milliseconds 100
-        $final = & $readState
-    }
-    Write-Host ('Endzustand: {0} (Ausgangszustand: {1})' -f $(if ($final.State) { 'AN' } else { 'AUS' }), $(if ($initialState) { 'AN' } else { 'AUS' }))
-    Write-Host ''
-    Write-Host 'Zusaetzliche manuelle Pruefung im laufenden Programm (nicht automatisierbar):' -ForegroundColor Yellow
-    Write-Host ' - mehrere Pulse bei sichtbarer kompakter Ansicht' -ForegroundColor Yellow
-    Write-Host ' - mehrere Pulse bei geoeffneter erweiterter Ansicht' -ForegroundColor Yellow
-    Write-Host ' - mehrere Pulse bei geoeffnetem Einstellungsdialog' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host ('Ergebnis (MANUELL / SYSTEMABHAENGIG): {0} von 3 Zyklen unauffaellig.' -f (3 - $failures)) -ForegroundColor Cyan
-    if ($failures -gt 0) { return 1 }
-    return 0
 }
 
 #endregion
@@ -13911,7 +13309,7 @@ function Start-Application {
 
     # Nichtmodale Lebensdauersteuerung: Das kompakte Fenster ist KEIN modaler
     # Lebensdauer-Anker mehr. Hide() (Ausblenden in den Infobereich) beendet
-    # die Anwendung nicht; Timer, Radio, Scroll-Lock-Aktivhaltung und
+    # die Anwendung nicht; Timer, Radio und
     # Lock-/Unlock-Verarbeitung laufen unsichtbar weiter. Die Anwendung endet
     # erst, wenn Stop-ApplicationDispatcher den Dispatcher herunterfaehrt
     # (nach ENDGUELTIG bestaetigtem Schliessen) - erst danach laeuft
@@ -13927,15 +13325,6 @@ if ($RunTests) {
     # keine echten Benutzerdaten (siehe Invoke-InternalTests).
     Initialize-AppState
     $exitCode = Invoke-InternalTests
-    exit $exitCode
-}
-
-if ($RunScrollLockManualTest) {
-    # Optionaler manueller Integrationstest mit echten Tastendruecken -
-    # laeuft nur nach ausdruecklicher Bestaetigung (siehe Funktion).
-    Initialize-AppState
-    $script:App.Settings = Get-DefaultSettings
-    $exitCode = Invoke-ScrollLockManualTest
     exit $exitCode
 }
 
