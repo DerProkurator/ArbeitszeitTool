@@ -175,6 +175,11 @@ Vorgang ist ein nachvollziehbarer mehrstufiger Ablauf:
 3. Die Backups werden zuerst ausgetauscht, die **Hauptdatei zuletzt**. Die `*.old`-Dateien
    (vollständiger alter Stand) bleiben erhalten, bis die neue Hauptdatei abschließend
    erneut validiert wurde — erst dann werden sie entfernt.
+4. Das Schreibjournal `vault.pending.azt` wird anschließend in-place mit der neuen
+   Hauptdatei überschrieben, sodass kein Stand mit dem alten Passwort im Tresorordner
+   verbleibt. Scheitert das, ersetzt es der nächste Speichervorgang; ein dabei
+   fehlschlagendes Speichern schreibt nie einen Journalstand zurück, der mit dem
+   aktuellen Passwort nicht lesbar ist.
 
 Wird der Vorgang hart unterbrochen (Absturz, Stromausfall), erkennt der nächste
 Programmstart die Zwischenzustände: fehlende Zieldateien werden aus `*.old`- bzw.
@@ -183,6 +188,11 @@ kontrolliert übernommen oder verschlüsselt in den `Recovery`-Ordner archiviert
 verbleibt kein gemischter, dauerhaft unklarer Dateisatz, und es wird nichts gelöscht,
 bevor die aktuelle Hauptdatei validiert wurde. Schlägt ein Schritt fehl, bleibt der
 bisherige Tresor mit dem bisherigen Passwort vollständig erhalten.
+
+**Hinweis Cloud-Ordner:** Der Versionsverlauf bzw. Papierkorb des Cloud-Dienstes
+(OneDrive/SharePoint) enthält weiterhin ältere Versionen der Tresordateien, die mit dem
+**alten** Passwort verschlüsselt sind. Wird das Passwort geändert, weil das alte bekannt
+geworden sein könnte, sollten diese älteren Versionen im Cloud-Dienst gelöscht werden.
 
 ## Migration vorhandener Klartextdaten
 
@@ -195,8 +205,8 @@ unverschlüsselten Version (`worktime.json`, `worktime.backup.json`, `settings.j
 3. `worktime.json` lesen und vollständig validieren; ist sie nicht vorhanden, leer oder
    unbrauchbar, wird **`worktime.backup.json` als alternative Datenquelle** gelesen und
    vollständig validiert — die tatsächlich verwendete Quelle wird festgehalten
-4. Daten im Arbeitsspeicher zusammenführen und verschlüsselt über eine temporäre
-   **verschlüsselte** Pending-Datei schreiben, erneut entschlüsseln und prüfen
+4. Daten im Arbeitsspeicher zusammenführen und verschlüsselt über das
+   **verschlüsselte** Schreibjournal (`vault.pending.azt`) schreiben, erneut entschlüsseln und prüfen
 5. den neuen Tresor erneut lesen und die **Datenzahlen** (Tage, Abschnitte, Pausen,
    Sperrintervalle, Korrekturen) mit der Klartextquelle vergleichen; danach
    verschlüsseltes Backup erzeugen und prüfen

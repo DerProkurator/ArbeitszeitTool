@@ -1495,6 +1495,7 @@ function Save-Vault {
     # Ruecknahme im Fehlerfall und fuer backup1
     $oldMainBytes = $null
     $oldPendingBytes = $null
+    $oldPendingUnreadable = $null
     $journalTouched = $false
     try {
         # 1. Validierung im Speicher - ungueltige Daten werden niemals geschrieben
@@ -1598,6 +1599,18 @@ function Save-Vault {
         #    Der bisherige Journalinhalt wird fuer die Ruecknahme gemerkt.
         if (Test-Path -LiteralPath $script:Paths.VaultPending) {
             try { $oldPendingBytes = [System.IO.File]::ReadAllBytes($script:Paths.VaultPending) } catch { $oldPendingBytes = $null }
+            # Nur einen mit dem aktuellen Schluessel lesbaren Journalstand fuer
+            # die Ruecknahme merken - nie z. B. einen Stand mit altem Passwort
+            # zurueckschreiben (Fallback: bisherige Hauptdatei). Im Ruhezustand
+            # spiegelt das Journal die Hauptdatei; dann entfaellt die Pruefung.
+            if ($null -ne $oldPendingBytes -and -not ($null -ne $oldMainBytes -and
+                    (Get-BytesSha256Hex -Bytes $oldPendingBytes) -eq (Get-BytesSha256Hex -Bytes $oldMainBytes))) {
+                try {
+                    Read-VaultFromFile -Path $script:Paths.VaultPending `
+                        -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey | Out-Null
+                }
+                catch { $oldPendingUnreadable = $oldPendingBytes; $oldPendingBytes = $null }
+            }
         }
         $journalTouched = $true
         Write-FileInPlace -Path $script:Paths.VaultPending -Bytes $newBytes
@@ -1789,6 +1802,11 @@ function Save-Vault {
                 }
                 elseif ($null -ne $oldMainBytes) {
                     Write-FileInPlace -Path $script:Paths.VaultPending -Bytes $oldMainBytes
+                }
+                elseif ($null -ne $oldPendingUnreadable) {
+                    # Ohne Hauptdatei gibt es keinen besseren Stand: den
+                    # bisherigen Journalinhalt unveraendert zurueckschreiben.
+                    Write-FileInPlace -Path $script:Paths.VaultPending -Bytes $oldPendingUnreadable
                 }
                 elseif (Test-Path -LiteralPath $script:Paths.VaultPending) {
                     # Erster Speichervorgang ohne bisherigen Stand: es gibt
@@ -8577,6 +8595,21 @@ function Invoke-VaultReencryption {
         # Abschlusspruefung: Die neue Hauptdatei muss sich mit dem neuen
         # Passwort erneut oeffnen lassen, BEVOR alte Dateien entfernt werden.
         Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $NewAesKey -HmacKey $NewHmacKey | Out-Null
+        # Das dauerhafte Journal darf keinen Stand mit dem alten Passwort
+        # behalten: in-place mit der neuen Hauptdatei ueberschreiben (keine
+        # Loeschung im Cloud-Ordner). Ein Fehler hier rollt die bereits
+        # validierte Umverschluesselung nicht zurueck.
+        if (Test-Path -LiteralPath $script:Paths.VaultPending) {
+            try {
+                if ($script:TestMode -and $script:App -and $script:App.Flags.TestFailJournalMirror) {
+                    throw (New-Object System.IO.IOException 'TESTHOOK: Journalspiegel deaktiviert')
+                }
+                Write-FileInPlace -Path $script:Paths.VaultPending -Bytes ([System.IO.File]::ReadAllBytes($script:Paths.VaultFile))
+            }
+            catch {
+                Write-AppLog -Level 'WARN' -Message 'Journal (vault.pending.azt) konnte nach der Passwortänderung nicht neu geschrieben werden; es wird beim nächsten Speichern ersetzt.'
+            }
+        }
         foreach ($d in @($done)) {
             try { Remove-Item -LiteralPath $d.Old -Force -ErrorAction SilentlyContinue } catch { }
         }
@@ -8871,7 +8904,7 @@ function Initialize-AppState {
         # Benutzerinfo bei fehlgeschlagener Best-Effort-Backuprotation.
         # TestFail*: reine Testhooks fuer -RunTests (nur bei $script:TestMode
         # wirksam, im normalen Programmbetrieb vollstaendig inaktiv).
-        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailMainWrite = $false; TestFailMainRestore = $false; TestFailBackupCopy = $false; TestFailBackup1Write = $false; TestFailPostCommitHash = $false }
+        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailMainWrite = $false; TestFailMainRestore = $false; TestFailBackupCopy = $false; TestFailBackup1Write = $false; TestFailPostCommitHash = $false; TestFailJournalMirror = $false }
     }
 }
 
@@ -11161,6 +11194,11 @@ function Invoke-InternalTests {
         try { Read-VaultFromFile -Path $script:Paths.VaultBackup1 -AesKey $newKeys.Aes -HmacKey $newKeys.Hmac | Out-Null }
         catch { $backupWithNew = $false }
         & $assert 'Test 29d: Backup ebenfalls neu verschluesselt' 'True' ([string]$backupWithNew)
+        $readable29 = {
+            param([string]$Path, $Keys)
+            try { Read-VaultFromFile -Path $Path -AesKey $Keys.Aes -HmacKey $Keys.Hmac | Out-Null; return $true } catch { return $false }
+        }
+        & $assert 'Test 29e: Journal (vault.pending.azt) nur noch mit dem neuen Passwort lesbar' 'True|True|False' ("$(Test-Path -LiteralPath $script:Paths.VaultPending)|$(& $readable29 $script:Paths.VaultPending $newKeys)|$(& $readable29 $script:Paths.VaultPending $keys)")
 
         # --- Test 30: Fehlgeschlagene Passwortaenderung erhaelt den alten Tresor ---
         $failError = Invoke-VaultReencryption -OldPasswordBytes $wrongPwdBytes `
@@ -11170,10 +11208,23 @@ function Invoke-InternalTests {
         catch { $mainIntact = $false }
         & $assert 'Test 30a: falsches aktuelles Passwort wird neutral abgelehnt' 'True' ([string]($failError -eq $script:VaultNeutralError))
         & $assert 'Test 30b: bisheriger Tresor bleibt vollstaendig erhalten' 'True' ([string]$mainIntact)
-        # Fuer die Folgetests zurueck auf das Testpasswort wechseln
+        # Fuer die Folgetests zurueck auf das Testpasswort wechseln - dabei
+        # scheitert (Testhook) das Neuschreiben des Journals
+        $script:App.Flags.TestFailJournalMirror = $true
         $backError = Invoke-VaultReencryption -OldPasswordBytes $newPwdBytes `
             -NewAesKey $keys.Aes -NewHmacKey $keys.Hmac -NewSalt $salt -NewIterations $iter
+        $script:App.Flags.TestFailJournalMirror = $false
         & $assert 'Test 30c: Ruecknahme der Passwortaenderung erfolgreich' '' $backError
+        # Journal traegt noch das andere Passwort; ein danach scheiternder
+        # Speichervorgang darf diesen Stand NICHT zurueckschreiben
+        $script:App.VaultFileHash = Get-FileSha256Hex -Path $script:Paths.VaultFile
+        $stale30 = & $readable29 $script:Paths.VaultPending $newKeys
+        $script:App.Flags.TestFailMainWrite = $true
+        $save30d = Save-Vault -Quiet
+        $script:App.Flags.TestFailMainWrite = $false
+        Clear-VaultSaveFailedState
+        & $assert 'Test 30d: Journal mit anderem Passwort wird nach Schreibfehler durch den aktuellen Hauptstand ersetzt' 'True|False|True|False' ("$stale30|$save30d|$(& $readable29 $script:Paths.VaultPending $keys)|$(& $readable29 $script:Paths.VaultPending $newKeys)")
+        & $assert 'Test 30e: danach speichert der Tresor regulaer, Journal = Hauptdatei' 'True|True' ("$(Save-Vault)|$((Get-FileSha256Hex -Path $script:Paths.VaultFile) -eq (Get-FileSha256Hex -Path $script:Paths.VaultPending))")
         Clear-VaultKeys -Keys $newKeys
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($newPwdBytes)
         # Die Umverschluesselung hat die Dateien ausserhalb von Save-Vault
