@@ -167,6 +167,9 @@ Einstellungen → „Verschlüsselungspasswort ändern...": Das aktuelle Passwor
 abgefragt und per Entschlüsselung validiert, das neue Passwort zweimal eingegeben. Der
 Vorgang ist ein nachvollziehbarer mehrstufiger Ablauf:
 
+0. Wurde `vault.azt` seit dem Entsperren extern verändert (z. B. durch die
+   Cloud-Synchronisierung) oder fehlt ihr Prüfwert, wird das Passwort **nicht** geändert
+   (gleicher Maßstab wie beim Speichern).
 1. Alle neuen Dateien werden vollständig in einem separaten Transaktionsbereich
    (`*.new`-Dateien) erstellt und jede einzelne mit dem neuen Passwort erneut geöffnet
    und validiert; der alte Haupttresor bleibt dabei unverändert.
@@ -180,6 +183,19 @@ Vorgang ist ein nachvollziehbarer mehrstufiger Ablauf:
    verbleibt. Scheitert das, ersetzt es der nächste Speichervorgang; ein dabei
    fehlschlagendes Speichern schreibt nie einen Journalstand zurück, der mit dem
    aktuellen Passwort nicht lesbar ist.
+5. Danach werden alle Dateien im Ordner `Recovery`, die sich mit dem **bisherigen**
+   Passwort öffnen lassen (Konfliktkopien, `legacy-`/`import-day-`-Archive, beiseitegelegte
+   Tresorstände), mit dem neuen Passwort neu verschlüsselt — der Inhalt bleibt
+   zeichengenau erhalten. Je Datei wird zuerst eine geprüfte Kopie `<Datei>.new`
+   geschrieben, dann das Original in-place überschrieben und erneut geprüft, zuletzt die
+   Kopie entfernt. Dateien eines anderen Passworts (z. B. nach „Passwort vergessen"
+   archivierte Tresore) und beschädigte Dateien bleiben unverändert. Nicht umgestellte
+   Dateien werden namentlich gemeldet und protokolliert.
+
+Scheitert die Übernahme (z. B. weil ein Sync-Client eine Datei geöffnet hält), wird sie
+zurückgenommen; nur wenn die Rücknahme vollständig gelungen ist, meldet die Anwendung
+„wiederhergestellt" — andernfalls fordert sie zum Neustart auf, bei dem die
+Start-Reparatur den Dateisatz wiederherstellt.
 
 Wird der Vorgang hart unterbrochen (Absturz, Stromausfall), erkennt der nächste
 Programmstart die Zwischenzustände: fehlende Zieldateien werden aus `*.old`- bzw.

@@ -33,6 +33,26 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+22.10.2026 - SECURITY-REVIEW: PASSWORTAENDERUNG UND
+RECOVERY
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (Tests 116a-117c);
+         Dialogtexte/UI manuell NICHT getestet.
+ - Passwortaenderung verschluesselt jetzt auch alle mit dem
+   bisherigen Passwort lesbaren Container im Ordner Recovery neu
+   (Invoke-RecoveryReencryption); fremde/beschaedigte Dateien
+   bleiben byteidentisch. Nicht umgestellte Dateien werden
+   gemeldet und protokolliert.
+ - Keine Passwortaenderung bei extern veraenderter vault.azt
+   (Test-VaultMainFileUnchanged, Massstab wie Save-Vault).
+ - Unvollstaendige Ruecknahme einer gescheiterten Uebernahme
+   wird nicht mehr als "wiederhergestellt" gemeldet; stumm nach
+   Recovery verschobene Backups werden protokolliert.
+ - STA-Neustart startet powershell.exe ueber den festen
+   Systempfad statt ueber den Suchpfad.
+ - Speicherzyklus, Journal, Backups und Containerformat sind
+   unveraendert.
+--------------------------------------------------
 19.07.2026 - OPTIONALER PC-SHUTDOWN BEIM
 ANWENDUNGSSCHLIESSEN
 --------------------------------------------------
@@ -78,8 +98,11 @@ Set-StrictMode -Off
 # WPF benoetigt einen STA-Thread. powershell.exe startet ab v3 standardmaessig
 # in STA; falls nicht (z. B. Sonderfaelle), Neustart mit -Sta.
 # Bewusst ohne -ExecutionPolicy: geltende Richtlinien werden nicht umgangen.
+# Fester Systempfad statt Suchpfad (keine fremde powershell.exe aus dem
+# aktuellen Verzeichnis oder PATH).
 if (-not $RunTests -and -not $RunScrollLockManualTest -and [System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
-    Start-Process -FilePath 'powershell.exe' -ArgumentList @('-Sta', '-NoProfile', '-File', "`"$PSCommandPath`"")
+    $psExe = Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)) 'WindowsPowerShell\v1.0\powershell.exe'
+    Start-Process -FilePath $psExe -ArgumentList @('-Sta', '-NoProfile', '-File', "`"$PSCommandPath`"")
     exit
 }
 
@@ -608,7 +631,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.0.0'
+$script:AppVersion = '1.1.0'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -8466,7 +8489,7 @@ $script:ChangePasswordXaml = @'
     </Window.Resources>
     <StackPanel Margin="16">
         <TextBlock Text="Verschlüsselungspasswort ändern" FontWeight="Bold" FontSize="15"/>
-        <TextBlock Text="Alle Tresordateien (einschließlich Backups) werden mit dem neuen Passwort neu verschlüsselt. Der Vorgang ist abgesichert: Schlägt ein Schritt fehl, bleibt der bisherige Tresor mit dem bisherigen Passwort vollständig erhalten." TextWrapping="Wrap" Foreground="#FFAAB8C6" Margin="0,8,0,0"/>
+        <TextBlock Text="Alle Tresordateien (einschließlich Backups und der mit dem bisherigen Passwort lesbaren Dateien im Ordner Recovery) werden mit dem neuen Passwort neu verschlüsselt. Der Vorgang ist abgesichert: Schlägt ein Schritt fehl, bleibt der bisherige Tresor mit dem bisherigen Passwort vollständig erhalten." TextWrapping="Wrap" Foreground="#FFAAB8C6" Margin="0,8,0,0"/>
         <TextBlock Text="Aktuelles Passwort:" Margin="0,12,0,4"/>
         <PasswordBox x:Name="PwCurrent" FontSize="15" Padding="4,3" Background="#FF10141B" Foreground="#FFEDF2F7" BorderBrush="#FF44506A" MaxLength="256"/>
         <TextBlock Text="Neues Passwort (mindestens 12 Zeichen, empfohlen 16+ zufällige Zeichen):" Margin="0,10,0,4" TextWrapping="Wrap"/>
@@ -8540,8 +8563,11 @@ function Invoke-VaultReencryption {
                 }
                 $archive = Join-Path $script:Paths.Recovery ('vault-unreadable-{0}.azt' -f ([guid]::NewGuid().ToString()))
                 Move-Item -LiteralPath $info.Path -Destination $archive -Force
+                Write-AppLog -Level 'WARN' -Message ('Passwortänderung: {0} war mit dem bisherigen Passwort nicht lesbar und wurde unverändert nach Recovery verschoben ({1}).' -f $info.Kind, (Split-Path $archive -Leaf))
             }
-            catch { }
+            catch {
+                Write-AppLog -Level 'WARN' -Message ('Passwortänderung: {0} ist mit dem bisherigen Passwort nicht lesbar und konnte nicht nach Recovery verschoben werden; die Datei bleibt unverändert liegen.' -f $info.Kind)
+            }
         }
     }
     Clear-UnusedScanKeys -KeyCache $keyCache -KeepKeys $null
@@ -8617,6 +8643,10 @@ function Invoke-VaultReencryption {
         return ''
     }
     catch {
+        $applyError = $_.Exception.Message
+        # Ruecknahme wird ueberprueft: nur wenn jede Zieldatei wieder ihren
+        # alten Stand traegt, darf "wiederhergestellt" gemeldet werden.
+        $rollbackOk = $true
         $reverse = @($done)
         [array]::Reverse($reverse)
         foreach ($d in $reverse) {
@@ -8624,18 +8654,121 @@ function Invoke-VaultReencryption {
                 if ($d.Applied -and (Test-Path -LiteralPath $d.Orig)) {
                     Move-Item -LiteralPath $d.Orig -Destination ($d.Orig + '.new') -Force
                 }
+                if ($script:TestMode -and $script:App -and $script:App.Flags.TestFailReencryptRollback) {
+                    throw (New-Object System.IO.IOException 'TESTHOOK: Ruecknahme der Umbenennung deaktiviert')
+                }
                 if (Test-Path -LiteralPath $d.Old) {
                     Move-Item -LiteralPath $d.Old -Destination $d.Orig -Force
                 }
             }
-            catch { }
+            catch { $rollbackOk = $false }
+            if (-not (Test-Path -LiteralPath $d.Orig)) { $rollbackOk = $false }
         }
         foreach ($p in @($prepared)) {
             try { Remove-Item -LiteralPath $p.New -Force -ErrorAction SilentlyContinue } catch { }
         }
+        if (-not $rollbackOk) {
+            # vault.txn bleibt bewusst liegen (unklarer Dateisatz); Start-
+            # Reparatur und Bereinigung nach dem Entsperren uebernehmen.
+            Write-AppLog -Level 'ERROR' -Message ('Passwortänderung: Übernahme fehlgeschlagen UND Rücknahme unvollständig: ' + $applyError)
+            return ('Die Übernahme der neu verschlüsselten Dateien ist fehlgeschlagen, und der bisherige Zustand konnte NICHT vollständig wiederhergestellt werden. ' +
+                'Bitte die Anwendung beenden und neu starten - beim Start werden die beiseitegelegten Dateien (.old/.new) erkannt und repariert. ' +
+                'Das bisherige Passwort bleibt bis dahin gültig. Details: ' + $applyError)
+        }
         try { Remove-Item -LiteralPath $script:Paths.VaultTxn -Force -ErrorAction SilentlyContinue } catch { }
-        return ('Die Übernahme der neu verschlüsselten Dateien ist fehlgeschlagen; der bisherige Zustand wurde wiederhergestellt. Details: ' + $_.Exception.Message)
+        return ('Die Übernahme der neu verschlüsselten Dateien ist fehlgeschlagen; der bisherige Zustand wurde wiederhergestellt. Details: ' + $applyError)
     }
+}
+
+# Verschluesselt nach einer erfolgreichen Passwortaenderung alle Container im
+# Recovery-Ordner neu, die sich mit dem BISHERIGEN Passwort oeffnen lassen
+# (Cloud-Konfliktkopien, Archive von Alt-/Importdaten, beiseitegelegte
+# Tresorstaende). Ohne diesen Schritt blieben sie mit dem alten Passwort
+# lesbar. Dateien, die das bisherige Passwort nicht oeffnet (z. B. bewusst
+# archivierte Tresore eines vergessenen Passworts) oder die beschaedigt sind,
+# bleiben byte-identisch unveraendert. Der Klartext wird auf Containerebene
+# unveraendert uebernommen (auch Nicht-Tresorinhalte wie legacy-Archive).
+# Ablauf je Datei - nur bei der seltenen Passwortaenderung, nie im
+# regulaeren Speicherzyklus: entschluesseln -> neu verschluesseln -> zuerst
+# als Kopie '<Datei>.new' schreiben und pruefen -> Original in-place
+# ueberschreiben und pruefen -> Kopie entfernen. Bei einem Abbruch liegt
+# immer mindestens eine vollstaendige Fassung vor. Fehler werden je Datei
+# gesammelt und gemeldet, niemals verschluckt.
+# Liefert @{ Reencrypted = <int>; Skipped = <int>; Failed = <Dateinamen> }.
+function Invoke-RecoveryReencryption {
+    param(
+        [Parameter(Mandatory)][byte[]]$OldPasswordBytes,
+        [Parameter(Mandatory)][byte[]]$NewAesKey,
+        [Parameter(Mandatory)][byte[]]$NewHmacKey,
+        [Parameter(Mandatory)][byte[]]$NewSalt,
+        [Parameter(Mandatory)][int]$NewIterations
+    )
+    $result = @{ Reencrypted = 0; Skipped = 0; Failed = (New-Object System.Collections.ArrayList) }
+    if (-not (Test-Path -LiteralPath $script:Paths.Recovery)) { return $result }
+    $keyCache = @{}
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    try {
+        foreach ($file in @(Get-ChildItem -LiteralPath $script:Paths.Recovery -Filter '*.azt' -File -ErrorAction SilentlyContinue)) {
+            # Der Win32-Filter trifft auch laengere Endungen - exakt pruefen
+            if ($file.Extension -ne '.azt') { continue }
+            $plain = $null
+            try {
+                $container = Read-VaultContainerFromFile -Path $file.FullName
+                $cacheKey = [Convert]::ToBase64String($container.Salt) + '|' + $container.Iterations
+                if (-not $keyCache.ContainsKey($cacheKey)) {
+                    $keyCache[$cacheKey] = Get-VaultKeysFromPassword -PasswordBytes $OldPasswordBytes -Salt $container.Salt -Iterations $container.Iterations
+                }
+                $oldKeys = $keyCache[$cacheKey]
+                $plain = Unprotect-VaultContainer -Container $container -AesKey $oldKeys.Aes -HmacKey $oldKeys.Hmac
+            }
+            catch {
+                # Anderes Passwort oder beschaedigt: unveraendert lassen
+                $result.Skipped++
+                continue
+            }
+            $copyPath = $file.FullName + '.new'
+            try {
+                $containerJson = Protect-VaultContainer -PlainText $plain -AesKey $NewAesKey -HmacKey $NewHmacKey -Salt $NewSalt -Iterations $NewIterations
+                $preamble = $utf8Bom.GetPreamble()
+                $body = $utf8Bom.GetBytes($containerJson)
+                $bytes = New-Object byte[] ($preamble.Length + $body.Length)
+                [System.Array]::Copy($preamble, 0, $bytes, 0, $preamble.Length)
+                [System.Array]::Copy($body, 0, $bytes, $preamble.Length, $body.Length)
+                $verifyCopy = {
+                    param([string]$Path)
+                    $check = Unprotect-VaultContainer -Container (Read-VaultContainerFromFile -Path $Path) -AesKey $NewAesKey -HmacKey $NewHmacKey
+                    if (-not [string]::Equals($check, $plain, [System.StringComparison]::Ordinal)) {
+                        throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
+                    }
+                }
+                [System.IO.File]::WriteAllBytes($copyPath, $bytes)
+                & $verifyCopy $copyPath
+                if ($script:TestMode -and $script:App -and $script:App.Flags.TestFailRecoveryWrite) {
+                    throw (New-Object System.IO.IOException 'TESTHOOK: Neuverschluesselung in Recovery deaktiviert')
+                }
+                Write-FileInPlace -Path $file.FullName -Bytes $bytes
+                & $verifyCopy $file.FullName
+                Remove-Item -LiteralPath $copyPath -Force
+                $result.Reencrypted++
+            }
+            catch {
+                [void]$result.Failed.Add($file.Name)
+                # Die geprüfte Kopie nur entfernen, wenn das Original noch
+                # vollstaendig mit dem bisherigen Passwort lesbar ist.
+                try {
+                    $orig = Unprotect-VaultContainer -Container (Read-VaultContainerFromFile -Path $file.FullName) -AesKey $oldKeys.Aes -HmacKey $oldKeys.Hmac
+                    if ([string]::Equals($orig, $plain, [System.StringComparison]::Ordinal) -and (Test-Path -LiteralPath $copyPath)) {
+                        Remove-Item -LiteralPath $copyPath -Force
+                    }
+                }
+                catch { }
+            }
+        }
+    }
+    finally {
+        Clear-UnusedScanKeys -KeyCache $keyCache -KeepKeys $null
+    }
+    return $result
 }
 
 # Erkennt beim Programmstart Zwischenzustaende einer unterbrochenen
@@ -8744,6 +8877,17 @@ function Complete-VaultTransactionCleanup {
     }
 }
 
+# Prueft vor einer Passwortaenderung, ob die Hauptdatei seit dem letzten
+# Laden/Speichern unveraendert ist (gleicher Massstab wie Save-Vault).
+# Ohne diese Pruefung wuerde eine extern (z. B. per Cloud-Synchronisierung)
+# veraenderte vault.azt stillschweigend neu verschluesselt und als eigener
+# Stand uebernommen. Reine Lesefunktion, liefert $true/$false.
+function Test-VaultMainFileUnchanged {
+    if ($null -eq $script:App -or -not $script:App.VaultFileHash) { return $false }
+    try { return ((Get-FileSha256Hex -Path $script:Paths.VaultFile) -eq $script:App.VaultFileHash) }
+    catch { return $false }
+}
+
 function Invoke-PasswordChangeFlow {
     if (-not $script:VaultSession.Unlocked) { return }
     $win = New-XamlWindow -Xaml $script:ChangePasswordXaml
@@ -8790,6 +8934,12 @@ function Invoke-PasswordChangeFlow {
             Show-Warning -Message $script:VaultNeutralError -Title 'Passwort ändern'
             return
         }
+        # 3./4. Keine Umverschluesselung einer extern veraenderten Hauptdatei
+        if (-not (Test-VaultMainFileUnchanged)) {
+            Show-Warning -Message ('Die Tresordatei wurde seit dem Entsperren außerhalb dieser Anwendung verändert (z. B. durch eine Cloud-Synchronisierung) ' +
+                'oder ihr Prüfwert ist nicht verfügbar. Das Passwort wurde NICHT geändert. Bitte die Anwendung neu starten und den Vorgang danach wiederholen.') -Title 'Passwort ändern'
+            return
+        }
         # 5. Neue Salt- und Schluesselwerte erzeugen
         $newPwdBytes = ConvertTo-PasswordBytes -Secure $state.NewPw
         $newSalt = [ArbeitszeitTool.VaultCrypto]::GetRandomBytes($script:VaultConst.SaltBytes)
@@ -8814,13 +8964,37 @@ function Invoke-PasswordChangeFlow {
         # Ergebnis des ABSCHLIESSENDEN Speichervorgangs pruefen. Die
         # Neuverschluesselung selbst ist bereits transaktional abgeschlossen
         # und bleibt in jedem Fall gueltig - sie wird hier nicht zurueckgesetzt.
-        if (Save-Vault) {
-            Show-Info -Message 'Das Verschlüsselungspasswort wurde erfolgreich geändert.' -Title 'Passwort ändern'
+        $saveOk = Save-Vault
+        # Danach die Recovery-Container (auch eine eben dorthin gesicherte
+        # vault.prev.azt) auf das neue Passwort umstellen.
+        try {
+            $recovery = Invoke-RecoveryReencryption -OldPasswordBytes $oldPwdBytes `
+                -NewAesKey $script:VaultSession.AesKey -NewHmacKey $script:VaultSession.HmacKey `
+                -NewSalt $script:VaultSession.Salt -NewIterations $script:VaultSession.Iterations
+        }
+        catch {
+            Write-AppLog -Level 'ERROR' -Message ('Passwortänderung: Recovery-Ordner konnte nicht verarbeitet werden: ' + $_.Exception.Message)
+            $recovery = @{ Reencrypted = 0; Skipped = 0; Failed = @('Recovery (Ordner nicht verarbeitbar)') }
+        }
+        $failedRecovery = @($recovery.Failed)
+        Write-AppLog -Message ('Passwortänderung - Recovery: {0} Datei(en) neu verschlüsselt, {1} nicht mit dem bisherigen Passwort lesbar (unverändert), {2} fehlgeschlagen.' -f $recovery.Reencrypted, $recovery.Skipped, $failedRecovery.Count)
+        $recoveryText = ''
+        if ($failedRecovery.Count -gt 0) {
+            Write-AppLog -Level 'WARN' -Message ('Passwortänderung: Recovery-Dateien weiterhin mit dem bisherigen Passwort lesbar: ' + ($failedRecovery -join ', '))
+            $recoveryText = ("`r`n`r`nACHTUNG: {0} Datei(en) im Ordner 'Recovery' konnten nicht neu verschlüsselt werden und sind weiterhin mit dem BISHERIGEN Passwort lesbar:`r`n" -f $failedRecovery.Count) +
+                ($failedRecovery -join "`r`n") + "`r`nDie Dateien selbst bleiben unverändert erhalten."
+        }
+        $historyText = "`r`n`r`nHinweis: Frühere Dateiversionen im Versionsverlauf oder Papierkorb eines Cloud-Speichers bleiben mit dem bisherigen Passwort lesbar."
+        if ($saveOk -and $failedRecovery.Count -eq 0) {
+            Show-Info -Message ('Das Verschlüsselungspasswort wurde erfolgreich geändert.' + $historyText) -Title 'Passwort ändern'
+        }
+        elseif ($saveOk) {
+            Show-Warning -Message ('Das Verschlüsselungspasswort wurde geändert; alle Tresordateien sind neu verschlüsselt.' + $recoveryText + $historyText) -Title 'Passwort ändern'
         }
         else {
             Show-Warning -Message ('Das Passwort wurde erfolgreich geändert und alle Tresordateien wurden bereits neu verschlüsselt. ' +
                 'Der anschließende reguläre Tresorspeichervorgang ist jedoch FEHLGESCHLAGEN - der Zustand wird als ' +
-                'NICHT GESPEICHERT angezeigt und automatisch erneut versucht.') -Title 'Passwort ändern'
+                'NICHT GESPEICHERT angezeigt und automatisch erneut versucht.' + $recoveryText + $historyText) -Title 'Passwort ändern'
         }
     }
     finally {
@@ -8904,7 +9078,7 @@ function Initialize-AppState {
         # Benutzerinfo bei fehlgeschlagener Best-Effort-Backuprotation.
         # TestFail*: reine Testhooks fuer -RunTests (nur bei $script:TestMode
         # wirksam, im normalen Programmbetrieb vollstaendig inaktiv).
-        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailMainWrite = $false; TestFailMainRestore = $false; TestFailBackupCopy = $false; TestFailBackup1Write = $false; TestFailPostCommitHash = $false; TestFailJournalMirror = $false }
+        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailMainWrite = $false; TestFailMainRestore = $false; TestFailBackupCopy = $false; TestFailBackup1Write = $false; TestFailPostCommitHash = $false; TestFailJournalMirror = $false; TestFailRecoveryWrite = $false; TestFailReencryptRollback = $false }
     }
 }
 
@@ -10984,6 +11158,7 @@ function Invoke-InternalTests {
     $testRoot2 = Join-Path ([System.IO.Path]::GetTempPath()) ('ArbeitszeitTool_Test_' + [guid]::NewGuid().ToString('N'))
     $testRoot3 = Join-Path ([System.IO.Path]::GetTempPath()) ('ArbeitszeitTool_Test_' + [guid]::NewGuid().ToString('N'))
     $testRoot4 = Join-Path ([System.IO.Path]::GetTempPath()) ('ArbeitszeitTool_Test_' + [guid]::NewGuid().ToString('N'))
+    $testRoot5 = Join-Path ([System.IO.Path]::GetTempPath()) ('ArbeitszeitTool_Test_' + [guid]::NewGuid().ToString('N'))
     $newTestPaths = {
         param([string]$Root)
         return @{
@@ -13106,6 +13281,111 @@ function Invoke-InternalTests {
         [void]$script:App.Data.Days.Remove($d115f)
         Save-Vault | Out-Null
 
+        # --- Test 116: Passwortaenderung stellt auch die Recovery-Container um ---
+        # Eigener Testordner mit frischem Tresor; Pfade werden danach zurueckgesetzt.
+        $paths116 = $script:Paths
+        $script:Paths = (& $newTestPaths $testRoot5)
+        New-Item -ItemType Directory -Path $script:Paths.Data -Force | Out-Null
+        New-Item -ItemType Directory -Path $script:Paths.Recovery -Force | Out-Null
+        Initialize-AppState
+        Set-VaultSessionKeys -Keys (& $cloneKeys $keys) -Salt $salt -Iterations $iter
+        Set-ActiveVault -Vault (New-VaultDataObject)
+        Set-VaultLoadReference -Kind 'Neu' -Revision 0
+        $saved116 = "$(Save-Vault)|$(Save-Vault)"
+        # Recovery-Inhalte wie im Betrieb: Konfliktkopie und Altdatenarchiv
+        # (Sitzungsschluessel), Tresorstand eines frueheren Salts mit demselben
+        # Passwort, Tresor eines fremden Passworts, beschaedigte und fremde Datei
+        $markerA116 = 'MARKER_KONFLIKT_116 äöüß €'
+        $recA116 = Protect-TextToRecovery -PlainText $markerA116 -Prefix 'vault'
+        $legacyJson116 = [ordered]@{ OriginalName = 'worktime.corrupt.1.json'; Content = '{ "MARKER_LEGACY_116": "äöü" }' } | ConvertTo-Json -Depth 5
+        $recB116 = Protect-TextToRecovery -PlainText $legacyJson116 -Prefix 'legacy'
+        $saltF116 = [ArbeitszeitTool.VaultCrypto]::GetRandomBytes($script:VaultConst.SaltBytes)
+        $keysF116 = Get-VaultKeysFromPassword -PasswordBytes $testPwdBytes -Salt $saltF116 -Iterations $iter
+        $recF116 = Join-Path $script:Paths.Recovery ('vault-prev-{0}.azt' -f ([guid]::NewGuid().ToString()))
+        Write-VaultToFile -Path $recF116 -Vault $script:App.Vault -AesKey $keysF116.Aes -HmacKey $keysF116.Hmac -Salt $saltF116 -Iterations $iter
+        $plainF116 = Unprotect-VaultContainer -Container (Read-VaultContainerFromFile -Path $recF116) -AesKey $keysF116.Aes -HmacKey $keysF116.Hmac
+        $saltC116 = [ArbeitszeitTool.VaultCrypto]::GetRandomBytes($script:VaultConst.SaltBytes)
+        $keysC116 = Get-VaultKeysFromPassword -PasswordBytes $wrongPwdBytes -Salt $saltC116 -Iterations $iter
+        $recC116 = Join-Path $script:Paths.Recovery ('vault-unreadable-{0}.azt' -f ([guid]::NewGuid().ToString()))
+        [System.IO.File]::WriteAllText($recC116, (Protect-VaultContainer -PlainText 'FREMDES_PASSWORT_116' -AesKey $keysC116.Aes -HmacKey $keysC116.Hmac -Salt $saltC116 -Iterations $iter), $utf8Bom)
+        Clear-VaultKeys -Keys $keysC116
+        $recD116 = Join-Path $script:Paths.Recovery ('vault-unreadable-{0}.azt' -f ([guid]::NewGuid().ToString()))
+        [System.IO.File]::WriteAllText($recD116, 'KAPUTT_116', $utf8Bom)
+        $recE116 = Join-Path $script:Paths.Recovery 'notiz.txt'
+        [System.IO.File]::WriteAllText($recE116, 'kein Container', $utf8Bom)
+        $untouched116 = { "$(Get-FileSha256Hex -Path $recC116)|$(Get-FileSha256Hex -Path $recD116)|$(Get-FileSha256Hex -Path $recE116)" }
+        $untouchedBefore116 = & $untouched116
+        $readWith116 = {
+            param([string]$Path, $Keys)
+            try { return (Unprotect-VaultContainer -Container (Read-VaultContainerFromFile -Path $Path) -AesKey $Keys.Aes -HmacKey $Keys.Hmac) }
+            catch { return '<nicht lesbar>' }
+        }
+        $newCount116 = { @(Get-ChildItem -LiteralPath $script:Paths.Recovery -Filter '*.new' -File -ErrorAction SilentlyContinue).Count }
+        # Vorabpruefung: keine Umverschluesselung einer extern veraenderten Hauptdatei
+        $unchanged116a = Test-VaultMainFileUnchanged
+        $mainBytes116 = [System.IO.File]::ReadAllBytes($script:Paths.VaultFile)
+        [System.IO.File]::WriteAllBytes($script:Paths.VaultFile, [byte[]]($mainBytes116 + [byte[]]@(32)))
+        $unchanged116b = Test-VaultMainFileUnchanged
+        [System.IO.File]::WriteAllBytes($script:Paths.VaultFile, $mainBytes116)
+        $hash116 = $script:App.VaultFileHash
+        $script:App.VaultFileHash = $null
+        $unchanged116c = Test-VaultMainFileUnchanged
+        $script:App.VaultFileHash = $hash116
+        & $assert 'Test 116a: Passwortaenderung nur bei unveraenderter Hauptdatei (unveraendert / extern geaendert / ohne Referenzhash)' 'True|True|True|False|False|True' ("$saved116|$unchanged116a|$unchanged116b|$unchanged116c|$(Test-VaultMainFileUnchanged)")
+        # Passwortaenderung wie in Invoke-PasswordChangeFlow (ohne Dialog)
+        $newPwd116 = [System.Text.Encoding]::UTF8.GetBytes('Neues Passwort 116 äöü!')
+        $newSalt116 = [ArbeitszeitTool.VaultCrypto]::GetRandomBytes($script:VaultConst.SaltBytes)
+        $newKeys116 = Get-VaultKeysFromPassword -PasswordBytes $newPwd116 -Salt $newSalt116 -Iterations $iter
+        $err116 = Invoke-VaultReencryption -OldPasswordBytes $testPwdBytes -NewAesKey $newKeys116.Aes -NewHmacKey $newKeys116.Hmac -NewSalt $newSalt116 -NewIterations $iter
+        Set-VaultSessionKeys -Keys (& $cloneKeys $newKeys116) -Salt $newSalt116 -Iterations $iter
+        $script:App.VaultFileHash = Get-FileSha256Hex -Path $script:Paths.VaultFile
+        $save116 = Save-Vault
+        $rec116 = Invoke-RecoveryReencryption -OldPasswordBytes $testPwdBytes -NewAesKey $script:VaultSession.AesKey -NewHmacKey $script:VaultSession.HmacKey `
+            -NewSalt $script:VaultSession.Salt -NewIterations $script:VaultSession.Iterations
+        & $assert 'Test 116b: Passwortaenderung inkl. Recovery: 3 neu verschluesselt, 2 nicht mit altem Passwort lesbar, 0 Fehler' '|True|3|2|0' ("$err116|$save116|$($rec116.Reencrypted)|$($rec116.Skipped)|$(@($rec116.Failed).Count)")
+        & $assert 'Test 116c: Recovery-Container mit neuem Passwort lesbar, Klartext zeichengenau erhalten' 'True|True|True' ("$((& $readWith116 $recA116 $newKeys116) -ceq $markerA116)|$((& $readWith116 $recB116 $newKeys116) -ceq $legacyJson116)|$((& $readWith116 $recF116 $newKeys116) -ceq $plainF116)")
+        & $assert 'Test 116d: altes Passwort oeffnet keinen Recovery-Container mehr (auch nicht mit frueherem Salt)' '<nicht lesbar>|<nicht lesbar>|<nicht lesbar>' ("$(& $readWith116 $recA116 $keys)|$(& $readWith116 $recB116 $keys)|$(& $readWith116 $recF116 $keysF116)")
+        & $assert 'Test 116e: fremdes Passwort, beschaedigte und Nicht-Container-Datei byteidentisch, keine .new-Reste' "$untouchedBefore116|0" ("$(& $untouched116)|$(& $newCount116)")
+        $leak116 = $false
+        foreach ($f116 in @(Get-ChildItem -LiteralPath $script:Paths.Recovery -File)) {
+            $raw116 = [System.IO.File]::ReadAllText($f116.FullName)
+            if ($raw116.Contains('MARKER_KONFLIKT_116') -or $raw116.Contains('MARKER_LEGACY_116')) { $leak116 = $true }
+        }
+        & $assert 'Test 116f: kein Klartext in Recovery; Haupt/Journal/Backups nur mit neuem Passwort lesbar' 'False|True True True|False False False' ("$leak116|$(& $readable29 $script:Paths.VaultFile $newKeys116) $(& $readable29 $script:Paths.VaultPending $newKeys116) $(& $readable29 $script:Paths.VaultBackup1 $newKeys116)|$(& $readable29 $script:Paths.VaultFile $keys) $(& $readable29 $script:Paths.VaultPending $keys) $(& $readable29 $script:Paths.VaultBackup1 $keys)")
+        # Fehlerfall: Ueberschreiben scheitert (Testhook) - jede Datei wird
+        # gemeldet, bleibt unveraendert lesbar, die Pruefkopie wird entfernt
+        $hashes116 = { "$(Get-FileSha256Hex -Path $recA116)|$(Get-FileSha256Hex -Path $recB116)|$(Get-FileSha256Hex -Path $recF116)" }
+        $before116g = & $hashes116
+        $script:App.Flags.TestFailRecoveryWrite = $true
+        $recFail116 = Invoke-RecoveryReencryption -OldPasswordBytes $newPwd116 -NewAesKey $keys.Aes -NewHmacKey $keys.Hmac -NewSalt $salt -NewIterations $iter
+        $script:App.Flags.TestFailRecoveryWrite = $false
+        & $assert 'Test 116g: Schreibfehler je Datei gemeldet (nicht verschluckt), Dateien unveraendert und lesbar, keine .new-Reste' "0|3|$before116g|True|0" ("$($recFail116.Reencrypted)|$(@($recFail116.Failed).Count)|$(& $hashes116)|$((& $readWith116 $recA116 $newKeys116) -ceq $markerA116)|$(& $newCount116)")
+        $recPath116 = $script:Paths.Recovery
+        $script:Paths.Recovery = Join-Path $testRoot5 'gibtsnicht116'
+        $recNone116 = Invoke-RecoveryReencryption -OldPasswordBytes $newPwd116 -NewAesKey $keys.Aes -NewHmacKey $keys.Hmac -NewSalt $salt -NewIterations $iter
+        $script:Paths.Recovery = $recPath116
+        & $assert 'Test 116h: ohne Recovery-Ordner gibt es nichts umzustellen' '0|0|0' ("$($recNone116.Reencrypted)|$($recNone116.Skipped)|$(@($recNone116.Failed).Count)")
+
+        # --- Test 117: Uebernahme scheitert an einer geoeffneten Hauptdatei ---
+        # (realistisch: Sync-Client oder Virenscanner haelt die Datei offen)
+        $leftovers117 = { @(Get-ChildItem -LiteralPath $script:Paths.Data -File | Where-Object { $_.Name -like '*.old' -or $_.Name -like '*.new' -or $_.Name -eq 'vault.txn' }).Count }
+        $lock117 = New-Object System.IO.FileStream($script:Paths.VaultFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try { $err117a = Invoke-VaultReencryption -OldPasswordBytes $newPwd116 -NewAesKey $keys.Aes -NewHmacKey $keys.Hmac -NewSalt $salt -NewIterations $iter }
+        finally { $lock117.Dispose() }
+        & $assert 'Test 117a: gesperrte Hauptdatei - Ruecknahme gemeldet, alle Dateien weiter mit aktuellem Passwort lesbar, keine Reste' 'True|True|True|True|0' ("$($err117a.Contains('wurde wiederhergestellt'))|$(& $readable29 $script:Paths.VaultFile $newKeys116)|$(& $readable29 $script:Paths.VaultBackup1 $newKeys116)|$(& $readable29 $script:Paths.VaultBackup2 $newKeys116)|$(& $leftovers117)")
+        $lock117 = New-Object System.IO.FileStream($script:Paths.VaultFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $script:App.Flags.TestFailReencryptRollback = $true
+        try { $err117b = Invoke-VaultReencryption -OldPasswordBytes $newPwd116 -NewAesKey $keys.Aes -NewHmacKey $keys.Hmac -NewSalt $salt -NewIterations $iter }
+        finally { $script:App.Flags.TestFailReencryptRollback = $false; $lock117.Dispose() }
+        & $assert 'Test 117b: unvollstaendige Ruecknahme wird ehrlich gemeldet (kein "wiederhergestellt"), vault.txn bleibt' 'True|False|True' ("$($err117b.Contains('NICHT vollständig'))|$($err117b.Contains('wurde wiederhergestellt'))|$(Test-Path -LiteralPath $script:Paths.VaultTxn)")
+        $repaired117 = Repair-VaultTransactionState
+        Complete-VaultTransactionCleanup
+        & $assert 'Test 117c: Startreparatur stellt den Dateisatz mit dem aktuellen Passwort vollstaendig wieder her' 'True|True|True|True|0' ("$repaired117|$(& $readable29 $script:Paths.VaultFile $newKeys116)|$(& $readable29 $script:Paths.VaultBackup1 $newKeys116)|$(& $readable29 $script:Paths.VaultBackup2 $newKeys116)|$(& $leftovers117)")
+        Clear-VaultKeys -Keys $newKeys116
+        Clear-VaultKeys -Keys $keysF116
+        [ArbeitszeitTool.VaultCrypto]::ClearBytes($newPwd116)
+        $script:Paths = $paths116
+
         Clear-VaultKeys -Keys $keys
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($testPwdBytes)
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($wrongPwdBytes)
@@ -13115,7 +13395,7 @@ function Invoke-InternalTests {
         Clear-VaultSessionKeys
         $script:Paths = $origPaths
         Initialize-AppState
-        foreach ($dir in @($testRoot, $testRoot2, $testRoot3, $testRoot4)) {
+        foreach ($dir in @($testRoot, $testRoot2, $testRoot3, $testRoot4, $testRoot5)) {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
