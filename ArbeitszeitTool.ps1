@@ -2825,11 +2825,20 @@ function Update-MaxReachedState {
 
 # Validiert eine Abschlusszeit vollstaendig. Liefert '' oder eine Fehlermeldung.
 # Es erfolgt keine stille Korrektur: ungueltige Eingaben werden abgelehnt.
+#
+# -TrimTrailingIntervals: Pausen-/Sperrintervalle werden NICHT geprueft, weil
+# der Aufrufer sie beim Abschluss ueber Close-DayPartsAt exakt am Arbeitsende
+# kappt bzw. erst danach beginnende Intervalle verwirft (z. B. Laptop
+# zugeklappt, spaeter entsperrt, Arbeitsende rueckwirkend gesetzt). Die
+# Pruefungen fuer Abschnitte, Zukunft und 10:00 bleiben unveraendert; die
+# Nettozeit ist davon unabhaengig, da Intervalle nur innerhalb der
+# (am Arbeitsende endenden) Abschnitte abgezogen werden.
 function Test-DayEndTime {
     param(
         [Parameter(Mandatory)]$Day,
         [Parameter(Mandatory)][datetime]$End,
-        [datetime]$Now = (Get-Date)
+        [datetime]$Now = (Get-Date),
+        [switch]$TrimTrailingIntervals
     )
     if ($End -gt $Now.AddMinutes(1)) {
         return "Das Arbeitsende $(Format-Clock $End) liegt in der Zukunft."
@@ -2850,6 +2859,7 @@ function Test-DayEndTime {
         }
     }
     foreach ($listName in @('ManualPauses', 'LockIntervals')) {
+        if ($TrimTrailingIntervals) { break }
         foreach ($iv in @($Day[$listName])) {
             if ($null -eq $iv) { continue }
             if ($iv.End) {
@@ -2883,10 +2893,14 @@ function Complete-WorkDay {
         [string]$Reason = 'Manuell',
         [bool]$AutoEnded = $false,
         [switch]$SkipValidation,  # nur fuer den automatischen Tageswechsel um 00:00
-        [switch]$Quiet            # automatische Ablaeufe: kein Fehlerdialog beim Speichern
+        [switch]$Quiet,           # automatische Ablaeufe: kein Fehlerdialog beim Speichern
+        # Manuelles "Arbeitstag beenden" (Dialog): ueber das Arbeitsende
+        # hinausreichende Pausen-/Sperrintervalle am Ende kappen bzw. erst
+        # danach beginnende verwerfen (Close-DayPartsAt) statt abzulehnen.
+        [switch]$TrimTrailingIntervals
     )
     if (-not $SkipValidation) {
-        $endError = Test-DayEndTime -Day $Day -End $End
+        $endError = Test-DayEndTime -Day $Day -End $End -TrimTrailingIntervals:$TrimTrailingIntervals
         if ($endError -ne '') {
             Show-Warning -Message $endError
             return $false
@@ -2896,6 +2910,44 @@ function Complete-WorkDay {
     # speichern; bei einem Speicherfehler wird der Tag vollstaendig aus dem
     # Snapshot zurueckgerollt (kein ungewollter Zwischenstand im Tresor).
     $snapshot = Get-DaySnapshot -Day $Day
+    $trimmed = $false
+    $trimOld = New-Object System.Collections.ArrayList
+    $trimNew = New-Object System.Collections.ArrayList
+    if ($TrimTrailingIntervals) {
+        # Nur nachlaufende Intervalle (Ende nach bzw. Beginn ab $End) werden
+        # als Korrektur vermerkt - mit Original- und neuem Wert, damit der
+        # Nachweis nachvollziehbar bleibt; das normale Schliessen offener
+        # Intervalle am Arbeitsende ist keine Korrektur.
+        foreach ($listName in @('ManualPauses', 'LockIntervals')) {
+            $label = 'Pause'
+            if ($listName -eq 'LockIntervals') { $label = 'Sperre' }
+            foreach ($iv in @($Day[$listName])) {
+                if ($null -eq $iv) { continue }
+                $s = $null; $e = $null
+                try { $s = ConvertFrom-DateTimeString $iv.Start } catch { }
+                if ($iv.End) { try { $e = ConvertFrom-DateTimeString $iv.End } catch { } }
+                if ($null -eq $s) { continue }
+                if (-not ($s -ge $End -or ($null -ne $e -and $e -gt $End))) { continue }
+                $trimmed = $true
+                $origText = '{0} ab {1} (offen)' -f $label, (Format-Clock $s)
+                if ($null -ne $e) { $origText = '{0} {1}-{2}' -f $label, (Format-Clock $s), (Format-Clock $e) }
+                [void]$trimOld.Add($origText)
+                if ($s -ge $End) { [void]$trimNew.Add($origText + ' verworfen') }
+                else { [void]$trimNew.Add(('{0} {1}-{2}' -f $label, (Format-Clock $s), (Format-Clock $End))) }
+            }
+        }
+        $trimOldText = ($trimOld -join '; ')
+        $trimNewText = ((@($trimNew) + @('Arbeitsende ' + (Format-Clock $End))) -join '; ')
+        $closeError = Close-DayPartsAt -Day $Day -End $End
+        if ($closeError -ne '') {
+            Restore-DayFromSnapshot -Day $Day -Snapshot $snapshot
+            Show-Warning -Message $closeError
+            return $false
+        }
+        if ($trimmed) {
+            Add-Correction -Day $Day -Description 'Nachlaufende Pausen-/Sperrintervalle am Arbeitsende gekappt' -OldValue $trimOldText -NewValue $trimNewText -NoLog
+        }
+    }
     Stop-RunningSegment -Day $Day -End $End | Out-Null
     Stop-ManualPauseInterval -Day $Day -End $End -Silent -NoSave | Out-Null
     Stop-LockInterval -Day $Day -End $End -NoSave -Silent | Out-Null
@@ -2924,6 +2976,9 @@ function Complete-WorkDay {
             Write-AppLog -Level 'WARN' -Message "Tagesabschluss ($($Day.Date)) NICHT gespeichert - Änderung zurückgenommen."
             return $false
         }
+    }
+    if ($trimmed) {
+        Write-CorrectionLog -Day $Day -Description 'Nachlaufende Pausen-/Sperrintervalle am Arbeitsende gekappt' -OldValue $trimOldText -NewValue $trimNewText
     }
     Write-AppLog -Message "Tagesabschluss ($($Day.Date)): Grund '$Reason', Ende $(Format-Clock $End)"
     return $true
@@ -5324,8 +5379,10 @@ function Show-EndDayDialog {
             Show-Warning -Message "Das Arbeitsende darf nicht vor dem Arbeitsbeginn ($(Format-Clock $comp.Beginn)) liegen."
             return
         }
-        # Vollstaendige Abschluss- und Intervallvalidierung (keine stille Korrektur)
-        $endError = Test-DayEndTime -Day $Day -End $end
+        # Vollstaendige Abschlussvalidierung (keine stille Korrektur); ueber das
+        # Arbeitsende hinausreichende Pausen-/Sperrintervalle kappt der
+        # anschliessende Complete-WorkDay -TrimTrailingIntervals am Ende.
+        $endError = Test-DayEndTime -Day $Day -End $end -TrimTrailingIntervals
         if ($endError -ne '') {
             Show-Warning -Message $endError
             return
@@ -9894,7 +9951,7 @@ function Invoke-EndDayFlow {
     }
     $result = Show-EndDayDialog -Day $day
     if ($null -eq $result) { return }
-    $completed = Complete-WorkDay -Day $day -End $result.End -Reason 'Manuell'
+    $completed = Complete-WorkDay -Day $day -End $result.End -Reason 'Manuell' -TrimTrailingIntervals
     # Nach dem Tagesabschluss werden die Pausen-/Sperrzeit-Details wieder verborgen
     Hide-PauseLockDetails
     Invoke-MainRefresh -ForceTables
@@ -12943,6 +13000,61 @@ function Invoke-InternalTests {
         $script:App.Vault['CleanShutdown'] = $false
         Save-Vault | Out-Null
 
+        # --- Test 115: "Arbeitstag beenden" mit nachtraeglich geschlossenem
+        #     Sperrintervall, das ueber das gewaehlte Arbeitsende hinausreicht
+        #     (Laptop um 15:17 zugeklappt, um 16:28 entsperrt, Ende 15:17) ---
+        $d115 = New-TestDay -DateText $yesterdayText
+        Add-TestSegment -Day $d115 -Mode 'Homeoffice' -StartText '08:00' | Out-Null
+        Add-TestInterval -Day $d115 -ListName 'ManualPauses' -StartText '12:00' -EndText '12:30' | Out-Null
+        Add-TestInterval -Day $d115 -ListName 'LockIntervals' -StartText '15:10' -EndText '16:28' | Out-Null
+        Add-TestInterval -Day $d115 -ListName 'LockIntervals' -StartText '15:17' -EndText '16:28' | Out-Null
+        [void]$script:App.Data.Days.Add($d115)
+        Save-Vault | Out-Null
+        $end115 = Get-TestNow $d115 '15:17'
+        $strict115 = Test-DayEndTime -Day $d115 -End $end115
+        $trim115 = Test-DayEndTime -Day $d115 -End $end115 -TrimTrailingIntervals
+        & $assert 'Test 115a: strikte Pruefung lehnt weiterhin ab, mit -TrimTrailingIntervals wird das Ende akzeptiert' 'True|' ("$($strict115 -ne '')|$trim115")
+        $corrBefore115 = & $countVaultLogs 'Nachlaufende Pausen-/Sperrintervalle am Arbeitsende gekappt'
+        # Reparierter Pfad des Tray-Menues: Invoke-EndDayFlow mit simuliertem
+        # Dialogergebnis (Show-EndDayDialog wird fuer den Test ersetzt)
+        $origDialog115 = ${function:Show-EndDayDialog}
+        $script:App.CurrentDay = $d115
+        try {
+            Set-Item -Path 'function:script:Show-EndDayDialog' -Value { param($Day, [switch]$NoShutdownOption) @{ End = (Get-TestNow $Day '15:17'); Shutdown = $false } }
+            try { Invoke-EndDayFlow } catch { }   # UI-Aktualisierung ohne Fenster ist im Testlauf irrelevant
+        }
+        finally {
+            Set-Item -Path 'function:script:Show-EndDayDialog' -Value $origDialog115
+            $script:App.CurrentDay = $null
+        }
+        $comp115 = Get-DayComputation -Day $d115 -Now (ConvertFrom-DateTimeString $d115.EndedAt)
+        & $assert 'Test 115b: Tag beendet um 15:17, Grund Manuell, geprueft' "Beendet|$yesterdayText 15:17:00|Manuell|False|True" ("$($d115['Status'])|$($d115['EndedAt'])|$($d115['EndReason'])|$($d115['AutoEndReviewPending'])|$($d115['AutoEndReviewed'])")
+        & $assert 'Test 115c: Sperre ab 15:10 auf 15:17 gekappt, Sperre ab 15:17 verworfen, Pause unveraendert' "1|$yesterdayText 15:10:00|$yesterdayText 15:17:00|$yesterdayText 12:30:00" ("$(@($d115.LockIntervals).Count)|$($d115.LockIntervals[0].Start)|$($d115.LockIntervals[0].End)|$($d115.ManualPauses[0].End)")
+        & $assert 'Test 115d: Netto korrekt (7:17 brutto - 0:30 Pause - 0:07 Sperre = 6:40), Korrektur protokolliert' "06:40|True|$($corrBefore115 + 1)" ("$(Format-Duration $comp115.Netto)|$(@($d115.Corrections).Count -ge 1)|$(& $countVaultLogs 'Nachlaufende Pausen-/Sperrintervalle am Arbeitsende gekappt')")
+        $corr115 = @($d115.Corrections)[-1]
+        & $assert 'Test 115g: Korrektureintrag nennt Original- und neue Intervalle' 'Sperre 15:10-16:28; Sperre 15:17-16:28|Sperre 15:10-15:17; Sperre 15:17-16:28 verworfen; Arbeitsende 15:17' ("$($corr115['OldValue'])|$($corr115['NewValue'])")
+        # Normalfall ohne nachlaufende Intervalle: keine Korrektur, offene Sperre am Ende geschlossen
+        $d115e = New-TestDay -DateText $yesterdayText
+        Add-TestSegment -Day $d115e -Mode 'Homeoffice' -StartText '08:00' | Out-Null
+        Add-TestInterval -Day $d115e -ListName 'LockIntervals' -StartText '15:00' | Out-Null
+        $ok115e = Complete-WorkDay -Day $d115e -End (Get-TestNow $d115e '16:00') -Reason 'Manuell' -TrimTrailingIntervals
+        & $assert 'Test 115e: Normalfall - offene Sperre endet am Arbeitsende, kein Korrektureintrag' "True|$yesterdayText 16:00:00|0" ("$ok115e|$($d115e.LockIntervals[0].End)|$(@($d115e.Corrections).Count)")
+        # Speicherfehler: vollstaendiger Rollback inkl. gekappter Intervalle
+        $d115f = New-TestDay -DateText $yesterdayText
+        Add-TestSegment -Day $d115f -Mode 'Homeoffice' -StartText '08:00' | Out-Null
+        Add-TestInterval -Day $d115f -ListName 'LockIntervals' -StartText '15:17' -EndText '16:28' | Out-Null
+        [void]$script:App.Data.Days.Add($d115f)
+        Save-Vault | Out-Null
+        $fp115f = Get-DayContentFingerprint -Day $d115f
+        $script:Paths.VaultPending = Join-Path $testRoot3 'gibtsnicht115\pending.azt'
+        $ok115f = Complete-WorkDay -Day $d115f -End (Get-TestNow $d115f '15:17') -Reason 'Manuell' -TrimTrailingIntervals -Quiet
+        $script:Paths.VaultPending = $goodPending102
+        Clear-VaultSaveFailedState
+        & $assert 'Test 115f: Speicherfehler - false, Tag inkl. Sperrintervall vollstaendig zurueckgerollt' "False|Aktiv|$fp115f" ("$ok115f|$($d115f['Status'])|$(Get-DayContentFingerprint -Day $d115f)")
+        [void]$script:App.Data.Days.Remove($d115)
+        [void]$script:App.Data.Days.Remove($d115f)
+        Save-Vault | Out-Null
+
         Clear-VaultKeys -Keys $keys
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($testPwdBytes)
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($wrongPwdBytes)
@@ -13415,7 +13527,7 @@ function Start-Application {
                 # Beim Programmstart wird kein Shutdown angeboten (die
                 # Oberflaeche ist noch nicht aufgebaut)
                 $endResult = Show-EndDayDialog -Day $active -NoShutdownOption
-                if ($endResult) { Complete-WorkDay -Day $active -End $endResult.End -Reason 'Manuell' | Out-Null }
+                if ($endResult) { Complete-WorkDay -Day $active -End $endResult.End -Reason 'Manuell' -TrimTrailingIntervals | Out-Null }
             }
             default {
                 Write-AppLog -Message 'Programmstart vom Benutzer abgebrochen.'
