@@ -1351,29 +1351,96 @@ function Protect-TextToRecovery {
     return $target
 }
 
-# Atomarer Speichervorgang des aktiven Tresors (Sitzungsschluessel):
+# Serialisiert und verschluesselt den Tresor zu den exakten Dateibytes
+# (UTF-8 mit BOM, identisch zu Write-VaultToFile).
+function ConvertTo-VaultFileBytes {
+    param(
+        [Parameter(Mandatory)]$Vault,
+        [Parameter(Mandatory)][byte[]]$AesKey,
+        [Parameter(Mandatory)][byte[]]$HmacKey,
+        [Parameter(Mandatory)][byte[]]$Salt,
+        [Parameter(Mandatory)][int]$Iterations
+    )
+    $json = $Vault | ConvertTo-Json -Depth 30
+    $containerJson = Protect-VaultContainer -PlainText $json -AesKey $AesKey -HmacKey $HmacKey -Salt $Salt -Iterations $Iterations
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    $preamble = $utf8Bom.GetPreamble()
+    $body = $utf8Bom.GetBytes($containerJson)
+    $bytes = New-Object byte[] ($preamble.Length + $body.Length)
+    [System.Array]::Copy($preamble, 0, $bytes, 0, $preamble.Length)
+    [System.Array]::Copy($body, 0, $bytes, $preamble.Length, $body.Length)
+    return ,$bytes
+}
+
+# Schreibt Bytes IN-PLACE in eine Datei: eine vorhandene Datei wird geoeffnet,
+# ueberschrieben und auf die neue Laenge gekuerzt - sie wird weder geloescht
+# noch umbenannt oder ersetzt. Cloud-Ordner (OneDrive/SharePoint) sehen
+# dadurch nur eine neue Version derselben Datei und keine Loeschung (kein
+# Papierkorbeintrag). Fehlt die Datei, wird sie angelegt. Kurze Wiederholung
+# bei voruebergehender Sperre (z. B. waehrend eines Sync-Uploads).
+function Write-FileInPlace {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes)
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            $stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            try {
+                $stream.Write($Bytes, 0, $Bytes.Length)
+                $stream.SetLength($Bytes.Length)
+                $stream.Flush($true)
+            }
+            finally { $stream.Dispose() }
+            return
+        }
+        catch [System.IO.IOException] {
+            if ($attempt -ge 3 -or $_.Exception -is [System.IO.DirectoryNotFoundException] -or
+                $_.Exception -is [System.IO.FileNotFoundException]) { throw }
+            Start-Sleep -Milliseconds 150
+        }
+    }
+}
+
+function Get-BytesSha256Hex {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes)) -replace '-', '') }
+    finally { $sha.Dispose() }
+}
+
+# Speichervorgang des aktiven Tresors (Sitzungsschluessel). Im Tresorordner
+# wird dabei NIEMALS eine Datei geloescht, umbenannt oder ersetzt - alle
+# Tresordateien werden ausschliesslich in-place ueberschrieben (siehe
+# Write-FileInPlace). Die Absturzsicherheit liefert ein Schreibjournal:
+# vault.pending.azt bleibt dauerhaft liegen und spiegelt im Ruhezustand die
+# Hauptdatei (gleiche Revision; beim Start gewinnt bei Gleichstand die
+# Hauptdatei).
 #   1. Validierung im Speicher              2. Metadaten-Snapshot anlegen
-#   3. Revision erhoehen, Zeitstempel       4. vault.pending.azt schreiben
-#   5. pending erneut lesen, HMAC pruefen, entschluesseln, validieren
-#   6. Pruefen, ob vault.azt seit dem letzten Laden extern veraendert wurde
-#      (Cloud-Synchronisierung) - dann NICHT ueberschreiben
-#   7. pending atomar als neue Hauptdatei uebernehmen (alter Stand beiseite)
-#   8. neue Hauptdatei erneut oeffnen und pruefen
-#   9. ERST DANACH Backups rotieren - ausschliesslich nachweislich
-#      verwendbare Dateien; unbrauchbare Dateien wandern nach Recovery
-# Bei jedem Fehler werden saemtliche zuvor veraenderten Metadaten
-# (Revision, LastCheckpointAt, ModifiedAt, WorkData.LastSavedAt) aus dem
-# Snapshot wiederhergestellt; die letzte gueltige Datei bleibt erhalten.
+#   3. Revision erhoehen, Zeitstempel       4. Pruefen, ob vault.azt seit dem
+#      letzten Laden extern veraendert wurde (Cloud-Synchronisierung) - dann
+#      NICHT ueberschreiben, eigener Stand als neue Datei nach Recovery
+#   5. Journal: neuen Stand in vault.pending.azt schreiben, erneut lesen,
+#      HMAC pruefen, entschluesseln, validieren
+#   6. Hauptdatei in-place mit demselben Stand ueberschreiben, erneut
+#      oeffnen und pruefen. Bricht das Schreiben ab (Absturz), liegt der neue
+#      Stand geprueft im Journal (hoehere Revision) und wird beim Start
+#      angeboten; bei einem Schreibfehler wird der alte Stand sofort aus dem
+#      Speicher zurueckgeschrieben.
+#   7. ERST DANACH Backups rotieren (backup1 -> backup2, alter Hauptstand ->
+#      backup1), ebenfalls in-place und nur mit nachweislich verwendbaren
+#      Staenden; unbrauchbare Dateien wandern nach Recovery.
+# Bei jedem Fehler vor dem Commit werden saemtliche zuvor veraenderten
+# Metadaten (Revision, LastCheckpointAt, ModifiedAt, WorkData.LastSavedAt)
+# aus dem Snapshot wiederhergestellt; die letzte gueltige Datei bleibt erhalten.
 #  -NoTrackingCheckpoint: WorkData.LastSavedAt (fachlicher Tracking-
 #   Checkpoint fuer die Homeoffice-Wiederherstellung) NICHT aktualisieren.
 #  -Quiet: keine Fehlerdialoge (fuer automatische Wiederholungsversuche).
 #  -NoBackupRotation: reine Zwischenspeicherung (30-Sekunden-Checkpoint,
-#   Radiolautstaerke). Die Hauptdatei wird ohne Beiseitelegen des alten
-#   Standes ersetzt, backup1/backup2 bleiben unveraendert. Backups rotieren
-#   damit nur bei fachlichen Wechseln (Modus, Pause, Sperre, Arbeitsende,
-#   Korrekturen, Schliessen) - in Cloud-Ordnern (OneDrive) entstehen so nicht
-#   alle 30 s neue Backup-Versionen bzw. Papierkorbeintraege. Wurde der Stand
-#   aus Pending/Backup geladen, wird trotzdem regulaer rotiert.
+#   Radiolautstaerke): backup1/backup2 bleiben unveraendert. Backups rotieren
+#   nur bei fachlichen Wechseln (Modus, Pause, Sperre, Arbeitsende,
+#   Korrekturen, Schliessen). Wurde der Stand aus Pending/Backup geladen,
+#   wird trotzdem regulaer rotiert.
 function Save-Vault {
     param(
         [switch]$NoTrackingCheckpoint,
@@ -1382,9 +1449,9 @@ function Save-Vault {
     )
     if ($null -eq $script:App -or $null -eq $script:App.Vault) { return $false }
     if (-not $script:VaultSession.Unlocked) { return $false }
-    # Kontrollierte Blockade: Nach einem kritischen Dateiaustauschfehler oder
-    # einem fehlenden Referenzhash der committeten Hauptdatei wird NICHT
-    # ungeschuetzt weitergeschrieben (keine zuverlaessige externe
+    # Kontrollierte Blockade: Nach einem kritischen Schreibfehler der
+    # Hauptdatei oder einem fehlenden Referenzhash der committeten Hauptdatei
+    # wird NICHT ungeschuetzt weitergeschrieben (keine zuverlaessige externe
     # Aenderungserkennung moeglich). Aufhebung erst durch Neustart.
     if ($script:App.Flags.SaveBlockedReason) {
         if (-not $script:App.Flags.SaveBlockedLogged) {
@@ -1418,16 +1485,17 @@ function Save-Vault {
             $vault['WorkData']['LastSavedAt'] = $metaSnapshot.LastSavedAt
         }
     }
-    $prevAside = $null
     # Commit-Punkt: Der Speichervorgang gilt als dauerhaft committed, sobald
-    # die neue Hauptdatei uebernommen UND vollstaendig geprueft wurde. Ab dann
+    # die neue Hauptdatei geschrieben UND vollstaendig geprueft wurde. Ab dann
     # duerfen nachgelagerte Fehler (Backuprotation, Referenzdaten) weder false
     # liefern noch Metadaten zuruecksetzen noch einen fachlichen Rollback der
     # aufrufenden Aktion ausloesen.
     $commitCompleted = $false
-    # Nur im kritischen Fallbackfehlerfall: Pending-Datei (neuer Stand) darf
-    # dann NICHT entfernt werden - alle Dateien bleiben unangetastet.
-    $preservePending = $false
+    # Bytes des bisherigen Standes (Hauptdatei bzw. Journal) fuer die
+    # Ruecknahme im Fehlerfall und fuer backup1
+    $oldMainBytes = $null
+    $oldPendingBytes = $null
+    $journalTouched = $false
     try {
         # 1. Validierung im Speicher - ungueltige Daten werden niemals geschrieben
         $errors = Test-VaultStructure -Vault $vault
@@ -1447,17 +1515,10 @@ function Save-Vault {
         if (-not $NoTrackingCheckpoint -and $vault['WorkData'] -is [System.Collections.IDictionary]) {
             $vault['WorkData']['LastSavedAt'] = $nowText
         }
-        # 4. verschluesselte Pending-Datei schreiben
-        Write-VaultToFile -Path $script:Paths.VaultPending -Vault $vault `
+        $newBytes = ConvertTo-VaultFileBytes -Vault $vault `
             -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey `
             -Salt $script:VaultSession.Salt -Iterations $script:VaultSession.Iterations
-        # 5. Pending-Datei erneut lesen, HMAC pruefen, entschluesseln, validieren
-        $verify = Read-VaultFromFile -Path $script:Paths.VaultPending `
-            -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
-        if ([long]$verify['Revision'] -ne [long]$vault['Revision']) {
-            throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
-        }
-        # 6. Externe Veraenderungen der Hauptdatei erkennen (z. B. Cloud-
+        # 4. Externe Veraenderungen der Hauptdatei erkennen (z. B. Cloud-
         #    Synchronisierung). Massstab ist der beim Entsperren bzw. beim
         #    letzten Schreiben erfasste SHA-256-Hash der Hauptdatei. Er wird
         #    beim Entsperren IMMER erfasst, wenn eine Hauptdatei existiert -
@@ -1470,7 +1531,8 @@ function Save-Vault {
         $mainExists = (Test-Path -LiteralPath $script:Paths.VaultFile)
         $externalChange = ''
         if ($mainExists) {
-            $currentHash = Get-FileSha256Hex -Path $script:Paths.VaultFile
+            $oldMainBytes = [System.IO.File]::ReadAllBytes($script:Paths.VaultFile)
+            $currentHash = Get-BytesSha256Hex -Bytes $oldMainBytes
             if ($script:App.VaultFileHash) {
                 if ($currentHash -ne $script:App.VaultFileHash) { $externalChange = 'inhaltlich verändert' }
             }
@@ -1493,14 +1555,15 @@ function Save-Vault {
         }
         if ($externalChange -ne '') {
             # Vorhandene Dateien nicht ueberschreiben; eigenen (verschluesselten)
-            # Stand neutral in Recovery sichern; keine automatische Zusammenfuehrung.
+            # Stand als NEUE Datei neutral in Recovery sichern (keine Loeschung,
+            # kein Verschieben); keine automatische Zusammenfuehrung.
             $conflictPath = $null
             try {
                 if (-not (Test-Path -LiteralPath $script:Paths.Recovery)) {
                     New-Item -ItemType Directory -Path $script:Paths.Recovery -Force | Out-Null
                 }
                 $conflictPath = Join-Path $script:Paths.Recovery ('vault-{0}.azt' -f ([guid]::NewGuid().ToString()))
-                Move-Item -LiteralPath $script:Paths.VaultPending -Destination $conflictPath -Force
+                [System.IO.File]::WriteAllBytes($conflictPath, $newBytes)
             }
             catch { }
             & $restoreMeta
@@ -1522,121 +1585,87 @@ function Save-Vault {
         #  - Stand bewusst aus Pending/Backup geladen (Auswahl im
         #    Wiederherstellungsdialog): das Ersetzen der unveraenderten alten
         #    Hauptdatei ist ein EXPLIZIT erkannter Wiederherstellungsvorgang,
-        #    kein gewoehnlicher Speichervorgang. Die alte Hauptdatei gelangt
+        #    kein gewoehnlicher Speichervorgang. Der alte Hauptstand gelangt
         #    nur nach vollstaendiger Pruefung in die Backupkette.
         $mainKnownGood = ($mainExists -and $script:App.LoadedFrom -eq 'Haupt')
         $skipRotation = ($NoBackupRotation -and $mainKnownGood)
-        if ($mainExists -and $script:App.LoadedFrom -ne 'Haupt') {
+        $oldMainUsable = $mainKnownGood
+        if ($mainExists -and -not $mainKnownGood) {
             Write-AppLog -Level 'WARN' -Message ("Wiederherstellungsvorgang: Der aus '{0}' geladene Stand ersetzt die unveränderte bisherige Hauptdatei." -f $script:App.LoadedFrom)
+            $oldMainUsable = Test-VaultFileFullyUsable -Path $script:Paths.VaultFile
         }
-        # 7. Neue Hauptdatei atomar uebernehmen, alten Stand beiseite legen
-        if ($mainExists) {
-            $prevAside = $script:Paths.VaultPrev
-            # Eine bereits vorhandene vault.prev.azt wird NIEMALS unbesehen
-            # ueberschrieben: gueltige Staende werden als 'vault-prev',
-            # unbrauchbare als 'vault-unreadable' neutral nach Recovery
-            # verschoben (keine Klartextdatei, GUID-Name).
-            if (Test-Path -LiteralPath $prevAside) {
-                try {
-                    $prevLeftPrefix = 'vault-unreadable'
-                    if (Test-VaultFileFullyUsable -Path $prevAside) { $prevLeftPrefix = 'vault-prev' }
-                    Move-FileToRecovery -Path $prevAside -Prefix $prevLeftPrefix | Out-Null
-                    Write-AppLog -Message 'Vorhandene vault.prev.azt vor dem Speichern neutral in Recovery gesichert.'
-                }
-                catch { }
-            }
-            $replaceOk = $false
-            try {
-                if ($script:TestMode -and $script:App.Flags.TestFailReplace) {
-                    throw (New-Object System.IO.IOException 'TESTHOOK: File.Replace deaktiviert')
-                }
-                if ($skipRotation) {
-                    # Ohne Sicherungsdatei: kein vault.prev.azt, keine
-                    # Backuprotation (Schritt 9 entfaellt mangels prev).
-                    [System.IO.File]::Replace($script:Paths.VaultPending, $script:Paths.VaultFile, [NullString]::Value)
-                }
-                else {
-                    [System.IO.File]::Replace($script:Paths.VaultPending, $script:Paths.VaultFile, $prevAside)
-                }
-                $replaceOk = $true
-            }
-            catch { $replaceOk = $false }
-            if (-not $replaceOk) {
-                # Robuster Fallback, falls File.Replace nicht moeglich ist.
-                # Der Fallback ist selbst wiederherstellbar: schlaegt der
-                # zweite Schritt fehl, wird die bisherige Hauptdatei SOFORT
-                # wieder hergestellt und vollstaendig validiert.
-                Move-Item -LiteralPath $script:Paths.VaultFile -Destination $prevAside -Force
-                $fallbackOk = $false
-                try {
-                    if ($script:TestMode -and $script:App.Flags.TestFailFallbackMove) {
-                        throw (New-Object System.IO.IOException 'TESTHOOK: Fallback-Move deaktiviert')
-                    }
-                    Move-Item -LiteralPath $script:Paths.VaultPending -Destination $script:Paths.VaultFile -Force
-                    $fallbackOk = $true
-                }
-                catch { $fallbackOk = $false }
-                if (-not $fallbackOk) {
-                    $restoredOk = $false
-                    try {
-                        if ($script:TestMode -and $script:App.Flags.TestFailFallbackRestore) {
-                            throw (New-Object System.IO.IOException 'TESTHOOK: Fallback-Restore deaktiviert')
-                        }
-                        Move-Item -LiteralPath $prevAside -Destination $script:Paths.VaultFile -Force
-                        Read-VaultFromFile -Path $script:Paths.VaultFile `
-                            -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey | Out-Null
-                        $restoredOk = $true
-                    }
-                    catch { $restoredOk = $false }
-                    if ($restoredOk) {
-                        try { $script:App.VaultFileHash = Get-FileSha256Hex -Path $script:Paths.VaultFile } catch { }
-                        Write-AppLog -Level 'WARN' -Message 'Dateiaustausch fehlgeschlagen - die bisherige Hauptdatei wurde sofort wiederhergestellt und validiert.'
-                        throw (New-Object System.InvalidOperationException 'VAULT_SWAP_FAILED')
-                    }
-                    # Kritischer Fall: auch die sofortige Wiederherstellung ist
-                    # fehlgeschlagen. Ab hier KEINE weiteren Schreibversuche;
-                    # saemtliche noch vorhandenen verschluesselten Dateien
-                    # (einschliesslich der Pending-Datei mit dem neuen Stand
-                    # und vault.prev.azt mit dem alten Stand) bleiben
-                    # unangetastet - die Startreparatur stellt den Zustand
-                    # beim naechsten Programmstart wieder her.
-                    $preservePending = $true
-                    $script:App.Flags.SaveBlockedReason = 'Die Hauptdatei des Tresors konnte nach einem fehlgeschlagenen Dateiaustausch nicht wiederhergestellt werden. Es werden keine weiteren Schreibversuche unternommen.'
-                    $script:App.Flags.SaveRetryCount = 3
-                    Write-AppLog -Level 'ERROR' -Message 'KRITISCH: Dateiaustausch UND sofortige Wiederherstellung der Hauptdatei fehlgeschlagen - weitere Speichervorgänge werden blockiert.'
-                    Show-AppError -Message ('Der Speichervorgang ist fehlgeschlagen und die bisherige Tresordatei konnte nicht automatisch wiederhergestellt werden. ' +
-                        'Es werden keine weiteren Schreibversuche unternommen; alle vorhandenen verschlüsselten Dateien (einschließlich des neuen Standes als Pending-Datei) bleiben unverändert erhalten. ' +
-                        'Der Zustand wird als NICHT GESPEICHERT angezeigt. Bitte die Anwendung neu starten - beim nächsten Start wird der Dateizustand repariert bzw. der gewünschte Stand zur Auswahl angeboten.')
-                    throw (New-Object System.InvalidOperationException 'VAULT_SWAP_CRITICAL')
-                }
-            }
+        # 5. Journal: neuen Stand in vault.pending.azt schreiben und pruefen.
+        #    Der bisherige Journalinhalt wird fuer die Ruecknahme gemerkt.
+        if (Test-Path -LiteralPath $script:Paths.VaultPending) {
+            try { $oldPendingBytes = [System.IO.File]::ReadAllBytes($script:Paths.VaultPending) } catch { $oldPendingBytes = $null }
         }
-        else {
-            Move-Item -LiteralPath $script:Paths.VaultPending -Destination $script:Paths.VaultFile -Force
+        $journalTouched = $true
+        Write-FileInPlace -Path $script:Paths.VaultPending -Bytes $newBytes
+        $verify = Read-VaultFromFile -Path $script:Paths.VaultPending `
+            -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
+        if ([long]$verify['Revision'] -ne [long]$vault['Revision']) {
+            throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
         }
-        # 8. Neue Hauptdatei erneut oeffnen und vollstaendig pruefen
+        # 6. Hauptdatei in-place ueberschreiben und vollstaendig pruefen
+        $mainWriteOk = $false
         try {
+            if ($script:TestMode -and $script:App.Flags.TestFailMainWrite) {
+                # Simuliert einen Abbruch MITTEN im Schreiben (Datei beschaedigt)
+                Write-FileInPlace -Path $script:Paths.VaultFile -Bytes ([System.Text.Encoding]::UTF8.GetBytes('TESTHOOK-HALB-GESCHRIEBEN'))
+                throw (New-Object System.IO.IOException 'TESTHOOK: Schreiben der Hauptdatei deaktiviert')
+            }
+            Write-FileInPlace -Path $script:Paths.VaultFile -Bytes $newBytes
             $verifyMain = Read-VaultFromFile -Path $script:Paths.VaultFile `
                 -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
             if ([long]$verifyMain['Revision'] -ne [long]$vault['Revision']) {
                 throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
             }
+            $mainWriteOk = $true
         }
-        catch {
-            # Uebernahme rueckgaengig machen: alter Hauptstand kommt zurueck
-            if ($prevAside -and (Test-Path -LiteralPath $prevAside)) {
+        catch { $mainWriteOk = $false }
+        if (-not $mainWriteOk) {
+            # Alten Hauptstand sofort aus dem Speicher zurueckschreiben und
+            # pruefen; das Journal wird unten ebenfalls zurueckgenommen.
+            $restoredOk = $false
+            if ($null -ne $oldMainBytes) {
+                try {
+                    if ($script:TestMode -and $script:App.Flags.TestFailMainRestore) {
+                        throw (New-Object System.IO.IOException 'TESTHOOK: Wiederherstellung der Hauptdatei deaktiviert')
+                    }
+                    Write-FileInPlace -Path $script:Paths.VaultFile -Bytes $oldMainBytes
+                    if ((Get-FileSha256Hex -Path $script:Paths.VaultFile) -eq (Get-BytesSha256Hex -Bytes $oldMainBytes)) { $restoredOk = $true }
+                }
+                catch { $restoredOk = $false }
+            }
+            else {
+                # Es gab noch keine Hauptdatei: eine evtl. halb geschriebene
+                # neue Datei wird wieder entfernt (nur beim ersten Speichern).
                 try {
                     if (Test-Path -LiteralPath $script:Paths.VaultFile) {
                         Remove-Item -LiteralPath $script:Paths.VaultFile -Force -ErrorAction SilentlyContinue
                     }
-                    Move-Item -LiteralPath $prevAside -Destination $script:Paths.VaultFile -Force
                 }
                 catch { }
             }
-            throw
+            if ($restoredOk -or $null -eq $oldMainBytes) {
+                Write-AppLog -Level 'WARN' -Message 'Schreiben der Hauptdatei fehlgeschlagen - der bisherige Stand wurde sofort wiederhergestellt.'
+                throw (New-Object System.InvalidOperationException 'VAULT_SWAP_FAILED')
+            }
+            # Kritischer Fall: auch die sofortige Wiederherstellung ist
+            # fehlgeschlagen. Ab hier KEINE weiteren Schreibversuche; das
+            # Journal (vault.pending.azt) haelt den neuen, geprueften Stand
+            # mit hoeherer Revision und wird beim naechsten Start angeboten.
+            $journalTouched = $false
+            $script:App.Flags.SaveBlockedReason = 'Die Hauptdatei des Tresors konnte nach einem fehlgeschlagenen Schreibvorgang nicht wiederhergestellt werden. Es werden keine weiteren Schreibversuche unternommen.'
+            $script:App.Flags.SaveRetryCount = 3
+            Write-AppLog -Level 'ERROR' -Message 'KRITISCH: Schreiben UND sofortige Wiederherstellung der Hauptdatei fehlgeschlagen - weitere Speichervorgänge werden blockiert.'
+            Show-AppError -Message ('Der Speichervorgang ist fehlgeschlagen und die bisherige Tresordatei konnte nicht automatisch wiederhergestellt werden. ' +
+                'Es werden keine weiteren Schreibversuche unternommen; der neue Stand liegt geprüft in der Journaldatei (vault.pending.azt). ' +
+                'Der Zustand wird als NICHT GESPEICHERT angezeigt. Bitte die Anwendung neu starten - beim nächsten Start wird der neueste gültige Stand zur Auswahl angeboten.')
+            throw (New-Object System.InvalidOperationException 'VAULT_SWAP_CRITICAL')
         }
         # ----- COMMIT-PUNKT ERREICHT -----
-        # Die neue Hauptdatei wurde uebernommen und vollstaendig geprueft
+        # Die neue Hauptdatei wurde geschrieben und vollstaendig geprueft
         # (Authentizitaet, Entschluesselung, JSON, Struktur, Revision).
         $commitCompleted = $true
         # Referenzdaten nach dem Commit (Best Effort - niemals Rollback):
@@ -1668,51 +1697,58 @@ function Save-Vault {
         # Ab jetzt entspricht die Hauptdatei dem eigenen Stand - ein evtl.
         # Wiederherstellungsvorgang aus Pending/Backup ist damit abgeschlossen.
         $script:App.LoadedFrom = 'Haupt'
-        # 9. Backuprotation NACH erfolgreicher Uebernahme und Pruefung.
-        #    Rotationsentscheidungen beruhen IMMER auf der VOLLSTAENDIGEN
-        #    Pruefung (Test-VaultFileFullyUsable): eine lediglich HMAC-gueltige,
-        #    aber strukturell ungueltige Datei darf niemals ein anderes
-        #    gueltiges Backup ueberschreiben. Unbrauchbare Dateien werden
-        #    neutral nach Recovery verschoben. ($mainKnownGood ist zulaessig:
-        #    der alte Hauptstand wurde beim Entsperren vollstaendig validiert
-        #    und ist seither nachweislich unveraendert.)
+        # Eine vault.prev.azt aus aelteren Programmversionen (frueherer
+        # Dateiaustausch) wird einmalig neutral nach Recovery gesichert.
+        if (Test-Path -LiteralPath $script:Paths.VaultPrev) {
+            try {
+                $prevLeftPrefix = 'vault-unreadable'
+                if (Test-VaultFileFullyUsable -Path $script:Paths.VaultPrev) { $prevLeftPrefix = 'vault-prev' }
+                Move-FileToRecovery -Path $script:Paths.VaultPrev -Prefix $prevLeftPrefix | Out-Null
+                Write-AppLog -Message 'Vorhandene vault.prev.azt neutral in Recovery gesichert.'
+            }
+            catch { }
+        }
+        # 7. Backuprotation NACH erfolgreicher Uebernahme und Pruefung,
+        #    ausschliesslich in-place. Rotationsentscheidungen beruhen IMMER
+        #    auf der VOLLSTAENDIGEN Pruefung (Test-VaultFileFullyUsable): eine
+        #    lediglich HMAC-gueltige, aber strukturell ungueltige Datei darf
+        #    niemals ein anderes gueltiges Backup ueberschreiben. Unbrauchbare
+        #    Dateien werden neutral nach Recovery gesichert. ($mainKnownGood
+        #    ist zulaessig: der alte Hauptstand wurde beim Entsperren
+        #    vollstaendig validiert und ist seither nachweislich unveraendert.)
         #    Die gesamte Rotation ist NACH dem Commit reine Best-Effort-
         #    Arbeit: ein Fehler hier macht den committeten Hauptspeicherstand
         #    NICHT rueckgaengig, Save-Vault liefert weiterhin true.
         try {
-            if ($prevAside -and (Test-Path -LiteralPath $prevAside)) {
-                $prevUsable = $mainKnownGood
-                if (-not $prevUsable) { $prevUsable = Test-VaultFileFullyUsable -Path $prevAside }
-                if ($prevUsable) {
+            if ($null -ne $oldMainBytes -and -not $skipRotation) {
+                if ($oldMainUsable) {
                     if (Test-Path -LiteralPath $script:Paths.VaultBackup1) {
                         if (Test-VaultFileFullyUsable -Path $script:Paths.VaultBackup1) {
                             if ($script:TestMode -and $script:App.Flags.TestFailBackupCopy) {
                                 throw (New-Object System.IO.IOException 'TESTHOOK: Backupkopie deaktiviert')
                             }
-                            [System.IO.File]::Copy($script:Paths.VaultBackup1, $script:Paths.VaultBackup2, $true)
+                            Write-FileInPlace -Path $script:Paths.VaultBackup2 -Bytes ([System.IO.File]::ReadAllBytes($script:Paths.VaultBackup1))
                         }
                         else {
                             # Unbrauchbares Backup1 darf Backup2 nicht ueberschreiben
                             try { Move-FileToRecovery -Path $script:Paths.VaultBackup1 -Prefix 'vault-unreadable' | Out-Null } catch { }
                         }
                     }
-                    if ($script:TestMode -and $script:App.Flags.TestFailPrevToBackup1) {
-                        throw (New-Object System.IO.IOException 'TESTHOOK: Prev-nach-Backup1 deaktiviert')
+                    if ($script:TestMode -and $script:App.Flags.TestFailBackup1Write) {
+                        throw (New-Object System.IO.IOException 'TESTHOOK: Schreiben von Backup1 deaktiviert')
                     }
-                    # Vorhandenes Backup1 per File.Replace ersetzen statt per
-                    # Move-Item -Force: Letzteres LOESCHT das Ziel zuerst, was
-                    # Cloud-Ordner (OneDrive) als Loeschung in den Papierkorb
-                    # uebernehmen. File.Replace wird als neue Version erkannt.
-                    if (Test-Path -LiteralPath $script:Paths.VaultBackup1) {
-                        [System.IO.File]::Replace($prevAside, $script:Paths.VaultBackup1, [NullString]::Value)
-                    }
-                    else {
-                        Move-Item -LiteralPath $prevAside -Destination $script:Paths.VaultBackup1
-                    }
+                    Write-FileInPlace -Path $script:Paths.VaultBackup1 -Bytes $oldMainBytes
                 }
                 else {
-                    # Eine beschaedigte alte Hauptdatei wird NICHT als Backup1 weiterkopiert
-                    try { Move-FileToRecovery -Path $prevAside -Prefix 'vault-unreadable' | Out-Null } catch { }
+                    # Eine beschaedigte alte Hauptdatei wird NICHT als Backup1
+                    # weitergefuehrt, sondern als neue Datei nach Recovery gesichert
+                    try {
+                        if (-not (Test-Path -LiteralPath $script:Paths.Recovery)) {
+                            New-Item -ItemType Directory -Path $script:Paths.Recovery -Force | Out-Null
+                        }
+                        [System.IO.File]::WriteAllBytes((Join-Path $script:Paths.Recovery ('vault-unreadable-{0}.azt' -f ([guid]::NewGuid().ToString()))), $oldMainBytes)
+                    }
+                    catch { }
                 }
             }
         }
@@ -1734,20 +1770,29 @@ function Save-Vault {
     }
     catch {
         # NACH dem Commit-Punkt: kein Rollback und kein false - die neue
-        # Hauptdatei ist bereits gueltig uebernommen und vollstaendig geprueft.
+        # Hauptdatei ist bereits gueltig geschrieben und vollstaendig geprueft.
         if ($commitCompleted) {
             Write-AppLog -Level 'WARN' -Message ('Nachgelagerter Fehler nach erfolgreich committetem Speichervorgang (Best Effort): ' + $_.Exception.Message)
             Clear-VaultSaveFailedState
             return $true
         }
         # Fehlgeschlagener Versuch VOR dem Commit: alle Metadaten aus dem
-        # Snapshot zuruecksetzen, Pending-Datei (verschluesselt) entfernen,
-        # bestehende Dateien unveraendert. Im kritischen Fallbackfehlerfall
-        # (VAULT_SWAP_CRITICAL) bleibt auch die Pending-Datei unangetastet.
+        # Snapshot zuruecksetzen und das Journal wieder auf den bisherigen
+        # Stand bringen (in-place, keine Loeschung) - es bleibt kein neuerer,
+        # nicht uebernommener Stand zurueck. Im kritischen Fall
+        # (VAULT_SWAP_CRITICAL) bleibt das Journal mit dem neuen Stand erhalten.
         & $restoreMeta
-        if (-not $preservePending) {
+        if ($journalTouched) {
             try {
-                if (Test-Path -LiteralPath $script:Paths.VaultPending) {
+                if ($null -ne $oldPendingBytes) {
+                    Write-FileInPlace -Path $script:Paths.VaultPending -Bytes $oldPendingBytes
+                }
+                elseif ($null -ne $oldMainBytes) {
+                    Write-FileInPlace -Path $script:Paths.VaultPending -Bytes $oldMainBytes
+                }
+                elseif (Test-Path -LiteralPath $script:Paths.VaultPending) {
+                    # Erster Speichervorgang ohne bisherigen Stand: es gibt
+                    # nichts zum Zurueckschreiben - das Journal wird entfernt.
                     Remove-Item -LiteralPath $script:Paths.VaultPending -Force -ErrorAction SilentlyContinue
                 }
             }
@@ -8765,11 +8810,11 @@ function Initialize-AppState {
         Counters            = @{ Tick = 0; LastSaveTick = 0 }
         # SaveBlockedReason/SaveBlockedLogged: kontrollierte Blockade weiterer
         # Speichervorgaenge (fehlender Referenzhash nach Commit bzw. kritischer
-        # Dateiaustauschfehler). BackupWarningShown: einmalige neutrale
+        # Schreibfehler der Hauptdatei). BackupWarningShown: einmalige neutrale
         # Benutzerinfo bei fehlgeschlagener Best-Effort-Backuprotation.
         # TestFail*: reine Testhooks fuer -RunTests (nur bei $script:TestMode
         # wirksam, im normalen Programmbetrieb vollstaendig inaktiv).
-        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailReplace = $false; TestFailFallbackMove = $false; TestFailFallbackRestore = $false; TestFailBackupCopy = $false; TestFailPrevToBackup1 = $false; TestFailPostCommitHash = $false }
+        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailMainWrite = $false; TestFailMainRestore = $false; TestFailBackupCopy = $false; TestFailBackup1Write = $false; TestFailPostCommitHash = $false }
     }
 }
 
@@ -8790,6 +8835,19 @@ function Invoke-MainRefresh {
     Update-CompactWindow -Comp $comp -Day $day
     Update-ExtendedWindow -Comp $comp -Day $day -Force:$ForceTables
     Update-TrayText -Comp $comp -Day $day
+}
+
+# Der regelmaessige Tracking-Checkpoint wird nur gebraucht, solange die
+# Nettozeit von beobachteten Zeitraeumen abhaengt: laufender Homeoffice-
+# Abschnitt (Sperren/Pausen werden dort abgezogen) oder offene manuelle Pause.
+# Im Betrieb laeuft die Zeit anhand der Zeitstempel weiter und eine Windows-
+# Sperre wird nur protokolliert - Beginn und Ende speichern ohnehin sofort.
+# Ein Checkpoint waehrend einer Sperre im Betrieb wuerde nur alle 30 s die
+# Tresordatei schreiben (Cloud-Versionen, die auf Sperrzeiten hindeuten).
+# Reine, testbare Funktion.
+function Test-TrackingCheckpointNeeded {
+    param([Parameter(Mandatory)]$Comp)
+    return ($Comp.RunningMode -eq 'Homeoffice' -or $null -ne $Comp.OpenPause)
 }
 
 function Invoke-MainTick {
@@ -8822,18 +8880,16 @@ function Invoke-MainTick {
         # bleibt. Bewusst begrenzt, um die Oberflaeche nicht zu blockieren:
         #  - nur ein Speichervorgang gleichzeitig (SaveInProgress-Sperre)
         #  - kein Checkpoint, wenn in den letzten 30 s bereits gespeichert wurde
-        #  - nur wenn der Checkpoint fachlich gebraucht wird: laufender
-        #    Homeoffice-Abschnitt oder offenes Sperr-/Pausenintervall. Im
-        #    reinen Betriebsmodus laeuft die Zeit anhand der Zeitstempel
-        #    weiter; jede fachliche Aenderung speichert ohnehin sofort.
+        #  - nur wenn der Checkpoint fachlich gebraucht wird (siehe
+        #    Test-TrackingCheckpointNeeded) - im Betrieb auch NICHT waehrend
+        #    einer Windows-Sperre
         #  - ohne Backuprotation: Backups entstehen nur bei fachlichen
         #    Wechseln, nicht bei jedem Checkpoint (OneDrive-Datenmenge)
         if ($day -and $day.Status -eq 'Aktiv' -and ($script:App.Counters.Tick % 30) -eq 0 -and
             -not $script:App.Flags.SaveInProgress -and
             ($script:App.Counters.Tick - $script:App.Counters.LastSaveTick) -ge 30) {
             $comp = Get-DayComputation -Day $day -Now (Get-Date)
-            $checkpointNeeded = ($comp.RunningMode -eq 'Homeoffice' -or $null -ne $comp.OpenLock -or $null -ne $comp.OpenPause)
-            if ($checkpointNeeded) {
+            if (Test-TrackingCheckpointNeeded -Comp $comp) {
                 Update-DayTotals -Day $day | Out-Null
                 Save-WorkData -Quiet -NoBackupRotation | Out-Null
                 $script:App.Counters.LastSaveTick = $script:App.Counters.Tick
@@ -10943,7 +10999,7 @@ function Invoke-InternalTests {
         $saved1 = Save-Vault
         $saved2 = Save-Vault
         & $assert 'Test 25a: Tresor gespeichert' 'True True' ("$saved1 $saved2")
-        & $assert 'Test 25b: vault.azt vorhanden, keine Pending-Datei zurueckgeblieben' 'True False' ("$(Test-Path -LiteralPath $script:Paths.VaultFile) $(Test-Path -LiteralPath $script:Paths.VaultPending)")
+        & $assert 'Test 25b: vault.azt vorhanden, Journal (vault.pending.azt) spiegelt die Hauptdatei' 'True True' ("$(Test-Path -LiteralPath $script:Paths.VaultFile) $((Get-FileSha256Hex -Path $script:Paths.VaultFile) -eq (Get-FileSha256Hex -Path $script:Paths.VaultPending))")
         & $assert 'Test 25c: Backup1 nach zweitem Speichern vorhanden' 'True' ([string](Test-Path -LiteralPath $script:Paths.VaultBackup1))
         & $assert 'Test 25d: Revision monoton steigend' '2' ([string]$script:App.Vault['Revision'])
         $b1HashBefore = Get-FileSha256Hex -Path $script:Paths.VaultBackup1
@@ -10953,6 +11009,41 @@ function Invoke-InternalTests {
         & $assert 'Test 25f: Checkpoint ohne Backuprotation - gespeichert, Backup1 unveraendert, kein Backup2, kein prev' "True|True|$b2ExistsBefore|False|3" ("$savedNoRot|$($b1HashBefore -eq $b1HashAfter)|$(Test-Path -LiteralPath $script:Paths.VaultBackup2)|$(Test-Path -LiteralPath $script:Paths.VaultPrev)|$(([long](Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey)['Revision']))")
         $savedRot = Save-Vault
         & $assert 'Test 25g: fachliches Speichern rotiert wieder (Backup1 = Stand des Checkpoints)' 'True|False|True' ("$savedRot|$($b1HashAfter -eq (Get-FileSha256Hex -Path $script:Paths.VaultBackup1))|$(Test-Path -LiteralPath $script:Paths.VaultBackup2)")
+        # --- Test 25h: Tresordateien werden in-place geschrieben, nie ersetzt ---
+        # Ein vor dem Speichern geoeffnetes Handle zeigt nur dann den neuen
+        # Inhalt, wenn die Datei selbst ueberschrieben (und nicht geloescht,
+        # umbenannt oder per Replace ausgetauscht) wurde. Genau das verhindert
+        # Papierkorbeintraege in Cloud-Ordnern (OneDrive/SharePoint).
+        $inPlace25 = {
+            param([string]$Path, [scriptblock]$Action)
+            $h = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            try {
+                & $Action
+                $h.Position = 0
+                $buf = New-Object byte[] ([int]$h.Length)
+                $read = 0
+                while ($read -lt $buf.Length) { $n = $h.Read($buf, $read, $buf.Length - $read); if ($n -le 0) { break }; $read += $n }
+                return ((Get-BytesSha256Hex -Bytes $buf) -eq (Get-FileSha256Hex -Path $Path))
+            }
+            finally { $h.Dispose() }
+        }
+        $ipMainCp = & $inPlace25 $script:Paths.VaultFile { Save-Vault -NoBackupRotation | Out-Null }
+        $ipPendCp = & $inPlace25 $script:Paths.VaultPending { Save-Vault -NoBackupRotation | Out-Null }
+        $ipMain = & $inPlace25 $script:Paths.VaultFile { Save-Vault | Out-Null }
+        $ipB1 = & $inPlace25 $script:Paths.VaultBackup1 { Save-Vault | Out-Null }
+        $ipB2 = & $inPlace25 $script:Paths.VaultBackup2 { Save-Vault | Out-Null }
+        & $assert 'Test 25h: Checkpoint und fachliches Speichern ueberschreiben vault.azt, Journal, Backup1 und Backup2 in-place' 'True|True|True|True|True' ("$ipMainCp|$ipPendCp|$ipMain|$ipB1|$ipB2")
+        & $assert 'Test 25i: kein vault.prev.azt, Journal = Hauptdatei, Backups vollstaendig verwendbar' 'False|True|True|True' ("$(Test-Path -LiteralPath $script:Paths.VaultPrev)|$((Get-FileSha256Hex -Path $script:Paths.VaultFile) -eq (Get-FileSha256Hex -Path $script:Paths.VaultPending))|$(Test-VaultFileFullyUsable -Path $script:Paths.VaultBackup1)|$(Test-VaultFileFullyUsable -Path $script:Paths.VaultBackup2)")
+        # --- Test 25j: Checkpoint im Betrieb nur noch bei Bedarf ---
+        $d25j = New-TestDay
+        Add-TestSegment -Day $d25j -Mode 'Betrieb' -StartText '08:00' | Out-Null
+        Add-TestInterval -Day $d25j -ListName 'LockIntervals' -StartText '12:00' | Out-Null
+        $c25j = Get-DayComputation -Day $d25j -Now (Get-TestNow $d25j '12:30')
+        $d25k = New-TestDay
+        Add-TestSegment -Day $d25k -Mode 'Homeoffice' -StartText '08:00' | Out-Null
+        $c25k = Get-DayComputation -Day $d25k -Now (Get-TestNow $d25k '12:30')
+        & $assert 'Test 25j: Windows-Sperre im Betrieb loest keinen 30-s-Checkpoint aus, Homeoffice weiterhin' 'False|True' ("$(Test-TrackingCheckpointNeeded -Comp $c25j)|$(Test-TrackingCheckpointNeeded -Comp $c25k)")
         $leakFound = $false
         $plainStructureFound = $false
         foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $testRoot 'Data') -File)) {
@@ -12534,16 +12625,17 @@ function Invoke-InternalTests {
         & $assert 'Test 108b: Backupkopie-Fehler nach dem Commit liefert true und setzt kein UnsavedChanges' 'True|False' ("$save108b|$($script:App.Flags.UnsavedChanges)")
         & $assert 'Test 108c: Hauptdatei traegt die neue Revision, In-Memory bleibt synchron' "$($rev108 + 1)|$($rev108 + 1)" ("$($main108['Revision'])|$($script:App.Vault['Revision'])")
         & $assert 'Test 108d: neutrale Backupwarnung wurde protokolliert' 'True' ([string]((& $countVaultLogs 'Backuprotation nach erfolgreichem Speichern fehlgeschlagen') -gt $warn108Before))
-        # Fehler beim Verschieben von prev nach Backup1 (ebenfalls nach dem
-        # Commit); die vom vorigen Test liegengebliebene vault.prev.azt wird
-        # dabei zuerst neutral in Recovery gesichert (nicht ueberschrieben).
+        # Fehler beim Schreiben von Backup1 (ebenfalls nach dem Commit); eine
+        # vault.prev.azt aus einer aelteren Programmversion wird dabei
+        # einmalig neutral in Recovery gesichert (nicht ueberschrieben).
+        [System.IO.File]::Copy($script:Paths.VaultFile, $script:Paths.VaultPrev, $true)
         $prevRec108 = @(Get-ChildItem -LiteralPath $script:Paths.Recovery -Filter 'vault-prev-*.azt' -File -ErrorAction SilentlyContinue).Count
-        $script:App.Flags.TestFailPrevToBackup1 = $true
+        $script:App.Flags.TestFailBackup1Write = $true
         $save108e = Save-Vault
-        $script:App.Flags.TestFailPrevToBackup1 = $false
+        $script:App.Flags.TestFailBackup1Write = $false
         $prevRec108b = @(Get-ChildItem -LiteralPath $script:Paths.Recovery -Filter 'vault-prev-*.azt' -File -ErrorAction SilentlyContinue).Count
-        & $assert 'Test 108e: Prev->Backup1-Fehler nach dem Commit - true, Hauptdatei vollstaendig gueltig' 'True|True' ("$save108e|$(Test-VaultFileFullyUsable -Path $script:Paths.VaultFile)")
-        & $assert 'Test 108f: vorhandene vault.prev.azt wurde neutral in Recovery gesichert (nicht ueberschrieben)' 'True' ([string]($prevRec108b -gt $prevRec108))
+        & $assert 'Test 108e: Backup1-Schreibfehler nach dem Commit - true, Hauptdatei vollstaendig gueltig' 'True|True' ("$save108e|$(Test-VaultFileFullyUsable -Path $script:Paths.VaultFile)")
+        & $assert 'Test 108f: alte vault.prev.azt wurde neutral in Recovery gesichert (nicht ueberschrieben)' 'True|False' ("$($prevRec108b -gt $prevRec108)|$(Test-Path -LiteralPath $script:Paths.VaultPrev)")
         Save-Vault | Out-Null
         & $assert 'Test 108g: naechster regulaerer Speichervorgang inkl. Backuprotation funktioniert wieder' 'True|False' ("$(Test-VaultFileFullyUsable -Path $script:Paths.VaultBackup1)|$($script:App.Flags.UnsavedChanges)")
         # Referenzhash nach dem Commit nicht ermittelbar -> Erfolg + Blockade
@@ -12560,43 +12652,42 @@ function Invoke-InternalTests {
         Clear-VaultSaveFailedState
         & $assert 'Test 108j: nach Aufhebung der Blockade funktioniert das Speichern wieder' 'True' ([string](Save-Vault))
 
-        # --- Tests 109: abgesicherter Dateiaustausch-Fallback ---
-        $rev109 = [long]$script:App.Vault['Revision']
-        $script:App.Flags.TestFailReplace = $true
-        $save109a = Save-Vault
-        $script:App.Flags.TestFailReplace = $false
-        $main109 = Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
-        & $assert 'Test 109a: File.Replace-Fehler mit erfolgreichem Fallback erzeugt gueltige neue Hauptdatei' "True|$($rev109 + 1)" ("$save109a|$($main109['Revision'])")
-        # Fallback: zweiter Move schlaegt fehl -> alte Hauptdatei SOFORT zurueck
+        # --- Tests 109: Schreibfehler der Hauptdatei (in-place mit Journal) ---
+        $readRev109 = {
+            param([string]$Path)
+            try { return [string](Read-VaultFromFile -Path $Path -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey)['Revision'] }
+            catch { return 'unlesbar' }
+        }
+        # Abbruch mitten im Schreiben der Hauptdatei -> alter Stand wird sofort
+        # zurueckgeschrieben, das Journal ebenfalls zurueckgenommen
         $revBefore109 = [long]$script:App.Vault['Revision']
-        $script:App.Flags.TestFailReplace = $true
-        $script:App.Flags.TestFailFallbackMove = $true
-        $save109b = Save-Vault -Quiet
-        $script:App.Flags.TestFailReplace = $false
-        $script:App.Flags.TestFailFallbackMove = $false
-        $main109b = Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
-        & $assert 'Test 109b: Fehler beim zweiten Move stellt die alte Hauptdatei sofort wieder her' "False|$revBefore109|$revBefore109" ("$save109b|$($main109b['Revision'])|$($script:App.Vault['Revision'])")
-        & $assert 'Test 109c: kein Pending-Rest, keine prev-Datei, Zustand NICHT GESPEICHERT' 'False|False|True' ("$(Test-Path -LiteralPath $script:Paths.VaultPending)|$(Test-Path -LiteralPath $script:Paths.VaultPrev)|$($script:App.Flags.UnsavedChanges)")
+        $script:App.Flags.TestFailMainWrite = $true
+        $save109a = Save-Vault -Quiet
+        $script:App.Flags.TestFailMainWrite = $false
+        & $assert 'Test 109a: Schreibfehler der Hauptdatei - false, alter Stand sofort wiederhergestellt, Speicher synchron' "False|$revBefore109|$revBefore109" ("$save109a|$(& $readRev109 $script:Paths.VaultFile)|$($script:App.Vault['Revision'])")
+        & $assert 'Test 109b: Journal zurueckgenommen (kein neuerer Stand), kein prev, Zustand NICHT GESPEICHERT' "$revBefore109|False|True" ("$(& $readRev109 $script:Paths.VaultPending)|$(Test-Path -LiteralPath $script:Paths.VaultPrev)|$($script:App.Flags.UnsavedChanges)")
         Clear-VaultSaveFailedState
-        # Kritischer Fallbackfehler: auch die sofortige Wiederherstellung
-        # schlaegt fehl -> keine weiteren Schreibversuche, alles unangetastet
+        & $assert 'Test 109c: danach speichert der Tresor regulaer weiter' "True|$($revBefore109 + 1)" ("$(Save-Vault)|$(& $readRev109 $script:Paths.VaultFile)")
+        # Kritischer Fall: auch das Zurueckschreiben scheitert -> Blockade, der
+        # neue Stand liegt geprueft im Journal (hoehere Revision)
         $revBefore109d = [long]$script:App.Vault['Revision']
-        $script:App.Flags.TestFailReplace = $true
-        $script:App.Flags.TestFailFallbackMove = $true
-        $script:App.Flags.TestFailFallbackRestore = $true
+        $script:App.Flags.TestFailMainWrite = $true
+        $script:App.Flags.TestFailMainRestore = $true
         $save109d = Save-Vault -Quiet
-        $script:App.Flags.TestFailReplace = $false
-        $script:App.Flags.TestFailFallbackMove = $false
-        $script:App.Flags.TestFailFallbackRestore = $false
-        & $assert 'Test 109d: kritischer Fallbackfehler - false, Blockade gesetzt, Pending (neuer Stand) bleibt erhalten' 'False|True|True' ("$save109d|$([string]$script:App.Flags.SaveBlockedReason -ne '')|$(Test-Path -LiteralPath $script:Paths.VaultPending)")
-        & $assert 'Test 109e: alter Stand liegt unangetastet als vault.prev.azt fuer die Startreparatur bereit' 'False|True' ("$(Test-Path -LiteralPath $script:Paths.VaultFile)|$(Test-Path -LiteralPath $script:Paths.VaultPrev)")
-        Repair-VaultTransactionState | Out-Null
-        & $assert 'Test 109f: Startreparatur stellt die Hauptdatei aus vault.prev.azt wieder her' 'True|True' ("$(Test-Path -LiteralPath $script:Paths.VaultFile)|$(Test-VaultFileFullyUsable -Path $script:Paths.VaultFile)")
+        $script:App.Flags.TestFailMainWrite = $false
+        $script:App.Flags.TestFailMainRestore = $false
+        & $assert 'Test 109d: kritischer Schreibfehler - false, Blockade gesetzt, Journal haelt den neuen Stand' "False|True|$($revBefore109d + 1)" ("$save109d|$([string]$script:App.Flags.SaveBlockedReason -ne '')|$(& $readRev109 $script:Paths.VaultPending)")
+        & $assert 'Test 109e: Hauptdatei unbrauchbar, Journal vollstaendig verwendbar (wird beim Start angeboten)' 'False|True' ("$(Test-VaultFileFullyUsable -Path $script:Paths.VaultFile)|$(Test-VaultFileFullyUsable -Path $script:Paths.VaultPending)")
+        # Start-Auswahl simulieren: neuester gueltiger Stand = Journal
+        $pendVault109 = Read-VaultFromFile -Path $script:Paths.VaultPending -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
+        Set-ActiveVault -Vault $pendVault109
+        Set-VaultLoadReference -Kind 'Pending' -Revision ([long]$pendVault109['Revision'])
         $script:App.Flags.SaveBlockedReason = ''
         $script:App.Flags.SaveBlockedLogged = $false
         Clear-VaultSaveFailedState
         $save109g = Save-Vault
-        & $assert 'Test 109g: nach Reparatur und Aufhebung der Blockade speichert der Tresor wieder' "True|$($revBefore109d + 1)" ("$save109g|$($script:App.Vault['Revision'])")
+        & $assert 'Test 109f: nach Auswahl des Journalstands speichert der Tresor wieder, Hauptdatei gueltig' "True|$($revBefore109d + 2)|True" ("$save109g|$(& $readRev109 $script:Paths.VaultFile)|$(Test-VaultFileFullyUsable -Path $script:Paths.VaultFile)")
+        & $assert 'Test 109g: unbrauchbare alte Hauptdatei gelangt nicht in die Backupkette' 'True' ([string](Test-VaultFileFullyUsable -Path $script:Paths.VaultBackup1))
 
         # --- Tests 110: exakter 10-Stunden-Zeitpunkt (zentrale Suche) ---------
         $d110a = New-TestDay

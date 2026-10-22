@@ -65,8 +65,7 @@ ArbeitszeitTool\
         vault.azt              verschlüsselter Datentresor (Arbeitszeiten, Einstellungen, Protokolle)
         vault.backup1.azt      verschlüsseltes Backup (vorletzter gültiger Stand)
         vault.backup2.azt      verschlüsseltes Backup (vorvorletzter gültiger Stand)
-        vault.pending.azt      nur kurzzeitig während eines Speichervorgangs (ebenfalls verschlüsselt)
-        vault.prev.azt         nur kurzzeitig: beiseitegelegter alter Hauptstand während der Übernahme
+        vault.pending.azt      Schreibjournal: verschlüsselter Spiegel der Hauptdatei (bleibt dauerhaft liegen)
         vault.txn              nur kurzzeitig: neutraler Transaktionsstatus einer Passwortänderung
                                (enthält keine Arbeitszeitdaten)
     Recovery\
@@ -247,30 +246,43 @@ Deshalb verwendet die Anwendung stabile, neutrale Dateinamen ohne Datums-/Uhrzei
 - Gespeichert wird sofort nach jeder relevanten Änderung (Start/Ende von Arbeitstag und
   Abschnitt, Moduswechsel, Pausen, Sperren/Entsperren, Korrekturen, Einstellungen,
   Erreichen von 09:45/10:00). Der regelmäßige 30-Sekunden-Checkpoint läuft nur, wenn er
-  fachlich gebraucht wird (laufender Homeoffice-Abschnitt oder offenes Sperr-/
-  Pausenintervall — er hält den Tracking-Checkpoint für die Lückenerkennung aktuell);
-  im reinen Betriebsmodus läuft die Zeit anhand der Zeitstempel ohnehin korrekt weiter.
-  Es läuft immer nur **ein** Speichervorgang gleichzeitig (keine Überlappung), und ein
-  Checkpoint wird übersprungen, wenn in den letzten 30 Sekunden bereits gespeichert wurde.
-  Diese Checkpoints (ebenso das Nachspeichern der Radiolautstärke) aktualisieren **nur die
-  Hauptdatei** — `vault.backup1.azt`/`vault.backup2.azt` rotieren ausschließlich bei
-  fachlichen Speichervorgängen (Moduswechsel, Pause, Windows-Sperre/-Entsperrung,
-  Arbeitsende, Korrekturen, Einstellungen, Schließen). So erzeugt ein Cloud-Ordner wie
-  OneDrive nicht alle 30 Sekunden neue Backup-Versionen. Bei der Rotation werden die
-  Backups per `File.Replace` bzw. Kopie ersetzt und nie vorher gelöscht, damit Cloud-Dienste
-  keine Löschungen in den Papierkorb übernehmen.
+  fachlich gebraucht wird: bei laufendem Homeoffice-Abschnitt oder offener Pause — er
+  hält den Tracking-Checkpoint für die Lückenerkennung aktuell. Im Betrieb läuft die Zeit
+  anhand der Zeitstempel ohnehin korrekt weiter; eine Windows-Sperre wird dort nur
+  protokolliert (Beginn und Ende werden sofort gespeichert) und löst **keinen**
+  30-Sekunden-Checkpoint aus. Es läuft immer nur **ein** Speichervorgang gleichzeitig,
+  und ein Checkpoint wird übersprungen, wenn in den letzten 30 Sekunden bereits
+  gespeichert wurde. Checkpoints (ebenso das Nachspeichern der Radiolautstärke)
+  aktualisieren **nur die Hauptdatei** und das Journal — `vault.backup1.azt`/
+  `vault.backup2.azt` rotieren ausschließlich bei fachlichen Speichervorgängen.
+- **Keine Löschungen im Tresorordner:** Sämtliche Tresordateien (`vault.azt`,
+  `vault.pending.azt`, `vault.backup1.azt`, `vault.backup2.azt`) werden ausschließlich
+  **in-place überschrieben** — nie gelöscht, umbenannt, verschoben oder per Dateiaustausch
+  ersetzt. Cloud-Ordner wie OneDrive/SharePoint sehen dadurch nur neue Versionen
+  derselben Dateien und übernehmen keine Löschungen in den Papierkorb. Ausnahmen sind
+  seltene, bewusst ausgelöste Vorgänge (Passwortänderung, Migration von Klartextdaten,
+  „Passwort vergessen") sowie das Sichern unbrauchbarer Dateien nach `Recovery`.
+  **Hinweis:** Der Versionsverlauf des Cloud-Dienstes zeigt weiterhin, *wann* gespeichert
+  wurde (z. B. beim Sperren und Entsperren), aber keine Inhalte.
 - Jeder Speichervorgang: im Speicher validieren → Metadaten-Snapshot anlegen → Revision
-  erhöhen → verschlüsseln → `vault.pending.azt` schreiben → Pending-Datei erneut lesen,
-  HMAC prüfen, entschlüsseln und strukturell validieren → prüfen, ob `vault.azt` seit dem
-  letzten Laden **extern verändert** wurde (siehe unten) → Pending-Datei atomar per
-  `File.Replace` als neue Hauptdatei übernehmen (alter Stand wird beiseitegelegt,
-  robuster Move-Fallback) → neue Hauptdatei **erneut öffnen und prüfen** → **erst
-  danach** Backuprotation. In die Backupkette gelangen ausschließlich nachweislich
-  verwendbare Dateien (Containerprüfung + HMAC): eine beschädigte alte Hauptdatei wird
-  niemals als `backup1` weiterkopiert, ein unbrauchbares `backup1` überschreibt niemals
-  `backup2` — unbrauchbare Dateien wandern neutral in den `Recovery`-Ordner. Wurde die
-  Anwendung aus Pending/Backup1/Backup2 geöffnet, wird dieser Stand kontrolliert als
-  neuer Hauptstand übernommen, ohne den einzigen gültigen Backupstand zu überschreiben.
+  erhöhen → verschlüsseln → prüfen, ob `vault.azt` seit dem letzten Laden **extern
+  verändert** wurde (siehe unten) → neuen Stand als **Journal** in `vault.pending.azt`
+  schreiben, erneut lesen, HMAC prüfen, entschlüsseln und strukturell validieren →
+  Hauptdatei mit demselben Stand überschreiben und **erneut öffnen und prüfen** → **erst
+  danach** Backuprotation (`backup1` → `backup2`, alter Hauptstand → `backup1`). In die
+  Backupkette gelangen ausschließlich nachweislich verwendbare Stände (Containerprüfung +
+  HMAC + Struktur): eine beschädigte alte Hauptdatei wird niemals als `backup1`
+  weitergeführt, ein unbrauchbares `backup1` überschreibt niemals `backup2` — unbrauchbare
+  Dateien werden neutral im `Recovery`-Ordner gesichert. Wurde die Anwendung aus
+  Pending/Backup1/Backup2 geöffnet, wird dieser Stand kontrolliert als neuer Hauptstand
+  übernommen, ohne den einzigen gültigen Backupstand zu überschreiben.
+- **Absturz während des Schreibens:** Bricht das Schreiben des Journals ab, ist die
+  Hauptdatei unverändert gültig. Bricht das Schreiben der Hauptdatei ab, liegt der neue
+  Stand bereits geprüft im Journal (höhere Revision) und wird beim nächsten Start als
+  neuester gültiger Stand angeboten. Scheitert nur der Schreibvorgang (ohne Absturz),
+  wird der alte Stand sofort aus dem Arbeitsspeicher zurückgeschrieben. Im Ruhezustand
+  hat das Journal dieselbe Revision wie die Hauptdatei; beim Start gewinnt bei Gleichstand
+  immer die Hauptdatei.
 - Schlägt ein Speichervorgang fehl, werden **alle** zuvor veränderten Metadaten
   (Revision, `LastCheckpointAt`, `ModifiedAt`, `WorkData.LastSavedAt`, `CleanShutdown`)
   aus dem Snapshot vollständig zurückgesetzt. Der Benutzer wird sichtbar informiert, der
@@ -278,16 +290,16 @@ Deshalb verwendet die Anwendung stabile, neutrale Dateinamen ohne Datums-/Uhrzei
   Anwendung versucht das Speichern bis zu dreimal automatisch erneut. Mehrstufige
   Aktionen (z. B. Arbeitstag beenden) führen die gesamte Änderung im Speicher durch,
   speichern genau einmal und rollen bei einem Fehler vollständig zurück.
-- **Externe Dateiänderungen (Cloud-Synchronisierung):** Vor dem Ersetzen von `vault.azt`
+- **Externe Dateiänderungen (Cloud-Synchronisierung):** Vor dem Überschreiben von `vault.azt`
   wird anhand des Hashes der zuletzt geladenen/geschriebenen Datei (Revision als
   zusätzliches Merkmal) geprüft, ob die Datei außerhalb der Anwendung verändert wurde.
   Ist das der Fall, wird sie **nicht überschrieben**: Der eigene Stand wird verschlüsselt
   unter einem neutralen GUID-Namen (`Recovery\vault-<GUID>.azt`, keine Arbeitszeitdaten
   im Dateinamen) gesichert, der Benutzer informiert und keine automatische
   Zusammenführung durchgeführt.
-- Die bestehende `vault.azt` wird **niemals** direkt überschrieben; mindestens zwei
-  vorherige gültige verschlüsselte Stände bleiben erhalten. Ein Absturz während des
-  Schreibens beschädigt weder die letzte gültige Hauptdatei noch die Backups.
+- Neben der Hauptdatei bleiben mindestens zwei vorherige gültige verschlüsselte Stände
+  (`backup1`, `backup2`) erhalten. Ein Absturz während des Schreibens führt dank Journal
+  nie dazu, dass kein gültiger aktueller Stand mehr vorhanden ist.
 - Jeder Stand trägt eine monoton steigende, HMAC-geschützte **Revision** sowie
   `SessionId`, `LastCheckpointAt` und `CleanShutdown`. Beim Start wird `CleanShutdown`
   auf `false` gesetzt und gespeichert, beim regulären Ende auf `true`.
