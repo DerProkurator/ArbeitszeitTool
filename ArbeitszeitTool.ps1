@@ -33,6 +33,19 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+27.10.2026 - VERSION 1.3.4: SICHTSCHUTZ AUCH FUER UI
+AUTOMATION
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (Tests 83d/83e).
+ - Verborgener Zustand: An die Pausen-/Sperrtabelle der
+   erweiterten Ansicht wird nur noch eine maskierte Kopie
+   gebunden (Get-MaskedPausesTable: Zeiten '••:••',
+   Kommentare '•••', Art lesbar). Zuvor lagen die echten
+   Werte trotz Blur im Automation-Baum (Screenreader).
+ - Echte Tabelle nur im Speicher (Ui.ExtendedPauseTable);
+   Bindung zentral ueber Set-ExtendedPausesSource, auch beim
+   Umschalten des Sichtschutzes.
+--------------------------------------------------
 27.10.2026 - VERSION 1.3.3: KONFLIKTSICHERUNG EHRLICH MELDEN
 --------------------------------------------------
  Status: umgesetzt, automatisiert getestet (Test 63c/63d).
@@ -770,7 +783,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.3.3'
+$script:AppVersion = '1.3.4'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -4913,6 +4926,34 @@ function Get-PausesTable {
     return ,$dt
 }
 
+# Sichtschutz: Kopie der Pausentabelle ohne konkrete Werte. Nur die Art
+# bleibt lesbar; Zeiten und Kommentare werden durch neutrale Platzhalter
+# ersetzt. Im verborgenen Zustand wird AUSSCHLIESSLICH diese Kopie an das
+# Grid gebunden - die echten Werte gelangen so weder in die Darstellung noch
+# in den Automation-Baum (Screenreader/UI Automation).
+function Get-MaskedPausesTable {
+    param([Parameter(Mandatory)][System.Data.DataTable]$Table)
+    $masked = $Table.Clone()
+    foreach ($row in $Table.Rows) {
+        $comment = ''
+        if ([string]$row['Kommentar'] -ne '') { $comment = '•••' }
+        [void]$masked.Rows.Add([string]$row['Art'], '••:••', '••:••', '••:••', $comment)
+    }
+    return ,$masked
+}
+
+# Bindet die Pausentabelle der erweiterten Ansicht passend zum Sichtschutz
+function Set-ExtendedPausesSource {
+    $win = $script:App.Ui.Extended
+    if ($null -eq $win) { return }
+    $grid = $win.FindName('ExtPauses')
+    if ($null -eq $grid) { return }
+    $table = $script:App.Ui.ExtendedPauseTable
+    if ($null -eq $table) { $grid.ItemsSource = $null; return }
+    if ([bool]$script:App.UiPrivacy.PauseAndLockDetailsVisible) { $grid.ItemsSource = $table.DefaultView }
+    else { $grid.ItemsSource = (Get-MaskedPausesTable -Table $table).DefaultView }
+}
+
 function Get-ExtendedValuesText {
     param($Comp, $Day)
     if ($null -eq $Day) { return "Kein aktiver Arbeitstag.`r`n`r`nÜber 'Arbeitstag starten' beginnen." }
@@ -5010,7 +5051,8 @@ function Update-ExtendedWindow {
         if ($Day) {
             $segTable = Get-SegmentsTable -Day $Day -Comp $Comp
             $win.FindName('ExtSegments').ItemsSource = $segTable.DefaultView
-            $win.FindName('ExtPauses').ItemsSource = (Get-PausesTable -Day $Day -Comp $Comp).DefaultView
+            $script:App.Ui.ExtendedPauseTable = Get-PausesTable -Day $Day -Comp $Comp
+            Set-ExtendedPausesSource
             $script:App.Ui.ExtendedSegTable = $segTable
             for ($i = 0; $i -lt $segTable.Rows.Count; $i++) {
                 if ([string]$segTable.Rows[$i]['Laufend'] -eq 'ja') { $script:App.Ui.ExtendedRunningRow = $i }
@@ -5018,7 +5060,8 @@ function Update-ExtendedWindow {
         }
         else {
             $win.FindName('ExtSegments').ItemsSource = $null
-            $win.FindName('ExtPauses').ItemsSource = $null
+            $script:App.Ui.ExtendedPauseTable = $null
+            Set-ExtendedPausesSource
         }
     }
     elseif ($Day -and $null -ne $script:App.Ui.ExtendedSegTable -and $script:App.Ui.ExtendedRunningRow -ge 0) {
@@ -10190,7 +10233,7 @@ function Initialize-AppState {
         # wird unmittelbar nach dem Entschluesseln und VOR dem ersten
         # Speichervorgang der neuen Sitzung befuellt.
         RecoveryState       = $null
-        Ui                  = @{ Compact = $null; Extended = $null; ExtendedStamp = ''; ExtendedSegTable = $null; ExtendedRunningRow = -1; Tray = $null; TrayItems = @{}; MenuItems = @{}; Handle = [IntPtr]::Zero; HideInProgress = $false }
+        Ui                  = @{ Compact = $null; Extended = $null; ExtendedStamp = ''; ExtendedSegTable = $null; ExtendedPauseTable = $null; ExtendedRunningRow = -1; Tray = $null; TrayItems = @{}; MenuItems = @{}; Handle = [IntPtr]::Zero; HideInProgress = $false }
         Timers              = @{ Main = $null; KeepAlive = $null }
         KeepAlive           = (New-KeepAliveState)
         # Zentraler Zustand des Internetradios: Es ist zu jedem Zeitpunkt
@@ -11155,6 +11198,8 @@ function Hide-PauseLockDetails {
 }
 
 # Wendet den zentralen Sichtbarkeitszustand auf ALLE betroffenen Elemente an:
+#  - Datenquelle: verborgen = maskierte Kopie (Get-MaskedPausesTable), damit
+#    keine echten Werte im Automation-Baum stehen; sichtbar = echte Tabelle
 #  - BlurEffect auf der Pausen-/Sperrzeiten-Tabelle (nur dieser Container,
 #    nicht das gesamte Fenster; Beschriftungen bleiben scharf)
 #  - IsHitTestVisible=false verhindert Auswahl-, Fokus- und Tooltip-
@@ -11168,6 +11213,8 @@ function Update-PauseLockPrivacyUi {
     if ($null -eq $win) { return }
     try {
         $visible = [bool]$script:App.UiPrivacy.PauseAndLockDetailsVisible
+        # Datenquelle zuerst: verborgen = nur maskierte Kopie gebunden
+        Set-ExtendedPausesSource
         $grid = $win.FindName('ExtPauses')
         if ($grid) {
             if ($visible) {
@@ -13310,6 +13357,24 @@ function Invoke-InternalTests {
             & $assert 'Test 83b: sichtbar = kein Effekt, Treffererkennung aktiv' 'True|True' ("$($null -eq $grid83.Effect)|$($grid83.IsHitTestVisible)")
             Hide-PauseLockDetails
             & $assert 'Test 83c: erneutes Verbergen stellt Blur und neutrale Automation wieder her' 'True' ([string]($grid83.Effect -is [System.Windows.Media.Effects.BlurEffect]))
+            # Sichtschutz: verborgen duerfen die echten Werte nicht in der
+            # gebundenen Datenquelle (und damit im Automation-Baum) stehen
+            $day83 = New-TestDay
+            Add-TestSegment -Day $day83 -Mode 'Homeoffice' -StartText '08:00' -EndText '14:00' | Out-Null
+            $pause83 = Add-TestInterval -Day $day83 -ListName 'ManualPauses' -StartText '12:17' -EndText '12:43'
+            [void](Set-ItemComment -Item $pause83 -Text 'MARKER_83_PAUSE')
+            $script:App.Ui.ExtendedPauseTable = Get-PausesTable -Day $day83 -Comp $null
+            $gridText83 = { (@($grid83.ItemsSource) | ForEach-Object { $_.Row.ItemArray -join '|' }) -join ';' }
+            Hide-PauseLockDetails
+            $hidden83 = & $gridText83
+            Set-PauseLockDetailsVisibility $true
+            $shown83 = & $gridText83
+            Hide-PauseLockDetails
+            $rehidden83 = & $gridText83
+            $leak83 = { param($t) $t.Contains('12:17') -or $t.Contains('12:43') -or $t.Contains('00:26') -or $t.Contains('MARKER_83') }
+            & $assert 'Test 83d: verborgen nur Platzhalter gebunden (keine Zeiten/Kommentare), Art bleibt lesbar' 'False|True|True' ("$(& $leak83 $hidden83)|$($hidden83.Contains('Manuelle Pause'))|$($hidden83.Contains('••:••'))")
+            & $assert 'Test 83e: Einblenden bindet die echten Werte, erneutes Verbergen entfernt sie wieder' 'True|True|False' ("$($shown83.Contains('12:17|12:43|00:26'))|$($shown83.Contains('MARKER_83_PAUSE'))|$(& $leak83 $rehidden83)")
+            $script:App.Ui.ExtendedPauseTable = $null
             $script:App.Ui.Extended = $null
             $privWin.Close()
         }

@@ -703,8 +703,10 @@ Anwendung. Für alle Arbeitszeitdaten gilt weiterhin „keine Cloud":
 
 In der **erweiterten Ansicht** werden die konkreten Pausen- und Sperrzeitwerte (Summen,
 Intervall-Beginn/-Ende/-Dauer) standardmäßig **verborgen**: Die Tabelle „Pausen und
-Sperrzeiten" wird unscharf gezeichnet (WPF-BlurEffect), die Summen zeigen neutrale
-Platzhalter (`••:••`). Beschriftungen bleiben lesbar.
+Sperrzeiten" wird unscharf gezeichnet (WPF-BlurEffect) und enthält im verborgenen
+Zustand nur Platzhalter (`••:••`, Kommentare als `•••`) – die echten Werte werden erst
+beim Einblenden an die Tabelle gebunden (seit 1.3.4). Die Summen zeigen ebenfalls
+neutrale Platzhalter. Beschriftungen und die Art des Eintrags bleiben lesbar.
 
 - Das **Auge-Symbol** neben „Pausen und Sperrzeiten" blendet die Werte bewusst ein bzw.
   wieder aus (nur Darstellung – keine Daten- oder Speicheränderung).
