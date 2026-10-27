@@ -486,8 +486,13 @@ Wo:
   vorausgewählt).
 - **„Tag bearbeiten"** (auch für vergangene Tage über den Verlauf): Tageskommentar,
   Schaltfläche „Kommentar..." je Liste (Abschnitte, Pausen, Sperrintervalle,
-  Änderungsprotokoll). Neue Einträge können direkt beim Anlegen kommentiert werden,
-  Korrekturen erhalten ein optionales Feld „Begründung der Änderung".
+  Änderungsprotokoll). Neue Einträge können direkt beim Anlegen kommentiert werden.
+  Seit 1.3.2 zeigt auch **„Bearbeiten"** (bzw. Doppelklick auf die Zeile) den Kommentar
+  des Eintrags und lässt ihn ändern; Zeitänderungen erhalten zusätzlich ein optionales
+  Feld „Begründung der Zeitänderung". Wird nur der Kommentar geändert, entsteht keine
+  Korrektur. Der volle Kommentar erscheint außerdem als Tooltip über der Zeile.
+- **Aufbau des Tages-Editors** (seit 1.3.2): Arbeitsabschnitte oben, darunter Reiter für
+  Manuelle Pausen, Sperrintervalle und Änderungsprotokoll (jeweils mit Anzahl im Titel).
 - **Anzeige**: Spalte „Kommentar" in den Tabellen, im Verlauf und im CSV-Export (dort
   einzeilig, Zeilenumbrüche als ` / `).
 
