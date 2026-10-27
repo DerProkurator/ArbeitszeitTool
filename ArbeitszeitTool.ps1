@@ -33,6 +33,18 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+27.10.2026 - VERSION 1.3.1: KOMPAKTFELD SOLL-ENDE /
+MAX-ENDE
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (Tests 123a-123c);
+         Einstellungsdialog manuell NICHT getestet.
+ - Neues waehlbares Feld 'SollEndeOderMaxEnde' fuer die kompakte
+   Ansicht und eigene Presets: zeigt bis zum Erreichen der
+   Sollzeit das Soll-Ende, danach automatisch das Max-Ende
+   (analog Soll-Rest / Ueberstunden).
+ - Soll-Ende-/Max-Ende-Text gemeinsam erzeugt (identisches
+   Format inkl. '*' bei pausierter Prognose).
+--------------------------------------------------
 27.10.2026 - VERSION 1.3.0: KOMMENTARE
 --------------------------------------------------
  Status: umgesetzt, automatisiert getestet (Tests 122a-122n);
@@ -719,7 +731,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.3.0'
+$script:AppVersion = '1.3.1'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -4561,6 +4573,17 @@ function Get-CompactStatusText {
         return 'Kein aktiver Arbeitstag | Rechtsklick: Arbeitstag starten'
     }
     $parts = New-Object System.Collections.ArrayList
+    $mark = ''
+    if ($Comp.EndePausiert) { $mark = '*' }
+    $sollEndeText = {
+        if ($Comp.SollErreicht) { return 'Soll-Ende: erreicht' }
+        if ($Comp.SollEnde) { return 'Soll-Ende: ' + (Format-Clock $Comp.SollEnde) + $mark }
+        return 'Soll-Ende: --:--'
+    }
+    $maxEndeText = {
+        if ($Comp.MaxEnde) { return 'Max-Ende: ' + (Format-Clock $Comp.MaxEnde) + $mark }
+        return 'Max-Ende: --:--'
+    }
     foreach ($field in @($script:App.Settings['CompactFields'])) {
         switch ([string]$field) {
             'Beginn' { [void]$parts.Add('Beginn: ' + (Format-Clock $Comp.Beginn)) }
@@ -4572,23 +4595,13 @@ function Get-CompactStatusText {
             'SollRest' { [void]$parts.Add('Soll-Rest: ' + (Format-Duration $Comp.SollRest)) }
             'Ueberstunden' { [void]$parts.Add('Überstunden: ' + (Format-Duration $Comp.Ueberstunden -WithSign)) }
             'MaxRest' { [void]$parts.Add('Max-Rest: ' + (Format-Duration $Comp.MaxRest)) }
-            'SollEnde' {
-                if ($Comp.SollErreicht) { [void]$parts.Add('Soll-Ende: erreicht') }
-                elseif ($Comp.SollEnde) {
-                    $mark = ''
-                    if ($Comp.EndePausiert) { $mark = '*' }
-                    [void]$parts.Add('Soll-Ende: ' + (Format-Clock $Comp.SollEnde) + $mark)
-                }
-                else { [void]$parts.Add('Soll-Ende: --:--') }
+            'SollEndeOderMaxEnde' {
+                # vor Erreichen der Sollzeit Soll-Ende, danach Max-Ende
+                if ($Comp.SollErreicht) { [void]$parts.Add((& $maxEndeText)) }
+                else { [void]$parts.Add((& $sollEndeText)) }
             }
-            'MaxEnde' {
-                if ($Comp.MaxEnde) {
-                    $mark = ''
-                    if ($Comp.EndePausiert) { $mark = '*' }
-                    [void]$parts.Add('Max-Ende: ' + (Format-Clock $Comp.MaxEnde) + $mark)
-                }
-                else { [void]$parts.Add('Max-Ende: --:--') }
-            }
+            'SollEnde' { [void]$parts.Add((& $sollEndeText)) }
+            'MaxEnde' { [void]$parts.Add((& $maxEndeText)) }
             'Modus' {
                 $mode = '-'
                 if ($Comp.RunningMode) { $mode = $Comp.RunningMode }
@@ -6101,6 +6114,7 @@ $script:CompactFieldDefs = [ordered]@{
     'SollRest'                 = 'Soll-Rest (immer)'
     'Ueberstunden'             = 'Überstunden (immer)'
     'MaxRest'                  = 'Max-Rest'
+    'SollEndeOderMaxEnde'      = 'Soll-Ende / Max-Ende (automatischer Wechsel)'
     'SollEnde'                 = 'Soll-Ende'
     'MaxEnde'                  = 'Max-Ende'
     'Modus'                    = 'Aktueller Modus'
@@ -14648,6 +14662,21 @@ function Invoke-InternalTests {
         & $assert 'Test 122m: Speicherfehler - false, Kommentar vollstaendig zurueckgenommen, keine Korrektur angelegt' "False|MARKER_122_KOMMENTAR|$corrBefore122" ("$failed122|$(Get-ItemComment -Item $d122)|$(@($d122['Corrections']).Count)")
         [void]$script:App.Data['Days'].Remove($d122)
         & $assert 'Test 122n: danach speichert der Tresor wieder regulaer' 'True' ([string](Save-Vault))
+
+        # --- Test 123: Kompaktfeld Soll-Ende / Max-Ende (automatischer Wechsel) ---
+        $fields123 = $script:App.Settings['CompactFields']
+        $script:App.Settings['CompactFields'] = @('SollEndeOderMaxEnde')
+        $d123 = New-TestDay
+        Add-TestSegment -Day $d123 -Mode 'Betrieb' -StartText '08:00' | Out-Null
+        $c123a = Get-DayComputation -Day $d123 -Now (Get-TestNow $d123 '10:00')
+        $c123b = Get-DayComputation -Day $d123 -Now (Get-TestNow $d123 '16:30')
+        $t123a = Get-CompactStatusText -Comp $c123a -Day $d123
+        $t123b = Get-CompactStatusText -Comp $c123b -Day $d123
+        & $assert 'Test 123a: vor Erreichen der Sollzeit wird das Soll-Ende angezeigt' ('False|Soll-Ende: ' + (Format-Clock $c123a.SollEnde)) ("$($c123a.SollErreicht)|$(@($t123a -split ' \| ')[0])")
+        & $assert 'Test 123b: nach Erreichen der Sollzeit automatisch das Max-Ende (kein Soll-Ende mehr)' ('True|Max-Ende: ' + (Format-Clock $c123b.MaxEnde)) ("$($c123b.SollErreicht)|$(@($t123b -split ' \| ')[0])")
+        $script:App.Settings['CompactFields'] = @('SollEnde', 'MaxEnde')
+        & $assert 'Test 123c: Einzelfelder Soll-Ende/Max-Ende unveraendert' ('Soll-Ende: ' + (Format-Clock $c123a.SollEnde) + ' | Max-Ende: ' + (Format-Clock $c123a.MaxEnde)) ((@((Get-CompactStatusText -Comp $c123a -Day $d123) -split ' \| ')[0..1]) -join ' | ')
+        $script:App.Settings['CompactFields'] = $fields123
 
         Clear-VaultKeys -Keys $newKeys116
         Clear-VaultKeys -Keys $keysF116

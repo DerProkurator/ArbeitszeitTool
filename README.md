@@ -425,6 +425,9 @@ Beginn: 06:12 | Netto: 06:36 | Soll-Rest: 00:24 | Max-Ende: 16:57
   Einstellungen, Anwendung schließen)
 - Ein `*` hinter einer Endzeit bedeutet: die Prognose ist pausiert (z. B. laufende
   Homeoffice-Pause)
+- Die Felder der zweiten Zeile sind wählbar (Einstellungen → Kompakte Ansicht bzw. eigene
+  Presets). Zwei Felder wechseln automatisch beim Erreichen der Sollzeit:
+  **Soll-Rest → Überstunden** und **Soll-Ende → Max-Ende** (seit 1.3.1).
 
 Eine **gespeicherte** Fensterposition wird gegen die **vollständigen Monitorflächen**
 (inkl. Taskleiste, `Screen.Bounds`) geprüft: Eine bewusst über der Windows-Taskleiste
