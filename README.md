@@ -421,7 +421,7 @@ Beginn: 06:12 | Netto: 06:36 | Soll-Rest: 00:24 | Max-Ende: 16:57
   gespeichert und beim nächsten Start wieder angewendet)
 - **Doppelklick**: erweiterte Ansicht öffnen
 - **Rechtsklick**: Kontextmenü (Arbeitstag starten/beenden, Modus wechseln, Pause,
-  Aktivhaltung, in den Infobereich ausblenden, minimieren, Verlauf, Export,
+  Kommentar, Aktivhaltung, in den Infobereich ausblenden, minimieren, Verlauf, Export,
   Einstellungen, Anwendung schließen)
 - Ein `*` hinter einer Endzeit bedeutet: die Prognose ist pausiert (z. B. laufende
   Homeoffice-Pause)
@@ -463,6 +463,36 @@ vollständig zurückgenommen. Nach einer Korrektur unter 10:00 wird `MaxReached`
 zurückgenommen. Abschlusszeiten werden vollständig validiert (nicht vor laufenden oder
 abgeschlossenen Abschnitten, nicht vor Pausen-/Sperrintervallen, nicht in der Zukunft,
 kein Netto über 10:00); es gibt keine stillen Zeitkorrekturen.
+
+## Kommentare
+
+Seit Version 1.3.0 lassen sich optionale Kommentare hinterlegen (je bis zu 1000 Zeichen,
+mehrzeilig):
+
+- **zum Arbeitstag** – z. B. „Dienstreise", „Gleitzeitausgleich beantragt"
+- **zu einzelnen Ereignissen** – Arbeitsabschnitt (Betrieb/Homeoffice), manuelle Pause,
+  Sperrintervall – z. B. „Arzttermin", „Kundentermin vor Ort"
+- **zu Änderungen** – jede Korrektur im Tages-Editor kann eine Begründung erhalten; sie
+  erscheint im Änderungsprotokoll des Tages und lässt sich dort auch nachträglich
+  ergänzen.
+
+Wo:
+
+- **Kontextmenü / Tray / erweiterte Ansicht → „Kommentar..."**: Kommentar zum aktuellen
+  Tag, zum laufenden Abschnitt oder zur laufenden Pause (bei laufender Pause ist diese
+  vorausgewählt).
+- **„Tag bearbeiten"** (auch für vergangene Tage über den Verlauf): Tageskommentar,
+  Schaltfläche „Kommentar..." je Liste (Abschnitte, Pausen, Sperrintervalle,
+  Änderungsprotokoll). Neue Einträge können direkt beim Anlegen kommentiert werden,
+  Korrekturen erhalten ein optionales Feld „Begründung der Änderung".
+- **Anzeige**: Spalte „Kommentar" in den Tabellen, im Verlauf und im CSV-Export (dort
+  einzeilig, Zeilenumbrüche als ` / `).
+
+Kommentare liegen verschlüsselt im Tresor, verändern keine Arbeitszeiten und zählen
+nicht als Korrektur. Das verschlüsselte Protokoll vermerkt nur, *dass* ein Kommentar
+geändert wurde, nicht den Inhalt. Kommentare zu Pausen und Sperrzeiten unterliegen in der
+erweiterten Ansicht demselben Sichtschutz wie die Zeiten. Ein leeres Feld entfernt den
+Kommentar. Tresore älterer Versionen bleiben unverändert ladbar.
 
 ## Unterschied Betrieb und Homeoffice
 
@@ -527,7 +557,8 @@ oder alle Daten. CSV-Dateien sind neben den optionalen Protokoll-Exporten (siehe
 Export erscheint die Warnung: „Die exportierte CSV-Datei ist nicht verschlüsselt und kann
 von anderen Personen oder Cloud-Diensten gelesen werden." — der Export erfolgt nur nach
 ausdrücklicher Bestätigung und niemals automatisch. Passwort und Schlüssel werden niemals
-exportiert.
+exportiert. **Kommentare** (Tag bzw. Abschnitt) werden als letzte Spalte „Kommentar"
+mitexportiert – vor der Weitergabe einer CSV-Datei also auf persönliche Inhalte achten.
 
 Alle Textfelder sind gegen **CSV-/Formelinjektion** geschützt: Werte, die mit `=`, `+`,
 `-`, `@`, Tabulator, Wagenrücklauf oder Zeilenumbruch beginnen (auch als Text exportierte

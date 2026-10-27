@@ -33,6 +33,28 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+27.10.2026 - VERSION 1.3.0: KOMMENTARE
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (Tests 122a-122n);
+         Dialoge/Menues/Layout manuell NICHT getestet.
+ - Optionales Feld 'Comment' an Tag, Abschnitt, manueller Pause,
+   Sperrintervall und Korrektur (max. 1000 Zeichen, normalisiert;
+   leer = kein Feld). Kein Schemawechsel - aeltere Tresore laden
+   unveraendert.
+ - Neuer Kommentar-Dialog (Show-CommentDialog); "Kommentar..." im
+   Kontext-/Tray-Menue und in der erweiterten Ansicht fuer Tag,
+   laufenden Abschnitt oder laufende Pause.
+ - Tages-Editor: Tageskommentar, Kommentar je Liste, neues
+   Aenderungsprotokoll (Korrekturen) mit Kommentarspalte; neue
+   Eintraege mit Kommentar, Korrekturen mit optionaler Begruendung.
+ - Spalte 'Kommentar' in Abschnitts-/Pausen-/Intervalltabellen,
+   Verlauf und CSV-Export (letzte Spalte, einzeilig,
+   Formelschutz).
+ - Kommentaraenderungen sind transaktional (Rollback bei
+   Speicherfehler), zaehlen nicht als Korrektur; das Protokoll
+   enthaelt keinen Kommentarinhalt.
+ - Kommentare fliessen in den Inhaltsvergleich beim Import ein.
+--------------------------------------------------
 27.10.2026 - VERSION 1.2.0: SCROLL-LOCK-AKTIVHALTUNG ALS
 OPTIONALE FUNKTION ZURUECK
 --------------------------------------------------
@@ -697,7 +719,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.3.0'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -2256,22 +2278,116 @@ function Add-Correction {
         [Parameter(Mandatory)][string]$Description,
         [string]$OldValue = '',
         [string]$NewValue = '',
+        # Optionale Begruendung/Kommentar zur Korrektur (nicht im Protokoll)
+        [string]$Comment = '',
         # -NoLog: Korrektureintrag nur im Tagesobjekt anlegen (er ist damit
         # Teil des Tages-Snapshots und wird bei einem Rollback vollstaendig
         # zurueckgenommen); den Erfolgslogeintrag schreibt der Aufrufer erst
         # nach erfolgreichem Speichern ueber Write-CorrectionLog.
         [switch]$NoLog
     )
-    [void]$Day['Corrections'].Add([ordered]@{
-            Timestamp   = ConvertTo-DateTimeString (Get-Date)
-            Description = $Description
-            OldValue    = $OldValue
-            NewValue    = $NewValue
-        })
+    $corr = [ordered]@{
+        Timestamp   = ConvertTo-DateTimeString (Get-Date)
+        Description = $Description
+        OldValue    = $OldValue
+        NewValue    = $NewValue
+    }
+    [void](Set-ItemComment -Item $corr -Text $Comment)
+    [void]$Day['Corrections'].Add($corr)
     $Day['ModifiedAt'] = ConvertTo-DateTimeString (Get-Date)
     if (-not $NoLog) {
         Write-CorrectionLog -Day $Day -Description $Description -OldValue $OldValue -NewValue $NewValue
     }
+}
+
+# Kommentare (optional) an Tag, Abschnitt, Pause, Sperrintervall und
+# Korrektur: Feld 'Comment' im jeweiligen Objekt. Fehlt das Feld, gibt es
+# keinen Kommentar (aeltere Tresore bleiben unveraendert ladbar). Kommentare
+# veraendern keine Zeiten und zaehlen daher NICHT als Korrektur.
+$script:CommentConst = @{
+    MaxLength     = 1000   # maximale Zeichenzahl eines Kommentars
+    PreviewLength = 60     # Kurzanzeige in Tabellen (eine Zeile)
+}
+
+# Normalisiert einen Kommentartext: Steuerzeichen (ausser Zeilenumbruch und
+# Tabulator) entfernen, Zeilenenden vereinheitlichen (CRLF), Leerraum am Rand
+# entfernen und die Laenge begrenzen. Liefert '' fuer "kein Kommentar".
+function Get-NormalizedComment {
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $t = $Text -replace "`r`n?", "`n"
+    $t = [regex]::Replace($t, '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '')
+    $t = $t.Trim()
+    $max = [int]$script:CommentConst.MaxLength
+    if ($t.Length -gt $max) {
+        # kein halbes Surrogatpaar am Schnittpunkt zuruecklassen
+        if ([char]::IsHighSurrogate($t[$max - 1])) { $max-- }
+        $t = $t.Substring(0, $max).TrimEnd()
+    }
+    return ($t -replace "`n", "`r`n")
+}
+
+function Get-ItemComment {
+    param($Item)
+    if ($Item -is [System.Collections.IDictionary] -and $Item.Contains('Comment') -and $null -ne $Item['Comment']) {
+        return [string]$Item['Comment']
+    }
+    return ''
+}
+
+# Setzt (oder entfernt bei leerem Text) den Kommentar eines Objekts.
+# Liefert den gespeicherten, normalisierten Text.
+function Set-ItemComment {
+    param([Parameter(Mandatory)]$Item, [AllowNull()][string]$Text)
+    $norm = Get-NormalizedComment -Text $Text
+    if ($norm -eq '') {
+        if ($Item.Contains('Comment')) { $Item.Remove('Comment') }
+    }
+    else {
+        $Item['Comment'] = $norm
+    }
+    return $norm
+}
+
+# Einzeilige Kurzfassung fuer Tabellen und Menues
+function Get-CommentPreview {
+    param([AllowNull()][string]$Text, [int]$MaxLength = 0)
+    if ($MaxLength -le 0) { $MaxLength = [int]$script:CommentConst.PreviewLength }
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $t = (($Text -replace "`r`n?|`n", ' / ') -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $MaxLength) { $t = $t.Substring(0, $MaxLength - 1).TrimEnd() + '…' }
+    return $t
+}
+
+# Setzt einen Kommentar transaktional: Schnappschuss des Tages, Aenderung,
+# Speichern; bei einem Speicherfehler wird die Aenderung vollstaendig
+# zurueckgenommen. Das Protokoll vermerkt nur, DASS ein Kommentar geaendert
+# wurde - nicht den Inhalt. $Item ist der Tag selbst oder ein Objekt des
+# Tages (Abschnitt, Pause, Sperrintervall, Korrektur). Achtung: Nach einem
+# Rollback sind Referenzen auf Unterobjekte des Tages veraltet.
+function Set-DayItemCommentSaved {
+    param(
+        [Parameter(Mandatory)]$Day,
+        [Parameter(Mandatory)]$Item,
+        [AllowNull()][string]$Text,
+        [Parameter(Mandatory)][string]$Label
+    )
+    $new = Get-NormalizedComment -Text $Text
+    $old = Get-ItemComment -Item $Item
+    if ($new -eq $old) { return $true }
+    $snapshot = Get-DaySnapshot -Day $Day
+    [void](Set-ItemComment -Item $Item -Text $new)
+    $Day['ModifiedAt'] = ConvertTo-DateTimeString (Get-Date)
+    if (-not (Save-WorkData)) {
+        Restore-DayFromSnapshot -Day $Day -Snapshot $snapshot
+        Write-AppLog -Level 'WARN' -Message 'Kommentar NICHT gespeichert - Änderung zurückgenommen.'
+        return $false
+    }
+    $what = 'geaendert'
+    if ($old -eq '') { $what = 'hinzugefuegt' }
+    elseif ($new -eq '') { $what = 'entfernt' }
+    Write-AppLog -Message "Kommentar ($($Day.Date)): $Label - Kommentar $what."
+    return $true
 }
 
 #endregion
@@ -2641,6 +2757,7 @@ function Get-SegmentDisplayRows {
                 Laufend    = $ja[[int][bool]$seg.Running]
                 Manuell    = $ja[[int][bool]$seg.Ref.Manual]
                 Korrigiert = $ja[[int][bool]$seg.Ref.Corrected]
+                Kommentar  = (Get-CommentPreview -Text (Get-ItemComment -Item $seg.Ref))
                 Running    = [bool]$seg.Running
             })
     }
@@ -4656,6 +4773,7 @@ $script:ExtendedXaml = @'
                 <Border Width="1" Background="#FF44506A" Margin="4,2,12,10"/>
                 <Button x:Name="BtnSwitchMode" Content="Modus wechseln" Width="160"/>
                 <Button x:Name="BtnPause" Content="Pause starten" Width="160"/>
+                <Button x:Name="BtnComment" Content="Kommentar..." Width="160"/>
             </StackPanel>
             <StackPanel Orientation="Horizontal">
                 <Button x:Name="BtnAddSegment" Content="Abschnitt hinzufügen" Width="160"/>
@@ -4677,12 +4795,12 @@ $script:ExtendedXaml = @'
 function Get-SegmentsTable {
     param([Parameter(Mandatory)]$Day, $Comp = $null, [datetime]$Now = (Get-Date))
     $dt = New-Object System.Data.DataTable
-    foreach ($col in @('Modus', 'Beginn', 'Ende', 'Brutto', 'Pause', 'Netto', 'Laufend', 'Manuell', 'Korrigiert')) {
+    foreach ($col in @('Modus', 'Beginn', 'Ende', 'Brutto', 'Pause', 'Netto', 'Laufend', 'Manuell', 'Korrigiert', 'Kommentar')) {
         [void]$dt.Columns.Add($col)
     }
     foreach ($row in (Get-SegmentDisplayRows -Day $Day -Comp $Comp -Now $Now)) {
         [void]$dt.Rows.Add($row.Modus, $row.Beginn, $row.Ende, $row.Brutto, $row.Pause, $row.Netto,
-            $row.Laufend, $row.Manuell, $row.Korrigiert)
+            $row.Laufend, $row.Manuell, $row.Korrigiert, $row.Kommentar)
     }
     return ,$dt
 }
@@ -4691,26 +4809,26 @@ function Get-SegmentsTable {
 function Get-PausesTable {
     param([Parameter(Mandatory)]$Day, $Comp)
     $dt = New-Object System.Data.DataTable
-    foreach ($col in @('Art', 'Beginn', 'Ende', 'Dauer')) { [void]$dt.Columns.Add($col) }
+    foreach ($col in @('Art', 'Beginn', 'Ende', 'Dauer', 'Kommentar')) { [void]$dt.Columns.Add($col) }
     $now = Get-Date
     foreach ($iv in @($Day.ManualPauses)) {
         $s = ConvertFrom-DateTimeString $iv.Start
         $e = $now
         $endText = 'läuft'
         if ($iv.End) { $e = ConvertFrom-DateTimeString $iv.End; $endText = Format-Clock $e }
-        [void]$dt.Rows.Add('Manuelle Pause', (Format-Clock $s), $endText, (Format-Duration ($e - $s)))
+        [void]$dt.Rows.Add('Manuelle Pause', (Format-Clock $s), $endText, (Format-Duration ($e - $s)), (Get-CommentPreview -Text (Get-ItemComment -Item $iv)))
     }
     foreach ($iv in @($Day.LockIntervals)) {
         $s = ConvertFrom-DateTimeString $iv.Start
         $e = $now
         $endText = 'läuft'
         if ($iv.End) { $e = ConvertFrom-DateTimeString $iv.End; $endText = Format-Clock $e }
-        [void]$dt.Rows.Add('Windows-Sperre', (Format-Clock $s), $endText, (Format-Duration ($e - $s)))
+        [void]$dt.Rows.Add('Windows-Sperre', (Format-Clock $s), $endText, (Format-Duration ($e - $s)), (Get-CommentPreview -Text (Get-ItemComment -Item $iv)))
     }
     if ($Comp) {
         foreach ($win in @($Comp.PauseWindows)) {
             if ($null -eq $win) { continue }
-            [void]$dt.Rows.Add('Feste Betriebspause', (Format-Clock $win.Start), (Format-Clock $win.End), (Format-Duration ($win.End - $win.Start)))
+            [void]$dt.Rows.Add('Feste Betriebspause', (Format-Clock $win.Start), (Format-Clock $win.End), (Format-Duration ($win.End - $win.Start)), '')
         }
     }
     return ,$dt
@@ -4859,6 +4977,7 @@ function Update-ExtendedWindow {
         $btnPause.IsEnabled = ($hasActive -and $Comp.RunningMode -eq 'Homeoffice' -and -not $Comp.MaxReached)
     }
     $win.FindName('BtnAddSegment').IsEnabled = ($null -ne $Day)
+    $win.FindName('BtnComment').IsEnabled = ($null -ne $Day)
     $win.FindName('BtnEditDay').IsEnabled = ($null -ne $Day)
     $win.FindName('BtnEndDay').IsEnabled = $hasActive
 }
@@ -5738,6 +5857,11 @@ $script:IntervalEditXaml = @'
             <TextBox x:Name="TxtEnd" Width="70" FontFamily="Consolas"/>
             <TextBlock x:Name="TxtEndHint" Text="  (leer = läuft noch)" Foreground="#FFAAB8C6" VerticalAlignment="Center"/>
         </StackPanel>
+        <StackPanel x:Name="PnlComment" Margin="0,10,0,0">
+            <TextBlock x:Name="TxtCommentLabel" Text="Kommentar (optional):" TextWrapping="Wrap"/>
+            <TextBox x:Name="TxtComment" AcceptsReturn="True" TextWrapping="Wrap" Height="60" Margin="0,4,0,0"
+                     VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"/>
+        </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
             <Button x:Name="BtnOk" Content="Übernehmen" IsDefault="True"/>
             <Button x:Name="BtnCancel" Content="Abbrechen" IsCancel="True" Margin="0"/>
@@ -5747,7 +5871,10 @@ $script:IntervalEditXaml = @'
 '@
 
 # Generischer Intervall-Editor.
-# Liefert @{ Mode; Start=[datetime]; End=[datetime]/$null } oder $null bei Abbruch
+# Liefert @{ Mode; Start=[datetime]; End=[datetime]/$null; Comment } oder
+# $null bei Abbruch. Mit -CommentLabel erscheint ein optionales
+# Kommentarfeld (z. B. Kommentar zum neuen Eintrag oder Begruendung einer
+# Korrektur); Comment ist normalisiert ('' = kein Kommentar).
 function Show-IntervalEditDialog {
     param(
         [Parameter(Mandatory)][string]$Caption,
@@ -5756,7 +5883,9 @@ function Show-IntervalEditDialog {
         [string]$StartText = '',
         [string]$EndText = '',
         [switch]$ShowMode,
-        [switch]$AllowEmptyEnd
+        [switch]$AllowEmptyEnd,
+        [string]$CommentLabel = '',
+        [string]$CommentText = ''
     )
     $win = New-XamlWindow -Xaml $script:IntervalEditXaml
     Set-DialogOwner -Window $win
@@ -5771,6 +5900,14 @@ function Show-IntervalEditDialog {
     if (-not $AllowEmptyEnd) { $win.FindName('TxtEndHint').Visibility = 'Collapsed' }
     $win.FindName('TxtStart').Text = $StartText
     $win.FindName('TxtEnd').Text = $EndText
+    $win.FindName('TxtComment').MaxLength = [int]$script:CommentConst.MaxLength
+    if ($CommentLabel -ne '') {
+        $win.FindName('TxtCommentLabel').Text = $CommentLabel
+        $win.FindName('TxtComment').Text = $CommentText
+    }
+    else {
+        $win.FindName('PnlComment').Visibility = 'Collapsed'
+    }
     $state = @{ Result = $null }
     $allowEmpty = [bool]$AllowEmptyEnd
     $showModeFlag = [bool]$ShowMode
@@ -5796,12 +5933,161 @@ function Show-IntervalEditDialog {
                 $selMode = 'Betrieb'
                 if ($win.FindName('RbHomeoffice').IsChecked) { $selMode = 'Homeoffice' }
             }
-            $state.Result = @{ Mode = $selMode; Start = $start; End = $end }
+            $state.Result = @{ Mode = $selMode; Start = $start; End = $end; Comment = (Get-NormalizedComment -Text ([string]$win.FindName('TxtComment').Text)) }
             $win.DialogResult = $true
             $win.Close()
         })
     [void]$win.ShowDialog()
     return $state.Result
+}
+
+#endregion
+
+#region ===== Dialog: Kommentar =====
+
+$script:CommentXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Kommentar" SizeToContent="Height" Width="480"
+        Background="#FF171C24" WindowStartupLocation="CenterScreen" ResizeMode="NoResize" Topmost="True">
+    <Window.Resources>
+<!--THEME-->
+    </Window.Resources>
+    <StackPanel Margin="16">
+        <TextBlock x:Name="TxtCaption" FontWeight="Bold" TextWrapping="Wrap" Margin="0,0,0,8"/>
+        <StackPanel x:Name="PnlTargets" Margin="0,0,0,8"/>
+        <TextBox x:Name="TxtComment" AcceptsReturn="True" AcceptsTab="False" TextWrapping="Wrap" Height="120"
+                 VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"/>
+        <TextBlock x:Name="TxtCounter" Foreground="#FFAAB8C6" HorizontalAlignment="Right" Margin="0,4,0,0"/>
+        <TextBlock Text="Kommentare werden verschlüsselt im Tresor gespeichert und verändern keine Arbeitszeiten. Leeres Feld = Kommentar entfernen." TextWrapping="Wrap" Foreground="#FFAAB8C6" Margin="0,4,0,0"/>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+            <Button x:Name="BtnOk" Content="Übernehmen"/>
+            <Button x:Name="BtnCancel" Content="Abbrechen" IsCancel="True" Margin="0"/>
+        </StackPanel>
+    </StackPanel>
+</Window>
+'@
+
+# Kommentar-Dialog fuer ein oder mehrere Ziele.
+# $Targets: Liste von @{ Key; Label; Text } - bei mehr als einem Ziel wird
+# per Optionsfeld gewaehlt; Eingaben je Ziel bleiben beim Umschalten erhalten.
+# Liefert die GEAENDERTEN Ziele als Liste von @{ Key; Text } (normalisiert;
+# leer = Kommentar entfernen) oder $null bei Abbruch.
+function Show-CommentDialog {
+    param(
+        [Parameter(Mandatory)][string]$Caption,
+        [Parameter(Mandatory)]$Targets,
+        [string]$DefaultKey = ''
+    )
+    $targetList = @($Targets)
+    if ($targetList.Count -eq 0) { return $null }
+    $win = New-XamlWindow -Xaml $script:CommentXaml
+    Set-DialogOwner -Window $win
+    $win.FindName('TxtCaption').Text = $Caption
+    $box = $win.FindName('TxtComment')
+    $box.MaxLength = [int]$script:CommentConst.MaxLength
+    $counter = $win.FindName('TxtCounter')
+    $state = @{ Result = $null; Current = ''; Drafts = @{}; Original = @{} }
+    foreach ($t in $targetList) {
+        $state.Drafts[[string]$t.Key] = [string]$t.Text
+        $state.Original[[string]$t.Key] = Get-NormalizedComment -Text ([string]$t.Text)
+    }
+    $updateCounter = {
+        $counter.Text = '{0} / {1} Zeichen' -f $box.Text.Length, $box.MaxLength
+    }
+    $box.Add_TextChanged({ & $updateCounter })
+    $select = {
+        param([string]$Key)
+        if ($state.Current -ne '') { $state.Drafts[$state.Current] = [string]$box.Text }
+        $state.Current = $Key
+        $box.Text = [string]$state.Drafts[$Key]
+        $box.CaretIndex = $box.Text.Length
+        & $updateCounter
+    }
+    if ($DefaultKey -eq '' -or -not $state.Drafts.ContainsKey($DefaultKey)) { $DefaultKey = [string]$targetList[0].Key }
+    $panel = $win.FindName('PnlTargets')
+    if ($targetList.Count -gt 1) {
+        foreach ($t in $targetList) {
+            $rb = New-Object System.Windows.Controls.RadioButton
+            $rb.Content = [string]$t.Label
+            $rb.GroupName = 'CommentTarget'
+            $rb.Tag = [string]$t.Key
+            $rb.Margin = New-Object System.Windows.Thickness(0, 0, 0, 2)
+            $rb.IsChecked = ([string]$t.Key -eq $DefaultKey)
+            $rb.Add_Checked({
+                    param($sender, $e)
+                    & $select ([string]$sender.Tag)
+                })
+            [void]$panel.Children.Add($rb)
+        }
+    }
+    else {
+        $panel.Visibility = 'Collapsed'
+    }
+    & $select $DefaultKey
+    $win.FindName('BtnOk').Add_Click({
+            $state.Drafts[$state.Current] = [string]$box.Text
+            $changed = New-Object System.Collections.ArrayList
+            foreach ($t in $targetList) {
+                $key = [string]$t.Key
+                $norm = Get-NormalizedComment -Text ([string]$state.Drafts[$key])
+                if ($norm -ne $state.Original[$key]) { [void]$changed.Add(@{ Key = $key; Text = $norm }) }
+            }
+            $state.Result = $changed
+            $win.DialogResult = $true
+            $win.Close()
+        })
+    $box.Focus() | Out-Null
+    [void]$win.ShowDialog()
+    if ($null -eq $state.Result) { return $null }
+    return ,$state.Result
+}
+
+# Ziele fuer den Kommentar zum aktuellen Arbeitstag: der Tag selbst, der
+# laufende Abschnitt und eine laufende manuelle Pause. Liefert
+# @{ Targets; DefaultKey; Items } - Items ordnet jedem Key das Objekt und
+# eine Protokollbezeichnung zu. Standardziel ist eine laufende Pause, sonst
+# der Tag. Reine Funktion (testbar).
+function Get-CurrentDayCommentTargets {
+    param([Parameter(Mandatory)]$Day)
+    $targets = New-Object System.Collections.ArrayList
+    $items = @{}
+    [void]$targets.Add(@{ Key = 'Day'; Label = "Arbeitstag $($Day.Date)"; Text = (Get-ItemComment -Item $Day) })
+    $items['Day'] = @{ Item = $Day; Label = 'Tag' }
+    $default = 'Day'
+    if ($Day.Status -eq 'Aktiv') {
+        foreach ($seg in @($Day.Segments)) {
+            if ($null -eq $seg -or -not [bool]$seg.Running) { continue }
+            $label = 'Laufender Abschnitt: {0} seit {1}' -f $seg.Mode, (Format-Clock (ConvertFrom-DateTimeString $seg.Start))
+            [void]$targets.Add(@{ Key = 'Segment'; Label = $label; Text = (Get-ItemComment -Item $seg) })
+            $items['Segment'] = @{ Item = $seg; Label = "Abschnitt $($seg.Mode)" }
+            break
+        }
+        foreach ($iv in @($Day.ManualPauses)) {
+            if ($null -eq $iv -or $iv.End) { continue }
+            $label = 'Laufende Pause seit {0}' -f (Format-Clock (ConvertFrom-DateTimeString $iv.Start))
+            [void]$targets.Add(@{ Key = 'Pause'; Label = $label; Text = (Get-ItemComment -Item $iv) })
+            $items['Pause'] = @{ Item = $iv; Label = 'Manuelle Pause' }
+            $default = 'Pause'
+            break
+        }
+    }
+    return @{ Targets = $targets; DefaultKey = $default; Items = $items }
+}
+
+# Speichert die Ergebnisse des Kommentar-Dialogs (je Ziel transaktional).
+# $Items ordnet jedem Key @{ Item; Label } zu (Get-CurrentDayCommentTargets).
+# Nach einem fehlgeschlagenen Speichern wurde der Tag zurueckgerollt - die
+# uebrigen Objektreferenzen sind dann veraltet, daher wird abgebrochen.
+function Save-DayCommentResults {
+    param([Parameter(Mandatory)]$Day, $Results, [Parameter(Mandatory)]$Items)
+    foreach ($r in @($Results)) {
+        if ($null -eq $r) { continue }
+        $entry = $Items[[string]$r.Key]
+        if ($null -eq $entry) { continue }
+        if (-not (Set-DayItemCommentSaved -Day $Day -Item $entry.Item -Text ([string]$r.Text) -Label $entry.Label)) { return $false }
+    }
+    return $true
 }
 
 #endregion
@@ -6608,7 +6894,7 @@ function Show-SettingsDialog {
 $script:DayEditorXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Tag bearbeiten" Width="860" Height="620" MinWidth="700" MinHeight="480"
+        Title="Tag bearbeiten" Width="900" Height="780" MinWidth="720" MinHeight="600"
         Background="#FF171C24" WindowStartupLocation="CenterScreen">
     <Window.Resources>
 <!--THEME-->
@@ -6619,11 +6905,17 @@ $script:DayEditorXaml = @'
             <RowDefinition Height="*"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="*"/>
+            <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
         <StackPanel Grid.Row="0" Margin="0,0,0,8">
             <TextBlock x:Name="TxtHeader" FontWeight="Bold" FontSize="15"/>
             <TextBlock Text="Die feste 45-Minuten-Betriebspause wird automatisch berechnet und kann nicht bearbeitet werden. Jede Änderung wird protokolliert." TextWrapping="Wrap" Foreground="#FFAAB8C6"/>
+            <DockPanel Margin="0,6,0,0">
+                <Button x:Name="BtnDayComment" DockPanel.Dock="Right" Content="Tageskommentar..." MinWidth="140" Margin="8,0,0,0"/>
+                <TextBlock Text="Tageskommentar: " VerticalAlignment="Center" Foreground="#FFAAB8C6"/>
+                <TextBlock x:Name="TxtDayComment" VerticalAlignment="Center" TextWrapping="Wrap" MaxHeight="40" TextTrimming="CharacterEllipsis"/>
+            </DockPanel>
         </StackPanel>
         <GroupBox Grid.Row="1" Header="Arbeitsabschnitte">
             <DockPanel>
@@ -6631,6 +6923,7 @@ $script:DayEditorXaml = @'
                     <Button x:Name="BtnSegNew" Content="Neu" MinWidth="90"/>
                     <Button x:Name="BtnSegEdit" Content="Bearbeiten" MinWidth="90" Margin="0,6,0,0"/>
                     <Button x:Name="BtnSegDelete" Content="Löschen" MinWidth="90" Margin="0,6,0,0"/>
+                    <Button x:Name="BtnSegComment" Content="Kommentar..." MinWidth="90" Margin="0,6,0,0"/>
                 </StackPanel>
                 <DataGrid x:Name="GridSegments" CanUserSortColumns="False"/>
             </DockPanel>
@@ -6641,6 +6934,7 @@ $script:DayEditorXaml = @'
                     <Button x:Name="BtnPauseNew" Content="Neu" MinWidth="90"/>
                     <Button x:Name="BtnPauseEdit" Content="Bearbeiten" MinWidth="90" Margin="0,6,0,0"/>
                     <Button x:Name="BtnPauseDelete" Content="Löschen" MinWidth="90" Margin="0,6,0,0"/>
+                    <Button x:Name="BtnPauseComment" Content="Kommentar..." MinWidth="90" Margin="0,6,0,0"/>
                 </StackPanel>
                 <DataGrid x:Name="GridPauses" CanUserSortColumns="False"/>
             </DockPanel>
@@ -6651,11 +6945,20 @@ $script:DayEditorXaml = @'
                     <Button x:Name="BtnLockNew" Content="Neu" MinWidth="90"/>
                     <Button x:Name="BtnLockEdit" Content="Bearbeiten" MinWidth="90" Margin="0,6,0,0"/>
                     <Button x:Name="BtnLockDelete" Content="Löschen" MinWidth="90" Margin="0,6,0,0"/>
+                    <Button x:Name="BtnLockComment" Content="Kommentar..." MinWidth="90" Margin="0,6,0,0"/>
                 </StackPanel>
                 <DataGrid x:Name="GridLocks" CanUserSortColumns="False"/>
             </DockPanel>
         </GroupBox>
-        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+        <GroupBox Grid.Row="4" Header="Änderungsprotokoll (Korrekturen)">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Right" Margin="8,0,0,0">
+                    <Button x:Name="BtnCorrComment" Content="Kommentar..." MinWidth="90"/>
+                </StackPanel>
+                <DataGrid x:Name="GridCorrections" CanUserSortColumns="False"/>
+            </DockPanel>
+        </GroupBox>
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
             <TextBlock x:Name="TxtNetto" VerticalAlignment="Center" FontFamily="Consolas" Margin="0,0,16,0"/>
             <Button x:Name="BtnClose" Content="Schließen" IsCancel="True" Margin="0"/>
         </StackPanel>
@@ -6666,7 +6969,7 @@ $script:DayEditorXaml = @'
 function Get-IntervalTable {
     param($Intervals)
     $dt = New-Object System.Data.DataTable
-    foreach ($col in @('Beginn', 'Ende', 'Dauer')) { [void]$dt.Columns.Add($col) }
+    foreach ($col in @('Beginn', 'Ende', 'Dauer', 'Kommentar')) { [void]$dt.Columns.Add($col) }
     $now = Get-Date
     foreach ($iv in @($Intervals)) {
         if ($null -eq $iv) { continue }
@@ -6674,7 +6977,23 @@ function Get-IntervalTable {
         $e = $now
         $endText = 'läuft'
         if ($iv.End) { $e = ConvertFrom-DateTimeString $iv.End; $endText = Format-Clock $e }
-        [void]$dt.Rows.Add((Format-Clock $s), $endText, (Format-Duration ($e - $s)))
+        [void]$dt.Rows.Add((Format-Clock $s), $endText, (Format-Duration ($e - $s)), (Get-CommentPreview -Text (Get-ItemComment -Item $iv)))
+    }
+    return ,$dt
+}
+
+# Tabelle des Aenderungsprotokolls (Korrekturen) eines Tages - in der
+# gespeicherten Reihenfolge (Zeilenindex = Index in Day.Corrections)
+function Get-CorrectionsTable {
+    param($Corrections)
+    $dt = New-Object System.Data.DataTable
+    foreach ($col in @('Zeitpunkt', 'Änderung', 'Alt', 'Neu', 'Kommentar')) { [void]$dt.Columns.Add($col) }
+    foreach ($corr in @($Corrections)) {
+        if ($null -eq $corr) { continue }
+        $when = [string]$corr.Timestamp
+        try { $when = (ConvertFrom-DateTimeString $corr.Timestamp).ToString('dd.MM.yyyy HH:mm') } catch { }
+        [void]$dt.Rows.Add($when, [string]$corr.Description, [string]$corr.OldValue, [string]$corr.NewValue,
+            (Get-CommentPreview -Text (Get-ItemComment -Item $corr)))
     }
     return ,$dt
 }
@@ -6697,6 +7016,11 @@ function Show-DayEditor {
         $win.FindName('GridSegments').ItemsSource = (Get-SegmentsTable -Day $Day).DefaultView
         $win.FindName('GridPauses').ItemsSource = (Get-IntervalTable -Intervals $Day.ManualPauses).DefaultView
         $win.FindName('GridLocks').ItemsSource = (Get-IntervalTable -Intervals $Day.LockIntervals).DefaultView
+        $win.FindName('GridCorrections').ItemsSource = (Get-CorrectionsTable -Corrections $Day.Corrections).DefaultView
+        $dayComment = Get-ItemComment -Item $Day
+        $dayCommentBlock = $win.FindName('TxtDayComment')
+        if ($dayComment -eq '') { $dayCommentBlock.Text = '(kein Kommentar)'; $dayCommentBlock.ToolTip = $null }
+        else { $dayCommentBlock.Text = Get-CommentPreview -Text $dayComment -MaxLength 200; $dayCommentBlock.ToolTip = $dayComment }
         $now = Get-Date
         $state.SegIds = @((Get-ParsedSegments -Day $Day -Now $now) | ForEach-Object { $_.Id })
         $state.PauseIds = @(@($Day.ManualPauses) | ForEach-Object { $_.Id })
@@ -6732,7 +7056,7 @@ function Show-DayEditor {
     # --- Arbeitsabschnitte ---
     $win.FindName('BtnSegNew').Add_Click({
             $result = Show-IntervalEditDialog -Caption 'Neuer Arbeitsabschnitt' -BaseDate $baseDate -ShowMode -Mode 'Homeoffice' `
-                -StartText '08:00' -EndText '09:00' -AllowEmptyEnd:$isActive
+                -StartText '08:00' -EndText '09:00' -AllowEmptyEnd:$isActive -CommentLabel 'Kommentar zum Abschnitt (optional):'
             if ($null -eq $result) { return }
             if (Test-SegmentOverlap -Day $Day -Start $result.Start -End $result.End) {
                 Show-Warning -Message 'Der neue Abschnitt überschneidet sich mit einem vorhandenen Arbeitsabschnitt.'
@@ -6746,6 +7070,7 @@ function Show-DayEditor {
             $snapshot = Get-DaySnapshot -Day $Day
             $newSeg = New-SegmentObject -Mode $result.Mode -Start $result.Start -Running ($null -eq $result.End) -Manual $true
             if ($null -ne $result.End) { $newSeg['End'] = ConvertTo-DateTimeString $result.End }
+            [void](Set-ItemComment -Item $newSeg -Text $result.Comment)
             [void]$Day['Segments'].Add($newSeg)
             if (-not (& $applyTenHourGuard $snapshot)) { & $refresh; return }
             $corrNewText = ('{0} {1}-{2}' -f $result.Mode, (Format-Clock $result.Start), (Format-Clock $result.End))
@@ -6770,7 +7095,8 @@ function Show-DayEditor {
             $endText = ''
             if ($seg.End) { $endText = Format-Clock (ConvertFrom-DateTimeString $seg.End) }
             $result = Show-IntervalEditDialog -Caption 'Arbeitsabschnitt bearbeiten' -BaseDate $baseDate -ShowMode -Mode $seg.Mode `
-                -StartText (Format-Clock (ConvertFrom-DateTimeString $seg.Start)) -EndText $endText -AllowEmptyEnd:$isActive
+                -StartText (Format-Clock (ConvertFrom-DateTimeString $seg.Start)) -EndText $endText -AllowEmptyEnd:$isActive `
+                -CommentLabel 'Begründung der Änderung (optional, erscheint im Änderungsprotokoll):'
             if ($null -eq $result) { return }
             if (Test-SegmentOverlap -Day $Day -Start $result.Start -End $result.End -ExcludeId $seg.Id) {
                 Show-Warning -Message 'Die Änderung überschneidet sich mit einem anderen Arbeitsabschnitt.'
@@ -6796,7 +7122,7 @@ function Show-DayEditor {
             $seg['Corrected'] = $true
             if (-not (& $applyTenHourGuard $snapshot)) { & $refresh; return }
             $corrNewText = ('{0} {1}-{2}' -f $result.Mode, (Format-Clock $result.Start), (Format-Clock $result.End))
-            Add-Correction -Day $Day -Description 'Arbeitsabschnitt korrigiert' -OldValue $oldText -NewValue $corrNewText -NoLog
+            Add-Correction -Day $Day -Description 'Arbeitsabschnitt korrigiert' -OldValue $oldText -NewValue $corrNewText -Comment $result.Comment -NoLog
             if (-not (Save-WorkData)) {
                 Restore-DayFromSnapshot -Day $Day -Snapshot $snapshot
                 Write-AppLog -Level 'WARN' -Message 'Korrektur NICHT gespeichert - Änderung vollständig zurückgenommen.'
@@ -6839,7 +7165,8 @@ function Show-DayEditor {
         # Erfolgslogeintrag erst NACH erfolgreichem Speichern (transaktional)
         $pendingCorr = $null
         if ($Action -eq 'New') {
-            $result = Show-IntervalEditDialog -Caption "Neues Intervall: $Label" -BaseDate $baseDate -StartText '12:00' -EndText '12:30' -AllowEmptyEnd:$isActive
+            $result = Show-IntervalEditDialog -Caption "Neues Intervall: $Label" -BaseDate $baseDate -StartText '12:00' -EndText '12:30' -AllowEmptyEnd:$isActive `
+                -CommentLabel 'Kommentar zum Eintrag (optional):'
             if ($null -eq $result) { return }
             if ($null -eq $result.End) {
                 foreach ($iv in @($Day[$ListName])) {
@@ -6849,6 +7176,7 @@ function Show-DayEditor {
             $snapshot = Get-DaySnapshot -Day $Day
             $newIv = New-IntervalObject -Start $result.Start
             if ($null -ne $result.End) { $newIv['End'] = ConvertTo-DateTimeString $result.End }
+            [void](Set-ItemComment -Item $newIv -Text $result.Comment)
             [void]$Day[$ListName].Add($newIv)
             if (-not (& $applyTenHourGuard $snapshot)) { & $refresh; return }
             $pendingCorr = @{ Description = "$Label ergaenzt"; Old = ''; New = ('{0}-{1}' -f (Format-Clock $result.Start), (Format-Clock $result.End)) }
@@ -6873,7 +7201,8 @@ function Show-DayEditor {
             }
             else {
                 $result = Show-IntervalEditDialog -Caption "$Label bearbeiten" -BaseDate $baseDate `
-                    -StartText (Format-Clock (ConvertFrom-DateTimeString $iv.Start)) -EndText $oldEndText -AllowEmptyEnd:$isActive
+                    -StartText (Format-Clock (ConvertFrom-DateTimeString $iv.Start)) -EndText $oldEndText -AllowEmptyEnd:$isActive `
+                    -CommentLabel 'Begründung der Änderung (optional, erscheint im Änderungsprotokoll):'
                 if ($null -eq $result) { return }
                 if ($null -eq $result.End) {
                     foreach ($other in @($Day[$ListName])) {
@@ -6885,7 +7214,7 @@ function Show-DayEditor {
                 if ($null -ne $result.End) { $iv['End'] = ConvertTo-DateTimeString $result.End } else { $iv['End'] = $null }
                 if (-not (& $applyTenHourGuard $snapshot)) { & $refresh; return }
                 $pendingCorr = @{ Description = "$Label korrigiert"; Old = $oldText; New = ('{0}-{1}' -f (Format-Clock $result.Start), (Format-Clock $result.End)) }
-                Add-Correction -Day $Day -Description $pendingCorr.Description -OldValue $oldText -NewValue $pendingCorr.New -NoLog
+                Add-Correction -Day $Day -Description $pendingCorr.Description -OldValue $oldText -NewValue $pendingCorr.New -Comment $result.Comment -NoLog
             }
         }
         if (-not (Save-WorkData)) {
@@ -6908,6 +7237,57 @@ function Show-DayEditor {
     $win.FindName('BtnLockNew').Add_Click({ & $intervalHandler 'LockIntervals' 'LockIds' 'GridLocks' 'New' 'Sperrintervall' })
     $win.FindName('BtnLockEdit').Add_Click({ & $intervalHandler 'LockIntervals' 'LockIds' 'GridLocks' 'Edit' 'Sperrintervall' })
     $win.FindName('BtnLockDelete').Add_Click({ & $intervalHandler 'LockIntervals' 'LockIds' 'GridLocks' 'Delete' 'Sperrintervall' })
+    # --- Kommentare (aendern keine Zeiten, zaehlen nicht als Korrektur) ---
+    $editComment = {
+        param([string]$Caption, $Item, [string]$Label)
+        if ($null -eq $Item) { return }
+        $res = Show-CommentDialog -Caption $Caption -Targets @(@{ Key = 'Item'; Label = $Label; Text = (Get-ItemComment -Item $Item) })
+        if ($null -eq $res -or @($res).Count -eq 0) { return }
+        [void](Save-DayCommentResults -Day $Day -Results $res -Items @{ Item = @{ Item = $Item; Label = $Label } })
+        & $refresh
+        Invoke-MainRefresh -ForceTables
+    }
+    $selectedId = {
+        param([string]$GridName, [string]$IdListName)
+        $idx = $win.FindName($GridName).SelectedIndex
+        $ids = @($state[$IdListName])
+        if ($idx -lt 0 -or $idx -ge $ids.Count) { Show-Info -Message 'Bitte zuerst einen Eintrag auswählen.'; return $null }
+        return [string]$ids[$idx]
+    }
+
+    $win.FindName('BtnDayComment').Add_Click({
+            & $editComment "Kommentar zum Arbeitstag $($Day.Date)" $Day 'Tag'
+        })
+    $win.FindName('BtnSegComment').Add_Click({
+            $id = & $selectedId 'GridSegments' 'SegIds'
+            if ($null -eq $id) { return }
+            $seg = & $findSegment $id
+            if ($null -eq $seg) { return }
+            $caption = 'Kommentar zum Abschnitt {0} ab {1}' -f $seg.Mode, (Format-Clock (ConvertFrom-DateTimeString $seg.Start))
+            & $editComment $caption $seg "Abschnitt $($seg.Mode)"
+        })
+    $win.FindName('BtnPauseComment').Add_Click({
+            $id = & $selectedId 'GridPauses' 'PauseIds'
+            if ($null -eq $id) { return }
+            $iv = & $findInterval 'ManualPauses' $id
+            if ($null -eq $iv) { return }
+            & $editComment ('Kommentar zur Pause ab {0}' -f (Format-Clock (ConvertFrom-DateTimeString $iv.Start))) $iv 'Manuelle Pause'
+        })
+    $win.FindName('BtnLockComment').Add_Click({
+            $id = & $selectedId 'GridLocks' 'LockIds'
+            if ($null -eq $id) { return }
+            $iv = & $findInterval 'LockIntervals' $id
+            if ($null -eq $iv) { return }
+            & $editComment ('Kommentar zum Sperrintervall ab {0}' -f (Format-Clock (ConvertFrom-DateTimeString $iv.Start))) $iv 'Sperrintervall'
+        })
+    $win.FindName('BtnCorrComment').Add_Click({
+            $idx = $win.FindName('GridCorrections').SelectedIndex
+            $list = @(@($Day.Corrections) | Where-Object { $null -ne $_ })
+            if ($idx -lt 0 -or $idx -ge $list.Count) { Show-Info -Message 'Bitte zuerst eine Änderung auswählen.'; return }
+            $corr = $list[$idx]
+            & $editComment ('Kommentar zur Änderung: {0}' -f [string]$corr.Description) $corr 'Korrektur'
+        })
+
     $win.FindName('BtnClose').Add_Click({ $win.Close() })
 
     & $refresh
@@ -6945,7 +7325,7 @@ $script:HistoryXaml = @'
 function Get-HistoryTable {
     param($Days)
     $dt = New-Object System.Data.DataTable
-    foreach ($col in @('Datum', 'Beginn', 'Ende', 'Netto', 'Betrieb', 'Homeoffice', 'Pausen', 'Sperrzeit', 'Sollabweichung', 'Status', 'Korrekturen')) {
+    foreach ($col in @('Datum', 'Beginn', 'Ende', 'Netto', 'Betrieb', 'Homeoffice', 'Pausen', 'Sperrzeit', 'Sollabweichung', 'Status', 'Korrekturen', 'Kommentar')) {
         [void]$dt.Columns.Add($col)
     }
     foreach ($day in @($Days)) {
@@ -6966,7 +7346,8 @@ function Get-HistoryTable {
             (Format-Duration $comp.SperrZeit),
             (Format-Duration $abweichung -WithSign:($abweichung.Ticks -ge 0)),
             [string]$day.Status,
-            [string]@($day.Corrections).Count
+            [string]@($day.Corrections).Count,
+            (Get-CommentPreview -Text (Get-ItemComment -Item $day))
         )
     }
     return ,$dt
@@ -7060,11 +7441,13 @@ function Export-WorkDataCsv {
 
     $header = @('Datum', 'Beginn', 'Ende', 'Betriebszeit', 'Homeoffice-Zeit', 'Sperrzeit', 'Pausenzeit',
         'Netto-Arbeitszeit', 'Regelarbeitszeit', 'Sollabweichung', 'Überstunden', 'Maximale Arbeitszeit',
-        'Maximalzeit erreicht', 'Anzahl Korrekturen')
+        'Maximalzeit erreicht', 'Anzahl Korrekturen', 'Kommentar')
     $lines = New-Object System.Collections.ArrayList
     [void]$lines.Add(($header -join ';'))
     $detailLines = New-Object System.Collections.ArrayList
-    [void]$detailLines.Add((@('Datum', 'Modus', 'Beginn', 'Ende', 'Bruttozeit', 'Pausenzeit', 'Nettozeit', 'Manuell erfasst', 'Korrigiert') -join ';'))
+    [void]$detailLines.Add((@('Datum', 'Modus', 'Beginn', 'Ende', 'Bruttozeit', 'Pausenzeit', 'Nettozeit', 'Manuell erfasst', 'Korrigiert', 'Kommentar') -join ';'))
+    # Kommentare einzeilig (Zeilenumbrueche als ' / '), ungekuerzt
+    $csvComment = { param($Item) Get-CommentPreview -Text (Get-ItemComment -Item $Item) -MaxLength ([int]$script:CommentConst.MaxLength * 4) }
 
     foreach ($day in @($Days | Sort-Object -Property @{ Expression = { $_.Date } })) {
         $refTime = Get-Date
@@ -7090,7 +7473,8 @@ function Export-WorkDataCsv {
             (Format-Duration $comp.Ueberstunden -WithSign),
             (Format-Duration $comp.MaxTs),
             $maxText,
-            [string]@($day.Corrections).Count
+            [string]@($day.Corrections).Count,
+            (& $csvComment $day)
         )
         [void]$lines.Add((($row | ForEach-Object { Get-CsvEscaped ([string]$_) }) -join ';'))
 
@@ -7102,7 +7486,7 @@ function Export-WorkDataCsv {
                 $detailRow = @(
                     $dayDate.ToString('dd.MM.yyyy'), $seg.Mode, (Format-Clock $seg.Start), $segEnd,
                     [string]$seg.Ref.Brutto, [string]$seg.Ref.Pause, [string]$seg.Ref.Netto,
-                    $ja[[int][bool]$seg.Ref.Manual], $ja[[int][bool]$seg.Ref.Corrected]
+                    $ja[[int][bool]$seg.Ref.Manual], $ja[[int][bool]$seg.Ref.Corrected], (& $csvComment $seg.Ref)
                 )
                 [void]$detailLines.Add((($detailRow | ForEach-Object { Get-CsvEscaped ([string]$_) }) -join ';'))
             }
@@ -8339,22 +8723,22 @@ function Get-DayContentFingerprint {
     $segs = New-Object System.Collections.ArrayList
     foreach ($seg in @($Day['Segments'])) {
         if ($null -eq $seg) { continue }
-        [void]$segs.Add(('{0}|{1}|{2}|{3}' -f [string]$seg['Mode'], [string]$seg['Start'], [string]$seg['End'], [bool]$seg['Running']))
+        [void]$segs.Add(('{0}|{1}|{2}|{3}|{4}' -f [string]$seg['Mode'], [string]$seg['Start'], [string]$seg['End'], [bool]$seg['Running'], (Get-ItemComment -Item $seg)))
     }
     $pauses = New-Object System.Collections.ArrayList
     foreach ($iv in @($Day['ManualPauses'])) {
         if ($null -eq $iv) { continue }
-        [void]$pauses.Add(('{0}|{1}' -f [string]$iv['Start'], [string]$iv['End']))
+        [void]$pauses.Add(('{0}|{1}|{2}' -f [string]$iv['Start'], [string]$iv['End'], (Get-ItemComment -Item $iv)))
     }
     $locks = New-Object System.Collections.ArrayList
     foreach ($iv in @($Day['LockIntervals'])) {
         if ($null -eq $iv) { continue }
-        [void]$locks.Add(('{0}|{1}' -f [string]$iv['Start'], [string]$iv['End']))
+        [void]$locks.Add(('{0}|{1}|{2}' -f [string]$iv['Start'], [string]$iv['End'], (Get-ItemComment -Item $iv)))
     }
     $corrections = New-Object System.Collections.ArrayList
     foreach ($corr in @($Day['Corrections'])) {
         if ($null -eq $corr) { continue }
-        [void]$corrections.Add(('{0}|{1}|{2}|{3}' -f [string]$corr['Timestamp'], [string]$corr['Description'], [string]$corr['OldValue'], [string]$corr['NewValue']))
+        [void]$corrections.Add(('{0}|{1}|{2}|{3}|{4}' -f [string]$corr['Timestamp'], [string]$corr['Description'], [string]$corr['OldValue'], [string]$corr['NewValue'], (Get-ItemComment -Item $corr)))
     }
     $totalsJson = ''
     if ($Day['Totals'] -is [System.Collections.IDictionary] -and @($Day['Totals'].Keys).Count -gt 0) {
@@ -8365,6 +8749,7 @@ function Get-DayContentFingerprint {
         Status         = [string]$Day['Status']
         EndedAt        = [string]$Day['EndedAt']
         RegularMinutes = [string]$Day['RegularMinutes']
+        Comment        = (Get-ItemComment -Item $Day)
         Segments       = @($segs.ToArray() | Sort-Object)
         Pauses         = @($pauses.ToArray() | Sort-Object)
         Locks          = @($locks.ToArray() | Sort-Object)
@@ -8408,8 +8793,11 @@ function Get-DayConflictSummary {
     if ($Day['Totals'] -is [System.Collections.IDictionary] -and $Day['Totals'].Contains('Netto')) {
         $netto = [string]$Day['Totals']['Netto']
     }
-    return ('Status {0} | {1} Abschnitt(e) | {2} Pause(n) | {3} Sperrintervall(e) | {4} Korrektur(en) | Netto {5}' -f `
+    $summary = ('Status {0} | {1} Abschnitt(e) | {2} Pause(n) | {3} Sperrintervall(e) | {4} Korrektur(en) | Netto {5}' -f `
             [string]$Day['Status'], $segCount, @($Day['ManualPauses']).Count, @($Day['LockIntervals']).Count, @($Day['Corrections']).Count, $netto)
+    $comment = Get-ItemComment -Item $Day
+    if ($comment -ne '') { $summary += ' | Kommentar: ' + (Get-CommentPreview -Text $comment -MaxLength 40) }
+    return $summary
 }
 
 # Liefert 'Behalten' | 'Uebernehmen' | 'Archivieren' | 'Abbrechen'
@@ -10719,7 +11107,7 @@ function Invoke-AddSegmentFlow {
     }
     $baseDate = [datetime]::ParseExact($day.Date, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
     $result = Show-IntervalEditDialog -Caption 'Arbeitsabschnitt manuell erfassen (z. B. Homeoffice 08:00 bis 09:30)' `
-        -BaseDate $baseDate -ShowMode -Mode 'Homeoffice' -StartText '08:00' -EndText '09:30'
+        -BaseDate $baseDate -ShowMode -Mode 'Homeoffice' -StartText '08:00' -EndText '09:30' -CommentLabel 'Kommentar zum Abschnitt (optional):'
     if ($null -eq $result) { return }
     if (Test-SegmentOverlap -Day $day -Start $result.Start -End $result.End) {
         Show-Warning -Message 'Der Abschnitt überschneidet sich mit einem vorhandenen Arbeitsabschnitt.'
@@ -10727,6 +11115,7 @@ function Invoke-AddSegmentFlow {
     }
     $snapshot = Get-DaySnapshot -Day $day
     $seg = New-SegmentObject -Mode $result.Mode -Start $result.Start -End $result.End -Manual $true
+    [void](Set-ItemComment -Item $seg -Text $result.Comment)
     [void]$day['Segments'].Add($seg)
     # 10-Stunden-Grenze: Aenderungen ueber 10:00 Netto werden abgelehnt
     if (-not (Test-DayUnderMax -Day $day)) {
@@ -10745,6 +11134,23 @@ function Invoke-AddSegmentFlow {
         Restore-DayFromSnapshot -Day $day -Snapshot $snapshot
         Write-AppLog -Level 'WARN' -Message 'Manuell erfasster Abschnitt NICHT gespeichert - Änderung zurückgenommen.'
     }
+    Invoke-MainRefresh -ForceTables
+}
+
+# Kommentar zum aktuellen Arbeitstag (Kontextmenue, Tray, erweiterte
+# Ansicht): wahlweise zum Tag, zum laufenden Abschnitt oder zur laufenden
+# Pause. Fruehere Abschnitte, Sperrintervalle und Korrekturen werden im
+# Tages-Editor kommentiert.
+function Invoke-CommentFlow {
+    $day = $script:App.CurrentDay
+    if ($null -eq $day) {
+        Show-Info -Message 'Es ist kein Arbeitstag vorhanden. Bitte zuerst einen Arbeitstag starten.'
+        return
+    }
+    $info = Get-CurrentDayCommentTargets -Day $day
+    $res = Show-CommentDialog -Caption 'Kommentar zum aktuellen Arbeitstag' -Targets $info.Targets -DefaultKey $info.DefaultKey
+    if ($null -eq $res -or @($res).Count -eq 0) { return }
+    [void](Save-DayCommentResults -Day $day -Results $res -Items $info.Items)
     Invoke-MainRefresh -ForceTables
 }
 
@@ -10871,6 +11277,7 @@ function New-CompactContextMenu {
     Add-WpfMenuItem -Menu $menu -Key 'StartDay' -Header 'Arbeitstag starten...' -OnClick { Invoke-StartDayFlow } | Out-Null
     Add-WpfMenuItem -Menu $menu -Key 'SwitchMode' -Header 'Modus wechseln...' -OnClick { Invoke-ModeSwitchFlow } | Out-Null
     Add-WpfMenuItem -Menu $menu -Key 'Pause' -Header 'Pause starten' -OnClick { Invoke-TogglePauseFlow } | Out-Null
+    Add-WpfMenuItem -Menu $menu -Key 'Comment' -Header 'Kommentar...' -OnClick { Invoke-CommentFlow } | Out-Null
     $keepAliveItem = Add-WpfMenuItem -Menu $menu -Key 'KeepAlive' -Header 'Scroll-Lock-Aktivhaltung' -OnClick { Invoke-ToggleKeepAlive }
     $keepAliveItem.IsCheckable = $true
     # Ansichts-Presets der kompakten Ansicht (fest eingebaute inkl. 'Minimum'
@@ -10924,6 +11331,7 @@ function Update-MenuState {
         $items['SwitchMode'].IsEnabled = ($hasActive -and $comp -and $null -ne $comp.RunningMode -and -not $comp.MaxReached)
         $items['Pause'].Header = $pauseHeader
         $items['Pause'].IsEnabled = $pauseEnabled
+        $items['Comment'].IsEnabled = ($null -ne $day)
         $items['KeepAlive'].IsChecked = [bool]$script:App.Settings['KeepAliveEnabled']
         $items['EndDay'].IsEnabled = $hasActive
     }
@@ -10934,6 +11342,7 @@ function Update-MenuState {
         $trayItems['SwitchMode'].Enabled = ($hasActive -and $comp -and $null -ne $comp.RunningMode -and -not $comp.MaxReached)
         $trayItems['Pause'].Text = $pauseHeader
         $trayItems['Pause'].Enabled = $pauseEnabled
+        $trayItems['Comment'].Enabled = ($null -ne $day)
         $trayItems['KeepAlive'].Checked = [bool]$script:App.Settings['KeepAliveEnabled']
         $trayItems['EndDay'].Enabled = $hasActive
     }
@@ -11009,6 +11418,7 @@ function Enable-TrayIcon {
         & $addItem 'StartDay' 'Arbeitstag starten...' { Invoke-OnUiDispatcher -Action { Invoke-StartDayFlow } }
         & $addItem 'SwitchMode' 'Modus wechseln...' { Invoke-OnUiDispatcher -Action { Invoke-ModeSwitchFlow } }
         & $addItem 'Pause' 'Pause starten' { Invoke-OnUiDispatcher -Action { Invoke-TogglePauseFlow } }
+        & $addItem 'Comment' 'Kommentar...' { Invoke-OnUiDispatcher -Action { Invoke-CommentFlow } }
         & $addItem 'KeepAlive' 'Scroll-Lock-Aktivhaltung' { Invoke-OnUiDispatcher -Action { Invoke-ToggleKeepAlive } }
         & $addItem 'RadioPlay' 'Radio starten' { Invoke-OnUiDispatcher -Action { Switch-RadioPlayback } }
         $radioTraySub = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -11256,6 +11666,7 @@ function Register-ExtendedWindowEvents {
     $Window.FindName('BtnStartDay').Add_Click({ Invoke-StartDayFlow })
     $Window.FindName('BtnSwitchMode').Add_Click({ Invoke-ModeSwitchFlow })
     $Window.FindName('BtnPause').Add_Click({ Invoke-TogglePauseFlow })
+    $Window.FindName('BtnComment').Add_Click({ Invoke-CommentFlow })
     $Window.FindName('BtnAddSegment').Add_Click({ Invoke-AddSegmentFlow })
     $Window.FindName('BtnEditDay').Add_Click({
             if ($script:App.CurrentDay) { Show-DayEditor -Day $script:App.CurrentDay }
@@ -14166,6 +14577,77 @@ function Invoke-InternalTests {
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($pwd119)
 
         $script:Paths.Recovery = $recPath119
+
+        # --- Tests 122: Kommentare (Tag, Abschnitt, Pause, Sperre, Korrektur) ---
+        $crlf122 = "`r`n"
+        & $assert 'Test 122a: Normalisierung - Rand, Steuerzeichen, Zeilenenden, leer' ("a${crlf122}bc|a${crlf122}b||") ("$(Get-NormalizedComment -Text ("  a`r`nb" + [char]1 + "c  "))|$(Get-NormalizedComment -Text "a`nb")|$(Get-NormalizedComment -Text "  `r`n ")|$(Get-NormalizedComment -Text $null)")
+        & $assert 'Test 122b: Laengenbegrenzung auf MaxLength' ([string]$script:CommentConst.MaxLength) ([string](Get-NormalizedComment -Text ('x' * 1500)).Length)
+        $seg122 = New-SegmentObject -Mode 'Homeoffice' -Start (Get-Date '2026-07-10 08:00') -End (Get-Date '2026-07-10 09:00')
+        $set122 = Set-ItemComment -Item $seg122 -Text ' Kundentermin '
+        $had122 = $seg122.Contains('Comment')
+        [void](Set-ItemComment -Item $seg122 -Text '   ')
+        & $assert 'Test 122c: Set-ItemComment setzt normalisiert und entfernt bei leerem Text' 'Kundentermin|True|False' ("$set122|$had122|$($seg122.Contains('Comment'))")
+        & $assert 'Test 122d: Kurzfassung einzeilig und gekuerzt' 'a / b|60|True' ("$(Get-CommentPreview -Text "a`r`nb")|$((Get-CommentPreview -Text ('y' * 200)).Length)|$((Get-CommentPreview -Text ('y' * 200)).EndsWith('…'))")
+        $d122 = New-TestDay -DateText '2026-07-08'
+        $s122 = Add-TestSegment -Day $d122 -Mode 'Homeoffice' -StartText '08:00' -EndText '12:00'
+        $p122 = Add-TestInterval -Day $d122 -ListName 'ManualPauses' -StartText '10:00' -EndText '10:15'
+        $l122 = Add-TestInterval -Day $d122 -ListName 'LockIntervals' -StartText '11:00' -EndText '11:05'
+        Add-Correction -Day $d122 -Description 'Test ohne Kommentar' -NoLog
+        Add-Correction -Day $d122 -Description 'Test mit Kommentar' -Comment ' vergessen zu stempeln ' -NoLog
+        & $assert 'Test 122e: Korrektur speichert optionale Begruendung, ohne Begruendung kein Feld' 'False|vergessen zu stempeln' ("$($d122['Corrections'][0].Contains('Comment'))|$($d122['Corrections'][1]['Comment'])")
+        $fpA122 = Get-DayContentFingerprint -Day $d122
+        [void](Set-ItemComment -Item $d122 -Text 'Tag')
+        $fpB122 = Get-DayContentFingerprint -Day $d122
+        [void](Set-ItemComment -Item $s122 -Text 'Abschnitt')
+        [void](Set-ItemComment -Item $p122 -Text 'Arzt')
+        [void](Set-ItemComment -Item $l122 -Text 'Sperre')
+        $fpC122 = Get-DayContentFingerprint -Day $d122
+        & $assert 'Test 122f: Kommentare fliessen in den Inhaltsvergleich ein (Importkonflikt)' 'True|True' ("$($fpA122 -ne $fpB122)|$($fpB122 -ne $fpC122)")
+        $snap122 = Get-DaySnapshot -Day $d122
+        [void](Set-ItemComment -Item $d122 -Text 'geaendert')
+        Restore-DayFromSnapshot -Day $d122 -Snapshot $snap122
+        & $assert 'Test 122g: Schnappschuss/Rollback stellt Kommentare wieder her' "Tag|$fpC122" ("$(Get-ItemComment -Item $d122)|$(Get-DayContentFingerprint -Day $d122)")
+        $d122['Status'] = 'Beendet'
+        $d122['EndedAt'] = ConvertTo-DateTimeString (Get-TestNow $d122 '12:00')
+        $segT122 = Get-SegmentsTable -Day $d122
+        $pauseT122 = Get-PausesTable -Day $d122 -Comp (Get-DayComputation -Day $d122 -Now (Get-TestNow $d122 '12:00'))
+        $ivT122 = Get-IntervalTable -Intervals $d122.ManualPauses
+        $histT122 = Get-HistoryTable -Days @($d122)
+        $corrT122 = Get-CorrectionsTable -Corrections $d122.Corrections
+        & $assert 'Test 122h: Tabellen zeigen die Kommentare (Abschnitte, Pausen/Sperren, Intervalle, Verlauf, Aenderungsprotokoll)' 'Abschnitt|Arzt|Sperre|Arzt|Tag||vergessen zu stempeln' ("$($segT122.Rows[0]['Kommentar'])|$($pauseT122.Rows[0]['Kommentar'])|$($pauseT122.Rows[1]['Kommentar'])|$($ivT122.Rows[0]['Kommentar'])|$($histT122.Rows[0]['Kommentar'])|$($corrT122.Rows[0]['Kommentar'])|$($corrT122.Rows[1]['Kommentar'])")
+        # CSV: einzeilig, Formel-Schutz, eigene Spalte am Ende (bestehende Spalten unveraendert)
+        [void](Set-ItemComment -Item $d122 -Text "=1+1`r`nzweite Zeile")
+        New-Item -ItemType Directory -Path $script:Paths.Exports -Force | Out-Null
+        $csv122 = @(Export-WorkDataCsv -Days @($d122) -Suffix 'Test122' -IncludeDetail $true)
+        $main122 = [System.IO.File]::ReadAllLines([string]$csv122[0])
+        $detail122 = [System.IO.File]::ReadAllLines([string]$csv122[1])
+        & $assert 'Test 122i: CSV - Spalte Kommentar am Ende, einzeilig und gegen Formeln geschuetzt' "Kommentar|'=1+1 / zweite Zeile|Kommentar|Abschnitt|2" ("$(@($main122[0] -split ';')[-1])|$(@($main122[1] -split ';')[-1])|$(@($detail122[0] -split ';')[-1])|$(@($detail122[1] -split ';')[-1])|$(@($main122).Count)")
+        foreach ($f122 in $csv122) { Remove-Item -LiteralPath ([string]$f122) -Force -ErrorAction SilentlyContinue }
+        # Ziele des Kommentar-Dialogs fuer den laufenden Tag
+        $a122 = New-TestDay -DateText '2026-07-09'
+        Add-TestSegment -Day $a122 -Mode 'Homeoffice' -StartText '08:00' | Out-Null
+        $t1122 = Get-CurrentDayCommentTargets -Day $a122
+        Add-TestInterval -Day $a122 -ListName 'ManualPauses' -StartText '09:00' | Out-Null
+        $t2122 = Get-CurrentDayCommentTargets -Day $a122
+        $t3122 = Get-CurrentDayCommentTargets -Day $d122
+        & $assert 'Test 122j: Kommentarziele - Tag/Abschnitt (Standard Tag), mit laufender Pause Standard Pause, beendeter Tag nur Tag' 'Day,Segment|Day|Day,Segment,Pause|Pause|Day|Day' ("$((@($t1122.Targets) | ForEach-Object { $_.Key }) -join ',')|$($t1122.DefaultKey)|$((@($t2122.Targets) | ForEach-Object { $_.Key }) -join ',')|$($t2122.DefaultKey)|$((@($t3122.Targets) | ForEach-Object { $_.Key }) -join ',')|$($t3122.DefaultKey)")
+        # Speichern im Tresor (transaktional, Inhalt nicht im Protokoll) und Rollback bei Speicherfehler
+        $d122['Comment'] = $null
+        [void]$d122.Remove('Comment')
+        [void]$script:App.Data['Days'].Add($d122)
+        $saved122 = Set-DayItemCommentSaved -Day $d122 -Item $d122 -Text 'MARKER_122_KOMMENTAR' -Label 'Tag'
+        $raw122 = Unprotect-VaultContainer -Container (Read-VaultContainerFromFile -Path $script:Paths.VaultFile) -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
+        $lastLog122 = [string]@($script:App.Vault['Logs'])[-1]['Message']
+        & $assert 'Test 122k: Kommentar wird im Tresor gespeichert, Protokoll ohne Kommentarinhalt' 'True|True|True|False' ("$saved122|$($raw122.Contains('MARKER_122_KOMMENTAR'))|$($lastLog122.Contains('Kommentar hinzugefuegt'))|$($lastLog122.Contains('MARKER_122'))")
+        & $assert 'Test 122l: Tresor mit Kommentaren besteht die Strukturpruefung' '0' ([string]@(Test-VaultStructure -Vault $script:App.Vault).Count)
+        $corrBefore122 = @($d122['Corrections']).Count
+        $script:App.Flags.TestFailMainWrite = $true
+        $failed122 = Set-DayItemCommentSaved -Day $d122 -Item $d122 -Text 'NICHT_GESPEICHERT' -Label 'Tag'
+        $script:App.Flags.TestFailMainWrite = $false
+        Clear-VaultSaveFailedState
+        & $assert 'Test 122m: Speicherfehler - false, Kommentar vollstaendig zurueckgenommen, keine Korrektur angelegt' "False|MARKER_122_KOMMENTAR|$corrBefore122" ("$failed122|$(Get-ItemComment -Item $d122)|$(@($d122['Corrections']).Count)")
+        [void]$script:App.Data['Days'].Remove($d122)
+        & $assert 'Test 122n: danach speichert der Tresor wieder regulaer' 'True' ([string](Save-Vault))
 
         Clear-VaultKeys -Keys $newKeys116
         Clear-VaultKeys -Keys $keysF116
