@@ -421,7 +421,7 @@ Beginn: 06:12 | Netto: 06:36 | Soll-Rest: 00:24 | Max-Ende: 16:57
   gespeichert und beim nächsten Start wieder angewendet)
 - **Doppelklick**: erweiterte Ansicht öffnen
 - **Rechtsklick**: Kontextmenü (Arbeitstag starten/beenden, Modus wechseln, Pause,
-  in den Infobereich ausblenden, minimieren, Verlauf, Export,
+  Aktivhaltung, in den Infobereich ausblenden, minimieren, Verlauf, Export,
   Einstellungen, Anwendung schließen)
 - Ein `*` hinter einer Endzeit bedeutet: die Prognose ist pausiert (z. B. laufende
   Homeoffice-Pause)
@@ -480,14 +480,44 @@ Die 6-Stunden-Grenze für die Betriebspause zählt nur Betriebszeit (die Pause i
 Netto-Arbeitszeit des Tages. Überlappen sich im Homeoffice eine manuelle Pause und eine
 Windows-Sperre, wird der Zeitraum nur **einmal** abgezogen.
 
-## Keine Aktivhaltung (seit Version 1.1.0)
+## Scroll-Lock-Aktivhaltung
 
-Die frühere optionale Scroll-Lock-Aktivhaltung wurde mit Version 1.1.0 **vollständig
-entfernt**. Die Anwendung simuliert keine Tastatureingaben mehr und beeinflusst die
-automatische Bildschirmsperre von Windows nicht. Tresore aus Version 1.0.0 bleiben
-unverändert ladbar: gespeicherte Werte der Aktivhaltung und das frühere Kompaktfeld
-„Scroll-Lock-Aktivhaltung" werden beim Laden verworfen und beim nächsten Speichern
-nicht mehr geschrieben.
+**Hintergrund:** Die Funktion entstand für einen Arbeitsplatz, an dem parallel mit zwei
+Systemen gearbeitet wurde: Während der Arbeit am zweiten System sollte sich der erste PC
+nicht automatisch sperren. Sie ist **standardmäßig deaktiviert** und sollte nur
+eingeschaltet werden, wenn genau so ein Bedarf besteht — sie ist nicht dafür gedacht,
+Anwesenheit vorzutäuschen.
+
+Die Funktion wurde in Version 1.1.0 entfernt und ist seit **Version 1.2.0** wieder als
+**Opt-in** enthalten: Einschalten über Einstellungen → Aktivhaltung oder per Kontext-/Tray-Menü.
+Tresore aus 1.1.x laden mit ausgeschalteter Funktion; Tresore aus 1.0.0 behalten ihre
+Einstellung.
+
+> **Hinweis für die IT-Freigabe:** Auch bei ausgeschalteter Funktion enthält das Skript den
+> Code zur Tastatureingabe-Simulation (`SendInput`). Virenschutz oder Compliance-Prüfungen
+> können das unabhängig vom Schalter beanstanden.
+
+Optional (**standardmäßig deaktiviert**) betätigt die Anwendung bei laufendem Arbeitstag
+alle 60 Sekunden die Rollen-Taste (Scroll Lock) über einen einfachen, vollständig
+entkoppelten **Doppelpuls**: Tastendruck (Down+Up) → ca. 200 ms → Tastendruck (Down+Up),
+ausgeführt per `SendInput` in C# auf einem ThreadPool-Thread (nie auf dem WPF-UI-Thread),
+mit Interlocked-Parallelschutz gegen überlappende Pulse.
+
+- Im Produktivbetrieb findet **keine** Scroll-Lock-Zustandsabfrage statt. Fehler werden
+  nur gedrosselt im verschlüsselten Protokoll erfasst und **deaktivieren die Funktion
+  nicht** automatisch.
+- Der automatische Testlauf (`-RunTests`) sendet **niemals** echte Eingaben
+  (vollständige Simulation); echte Tastendrücke gibt es nur im normalen Betrieb und im
+  ausdrücklich bestätigten `-RunScrollLockManualTest`.
+- **Ehrliche Grenze:** Bei `Stop-Process -Force`, Stromausfall oder einem
+  Prozess-/Systemabsturz exakt zwischen den beiden Tastendrücken — ebenso bei einem
+  fehlgeschlagenen zweiten `SendInput` — kann der Scroll-Lock-Zustand verändert
+  zurückbleiben. Das ist bei einem zustandslosen Doppelpuls nicht vollständig
+  ausschließbar und beeinträchtigt die Arbeitszeiterfassung nicht.
+
+> **Wichtig:** Die Nutzung dieser Funktion muss mit den IT- und Sicherheitsvorgaben des
+> jeweiligen Unternehmens abgestimmt sein. Die Anwendung verändert keine
+> Gruppenrichtlinien, Sicherheitssoftware oder erzwungene Unternehmensvorgaben.
 
 ## CSV-Export
 
@@ -544,7 +574,8 @@ anschließendem Speichern (der einzige gültige Backupstand wird nicht überschr
 Metadaten-Rollback bei Speicherfehlern, Erkennung externer Dateiänderungen,
 Container-Härtung (übergroße Dateien, falsche Salt-Länge), Pending-/Revision-/
 CleanShutdown-Logik, Schema-Ablehnung, Regelarbeitszeit- und 10-Stunden-Validierung,
-MaxReached-Rücknahme, EndedAt-Validierung, CSV-Formelinjektion, Fensterbreite, Taskleisten-Position und Monitor-Lücken, UTF-8-BOM der
+MaxReached-Rücknahme, EndedAt-Validierung, CSV-Formelinjektion, Scroll-Lock-
+Fehlerbehandlung, Fensterbreite, Taskleisten-Position und Monitor-Lücken, UTF-8-BOM der
 Skript- und README-Datei sowie Layoutprüfungen des Einstellungs- und Exportdialogs
 (umbruchfähige Beschriftungen, identische Preset- und OK/Abbrechen-Schaltflächen,
 vollständige Sichtbarkeit; WPF layoutet skalierungsunabhängig in DIPs, die Prüfungen
@@ -552,7 +583,10 @@ gelten daher für 100/125/150 % gleichermaßen — die Fensterhöhe wird zur Lau
 MaxHeight und einen ScrollViewer begrenzt). Exit-Code 0 = alle bestanden.
 
 Die Tests arbeiten ausschließlich in temporären Testordnern und verändern keine echten
-Benutzerdaten. Die Krypto-Tests dauern wegen der 600.000 PBKDF2-Iterationen einige Sekunden.
+Benutzerdaten. Hinweis: Die automatisierten Scroll-Lock-Tests senden ausschließlich
+simulierte Eingaben (siehe Abschnitt „Scroll-Lock-Aktivhaltung"); echte Tastendrücke gibt
+es nur im normalen Betrieb oder im gesondert bestätigten `-RunScrollLockManualTest`. Die
+Krypto-Tests dauern wegen der 600.000 PBKDF2-Iterationen einige Sekunden.
 
 ## Zeichenkodierung
 
@@ -577,6 +611,9 @@ und nach der Entschlüsselung als UTF-8 dekodiert (unabhängig von der ANSI-Code
   Sperre oder Pause, die bis zum Tagesende lief, sonst das Erreichen der
   10-Stunden-Grenze bzw. das letzte Abschnittsende. Gleiches gilt nach einem Absturz oder
   harten Herunterfahren.
+- Bei sehr restriktiven Unternehmensrichtlinien kann `SendInput` unterbunden sein; ein
+  Fehlschlag wird dann gedrosselt verschlüsselt protokolliert, ohne die Funktion
+  automatisch zu deaktivieren — die übrige Anwendung arbeitet normal weiter.
 - Verschlüsselung ersetzt kein Backup: den Ordner regelmäßig sichern (die Tresordateien
   sind auch im Backup verschlüsselt).
 
@@ -660,13 +697,14 @@ Verschlüsselungs- oder Zugriffssperre.
 
 ## Einstellungen und Infobereich
 
-- **Einstellungen mit Tabs:** Allgemein / Kompakte Ansicht / Internetradio, feste Ausgangsgröße (780×620), begrenzt auf den Arbeitsbereich des
+- **Einstellungen mit Tabs:** Allgemein / Kompakte Ansicht / Aktivhaltung /
+  Internetradio, feste Ausgangsgröße (780×620), begrenzt auf den Arbeitsbereich des
   Monitors. Speichern/Abbrechen bleiben immer sichtbar; erst „Speichern" übernimmt die
   Änderungen aller Tabs, „Abbrechen" verwirft sie. Sender werden links in einer
   scrollenden Liste verwaltet und rechts über ein gemeinsames Name/URL-Feldpaar bearbeitet
   („Übernehmen").
 - **In den Infobereich ausblenden:** Die Anwendung läuft unsichtbar weiter (Timer,
-  Erfassung, Radio, Sperr-/Entsperrverarbeitung). Wieder angezeigt wird sie
+  Erfassung, Radio, Aktivhaltung, Sperr-/Entsperrverarbeitung). Wieder angezeigt wird sie
   per Doppelklick auf das Tray-Symbol oder über dessen Menü. Ist kein Tray-Symbol
   verfügbar, wird stattdessen über die Taskleiste minimiert.
 
@@ -689,7 +727,8 @@ Einlesen werden ausschließlich die intern fest bekannten Pfade verwendet.
 
 ## Hinweis zu betrieblichen IT- und Sicherheitsvorgaben
 
-Der Einsatz auf Firmengeräten — insbesondere des Internetradios — sollte vorab mit den geltenden IT-, Sicherheits- und
+Der Einsatz auf Firmengeräten — insbesondere von Scroll-Lock-Aktivhaltung und
+Internetradio — sollte vorab mit den geltenden IT-, Sicherheits- und
 Arbeitszeitregelungen abgestimmt werden. Die Anwendung sendet keine Arbeitszeitdaten nach
 außen und protokolliert keine Inhalte anderer Anwendungen.
 
