@@ -508,6 +508,10 @@ Wo:
   Manuelle Pausen, Sperrintervalle und Änderungsprotokoll (jeweils mit Anzahl im Titel).
 - **Anzeige**: Spalte „Kommentar" in den Tabellen, im Verlauf und im CSV-Export (dort
   einzeilig, Zeilenumbrüche als ` / `).
+- **Verlauf** (seit 1.4.1): Der Tageskommentar steht vollständig in einer Zeile; die
+  Tabelle lässt sich horizontal scrollen, so sind die Kommentare über alle Tage hinweg
+  lesbar. Der volle Kommentar mit Zeilenumbrüchen erscheint als Tooltip. Ein
+  **Doppelklick** auf einen Tag öffnet „Tag bearbeiten".
 
 Kommentare liegen verschlüsselt im Tresor, verändern keine Arbeitszeiten und zählen
 nicht als Korrektur. Das verschlüsselte Protokoll vermerkt nur, *dass* ein Kommentar

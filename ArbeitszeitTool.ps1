@@ -33,6 +33,22 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+27.10.2026 - VERSION 1.4.1: VERLAUF - DOPPELKLICK UND
+HORIZONTALES SCROLLEN
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (alle Tests gruen);
+         Scrollverhalten offscreen geprueft (Extent > Viewport,
+         Scrollleiste sichtbar); Doppelklick manuell NICHT getestet.
+ - Verlauf: Doppelklick auf einen Tag oeffnet "Tag bearbeiten"
+   (wie im Tages-Editor); Hinweis neben den Schaltflaechen.
+ - Verlauf: Spalten in natuerlicher Breite (ColumnWidth=Auto)
+   mit horizontaler Scrollleiste statt in die Fensterbreite
+   gequetscht; Kommentar vollstaendig einzeilig (Zeilenumbrueche
+   als ' / '), Mindestbreite 200; voller Kommentar mit
+   Zeilenumbruechen als Tooltip.
+ - Doppelklick-Erkennung als gemeinsame Funktion
+   Test-DataGridRowClick (Tages-Editor und Verlauf).
+--------------------------------------------------
 27.10.2026 - VERSION 1.4.0: TESTSUITE AUSGELAGERT
 --------------------------------------------------
  Status: umgesetzt, automatisiert getestet (alle Tests gruen
@@ -855,7 +871,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.4.0'
+$script:AppVersion = '1.4.1'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -7311,6 +7327,18 @@ $script:DayEditorXaml = @'
 </Window>
 '@
 
+# Prueft, ob ein Mausereignis (z. B. Doppelklick) auf einer Datenzeile eines
+# DataGrid ausgeloest wurde - nicht auf Kopfzeile, Scrollleiste oder Leerflaeche
+function Test-DataGridRowClick {
+    param($Source)
+    $dep = $Source
+    while ($null -ne $dep -and -not ($dep -is [System.Windows.Controls.DataGridRow])) {
+        if ($dep -is [System.Windows.Media.Visual]) { $dep = [System.Windows.Media.VisualTreeHelper]::GetParent($dep) }
+        else { $dep = [System.Windows.LogicalTreeHelper]::GetParent($dep) }
+    }
+    return ($null -ne $dep)
+}
+
 function Get-IntervalTable {
     param($Intervals)
     $dt = New-Object System.Data.DataTable
@@ -7708,15 +7736,6 @@ function Show-DayEditor {
         }
         return $null
     }
-    $isRowClick = {
-        param($Source)
-        $dep = $Source
-        while ($null -ne $dep -and -not ($dep -is [System.Windows.Controls.DataGridRow])) {
-            if ($dep -is [System.Windows.Media.Visual]) { $dep = [System.Windows.Media.VisualTreeHelper]::GetParent($dep) }
-            else { $dep = [System.Windows.LogicalTreeHelper]::GetParent($dep) }
-        }
-        return ($null -ne $dep)
-    }
     $gridButtons = @{ GridSegments = 'BtnSegEdit'; GridPauses = 'BtnPauseEdit'; GridLocks = 'BtnLockEdit'; GridCorrections = 'BtnCorrComment' }
     foreach ($gridName in @($gridButtons.Keys)) {
         $grid = $win.FindName($gridName)
@@ -7735,7 +7754,7 @@ function Show-DayEditor {
             })
         $grid.Add_MouseDoubleClick({
                 param($src, $e)
-                if (-not (& $isRowClick $e.OriginalSource)) { return }
+                if (-not (Test-DataGridRowClick -Source $e.OriginalSource)) { return }
                 $btn = $win.FindName($gridButtons[[string]$src.Tag])
                 $btn.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
             })
@@ -7765,8 +7784,12 @@ $script:HistoryXaml = @'
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <DataGrid Grid.Row="0" x:Name="GridDays" CanUserSortColumns="False"/>
+        <!-- Spalten in natuerlicher Breite (statt in die Fensterbreite
+             gequetscht): lange Kommentare per horizontalem Scrollen lesbar -->
+        <DataGrid Grid.Row="0" x:Name="GridDays" CanUserSortColumns="False"
+                  ColumnWidth="Auto" HorizontalScrollBarVisibility="Auto"/>
         <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <TextBlock Text="Doppelklick auf einen Tag = bearbeiten" Foreground="#FFAAB8C6" VerticalAlignment="Center" Margin="0,0,16,8"/>
             <Button x:Name="BtnOpen" Content="Tag bearbeiten"/>
             <Button x:Name="BtnDelete" Content="Tag löschen"/>
             <Button x:Name="BtnClose" Content="Schließen" IsCancel="True" Margin="0"/>
@@ -7800,7 +7823,9 @@ function Get-HistoryTable {
             (Format-Duration $abweichung -WithSign:($abweichung.Ticks -ge 0)),
             [string]$day.Status,
             [string]@($day.Corrections).Count,
-            (Get-CommentPreview -Text (Get-ItemComment -Item $day))
+            # Voller Kommentar, einzeilig (Zeilenumbrueche als ' / ') - der
+            # Verlauf scrollt horizontal, statt den Text zu kuerzen
+            (Get-CommentPreview -Text (Get-ItemComment -Item $day) -MaxLength ([int]$script:CommentConst.MaxLength * 4))
         )
     }
     return ,$dt
@@ -7831,6 +7856,30 @@ function Show-HistoryWindow {
             if ($null -eq $day) { Show-Info -Message 'Bitte zuerst einen Tag auswählen.'; return }
             Show-DayEditor -Day $day
             & $refresh
+        })
+
+    # Doppelklick auf einen Tag = "Tag bearbeiten"; Kommentarspalte mit
+    # Mindestbreite; voller Kommentar (mit Zeilenumbruechen) als Tooltip
+    $gridDays = $win.FindName('GridDays')
+    $gridDays.Add_AutoGeneratingColumn({
+            param($src, $e)
+            if ($e.PropertyName -eq 'Kommentar') { $e.Column.MinWidth = 200 }
+        })
+    $gridDays.Add_LoadingRow({
+            param($src, $e)
+            $text = ''
+            $idx = $e.Row.GetIndex()
+            if ($idx -ge 0 -and $idx -lt $state.DayIds.Count) {
+                foreach ($day in @($script:App.Data.Days)) {
+                    if ($day.Id -eq $state.DayIds[$idx]) { $text = Get-ItemComment -Item $day; break }
+                }
+            }
+            if ($text -eq '') { $e.Row.ToolTip = $null } else { $e.Row.ToolTip = $text }
+        })
+    $gridDays.Add_MouseDoubleClick({
+            param($src, $e)
+            if (-not (Test-DataGridRowClick -Source $e.OriginalSource)) { return }
+            $win.FindName('BtnOpen').RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
         })
 
     $win.FindName('BtnDelete').Add_Click({
