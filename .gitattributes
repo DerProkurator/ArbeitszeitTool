@@ -1,3 +1,9 @@
 # Windows PowerShell 5.1 erwartet CRLF (siehe Test 101) - unabhaengig von core.autocrlf
 *.ps1 text eol=crlf
 *.md  text eol=crlf
+
+# Nicht Teil der Auslieferung: fehlt im GitHub-"Download ZIP" und in
+# Release-Quellarchiven (git archive). Ein git clone enthaelt alles.
+tests/          export-ignore
+.gitattributes  export-ignore
+.gitignore      export-ignore

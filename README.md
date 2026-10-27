@@ -42,11 +42,9 @@ Ohne sichtbares Konsolenfenster (blitzt beim Start kurz auf):
 powershell.exe -WindowStyle Hidden -Sta -NoProfile -File .\ArbeitszeitTool.ps1
 ```
 
-Testmodus (ohne Oberfläche, führt die internen Testfälle in temporären Testordnern aus):
-
-```
-powershell.exe -NoProfile -File .\ArbeitszeitTool.ps1 -RunTests
-```
+Für den Betrieb wird nur `ArbeitszeitTool.ps1` benötigt. Die Tests liegen seit 1.4.0 im
+Ordner `tests\` des Repositorys und sind nicht Teil des ZIP-Downloads (siehe
+[Testmodus](#testmodus)).
 
 **Hinweis zur Ausführungsrichtlinie:** Die Anwendung verwendet **keinen**
 `-ExecutionPolicy Bypass` und verändert die Ausführungsrichtlinie nicht. Verhindert die
@@ -559,9 +557,9 @@ mit Interlocked-Parallelschutz gegen überlappende Pulse.
 - Im Produktivbetrieb findet **keine** Scroll-Lock-Zustandsabfrage statt. Fehler werden
   nur gedrosselt im verschlüsselten Protokoll erfasst und **deaktivieren die Funktion
   nicht** automatisch.
-- Der automatische Testlauf (`-RunTests`) sendet **niemals** echte Eingaben
+- Der automatische Testlauf (`tests\Run-Tests.ps1`) sendet **niemals** echte Eingaben
   (vollständige Simulation); echte Tastendrücke gibt es nur im normalen Betrieb und im
-  ausdrücklich bestätigten `-RunScrollLockManualTest`.
+  ausdrücklich bestätigten manuellen Test (`tests\Run-Tests.ps1 -ScrollLockManual`).
 - **Ehrliche Grenze:** Bei `Stop-Process -Force`, Stromausfall oder einem
   Prozess-/Systemabsturz exakt zwischen den beiden Tastendrücken — ebenso bei einem
   fehlgeschlagenen zweiten `SendInput` — kann der Scroll-Lock-Zustand verändert
@@ -612,7 +610,24 @@ angeboten — stille Korrekturen finden nicht statt.
 
 ## Testmodus
 
-`-RunTests` führt über 110 Testfälle mit rund 400 Einzelprüfungen ohne Oberfläche aus, u. a.: Berechnungs-
+Die Testsuite gehört seit Version 1.4.0 nicht mehr zur ausgelieferten Anwendung. Sie liegt
+im Repository unter `tests\` und ist per `export-ignore` (`.gitattributes`) vom
+GitHub-„Download ZIP" und von Release-Archiven ausgenommen; ein `git clone` enthält sie.
+
+```
+powershell.exe -NoProfile -File .\tests\Run-Tests.ps1
+```
+
+- `tests\Run-Tests.ps1` – Testeinstieg: lädt die Anwendung per Dot-Sourcing mit
+  `-DefinitionsOnly` (nur Funktionen und Konstanten, **kein** Programmstart, kein Tresor,
+  keine Dialoge) und danach die Testsuite. Optional `-AppPath` für eine andere Kopie der
+  Anwendung.
+- `tests\InternalTests.ps1` – die Testfälle selbst. Quelltextprüfungen (BOM, CRLF,
+  Startlogik) lesen über `$script:AppScriptPath` immer die Anwendung, nie die Testdatei.
+- Der frühere Aufruf `ArbeitszeitTool.ps1 -RunTests` (bzw. `-RunScrollLockManualTest`)
+  zeigt nur noch einen Hinweis und endet mit Exit-Code 2 – ohne die Anwendung zu starten.
+
+Die Suite führt über 120 Testfälle mit rund 480 Einzelprüfungen ohne Oberfläche aus, u. a.: Berechnungs-
 Engine (Betriebspause inkl. Randwerte 05:59:59/06:00:00/06:44:59/06:45:00, Homeoffice-
 Abzüge, Überlappungen, Überstunden, 09:45/10:00), Verschlüsselung (Roundtrip inkl.
 Unicode und deutscher Prüftexte, falsches Passwort, manipulierter Ciphertext/HMAC/Header,
@@ -639,7 +654,8 @@ MaxHeight und einen ScrollViewer begrenzt). Exit-Code 0 = alle bestanden.
 Die Tests arbeiten ausschließlich in temporären Testordnern und verändern keine echten
 Benutzerdaten. Hinweis: Die automatisierten Scroll-Lock-Tests senden ausschließlich
 simulierte Eingaben (siehe Abschnitt „Scroll-Lock-Aktivhaltung"); echte Tastendrücke gibt
-es nur im normalen Betrieb oder im gesondert bestätigten `-RunScrollLockManualTest`. Die
+es nur im normalen Betrieb oder im gesondert bestätigten manuellen Test
+(`tests\Run-Tests.ps1 -ScrollLockManual`). Die
 Krypto-Tests dauern wegen der 600.000 PBKDF2-Iterationen einige Sekunden.
 
 ## Zeichenkodierung
