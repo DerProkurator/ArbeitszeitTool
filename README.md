@@ -362,6 +362,17 @@ Deshalb verwendet die Anwendung stabile, neutrale Dateinamen ohne Datums-/Uhrzei
   beschreibbar, Speicher voll), erscheint eine Fehlermeldung, dass die lokalen
   Änderungen **nicht** gesichert sind und die Anwendung nicht beendet werden sollte
   (seit 1.3.3).
+- **Gleichzeitige Zugriffe (seit 1.3.5):** Vergleich und Überschreiben der Hauptdatei
+  erfolgen unter einem einzigen Dateizugriff, der fremde Schreibzugriffe ausschließt;
+  danach wird der geschriebene Inhalt über denselben Zugriff zurückgelesen und geprüft.
+  Eine Änderung, die erst unmittelbar vor dem Schreiben eintrifft, wird so ebenfalls
+  erkannt und nicht überschrieben. Der Prüfwert für den nächsten Vergleich stammt aus den
+  selbst geschriebenen Daten. Zusätzlich lässt sich das Tool pro Datenordner nur
+  **einmal** starten; ein zweiter Start weist auf die laufende Instanz hin. Grenzen: Die
+  Einzelinstanz-Sperre gilt nur innerhalb der eigenen Windows-Sitzung und erkennt
+  denselben Ordner nicht, wenn er über verschiedene Pfade geöffnet wird (z. B.
+  Laufwerksbuchstabe und UNC-Pfad). Gegen andere Rechner oder Sync-Clients schützt
+  weiterhin die Hash-Prüfung.
 - Neben der Hauptdatei bleiben mindestens zwei vorherige gültige verschlüsselte Stände
   (`backup1`, `backup2`) erhalten. Ein Absturz während des Schreibens führt dank Journal
   nie dazu, dass kein gültiger aktueller Stand mehr vorhanden ist.

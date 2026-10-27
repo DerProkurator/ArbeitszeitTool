@@ -33,6 +33,33 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+27.10.2026 - VERSION 1.3.5: KONKURRIERENDE TRESORZUGRIFFE
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (Tests 63e-63j);
+         Einzelinstanz-Meldung beim Doppelstart manuell NICHT
+         getestet.
+ - Save-Vault Schritt 6: Hauptdatei ueber
+   Write-FileInPlaceVerified - Vergleich mit dem in Schritt 4
+   geprueften Hash und Schreiben unter EINEM Handle (fremde
+   Schreibzugriffe ausgeschlossen), danach Ruecklesen und
+   Vergleich ueber dasselbe Handle. Fremdaenderung dazwischen:
+   nichts ueberschrieben, Journal/Metadaten zurueck, regulaere
+   Konfliktbehandlung (Sicherung nach Recovery).
+ - Scheitert die Pruefung NACH dem Schreiben und liegt nicht
+   mehr der eigene Stand in der Datei, wird nicht
+   zurueckgeschrieben (Fremdaenderung bleibt erhalten).
+ - Referenzhash nach dem Commit aus den eigenen Bytes statt
+   durch erneutes Lesen der Datei.
+ - Einzelinstanz je Datenordner (benannter Mutex, Name aus
+   Pfad-Hash); zweiter Start zeigt einen Hinweis und beendet
+   sich ohne Dateizugriff auf den Tresor.
+ - Konfliktbehandlung als Scriptblock fuer Schritt 4 und die
+   spaete Erkennung; Testhook TestBeforeMainWrite.
+ - NICHT umgesetzt (bewusst): instanzuebergreifende Sperre
+   ueber den gesamten Dateisatz inkl. Journal/Backups und
+   Passwortwechsel - fuer ein Einzelplatz-Tool unverhaeltnis-
+   maessig; abgedeckt durch Einzelinstanz + Hash-Pruefung.
+--------------------------------------------------
 27.10.2026 - VERSION 1.3.4: SICHTSCHUTZ AUCH FUER UI
 AUTOMATION
 --------------------------------------------------
@@ -783,7 +810,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.3.4'
+$script:AppVersion = '1.3.5'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -1577,6 +1604,73 @@ function Write-FileInPlace {
     }
 }
 
+# Bedingtes In-place-Schreiben (Hauptdatei): Vergleich und
+# Schreiben laufen unter EINEM Handle, das fremde Schreibzugriffe ausschliesst
+# (FileShare.Read - wie Write-FileInPlace; Leser wie Sync-Clients bleiben
+# moeglich). Zwischen Pruefung und Schreiben kann so weder eine zweite
+# Instanz noch ein Sync-Client die Datei veraendern.
+#  $ExpectedHash: erwarteter SHA-256 des aktuellen Inhalts; leer = die Datei
+#  darf noch nicht existieren. Weicht der Inhalt ab, fehlt die Datei oder
+#  existiert sie unerwartet, wird NICHTS geschrieben und
+#  'VAULT_EXTERNAL_CHANGE' geworfen.
+# Nach dem Schreiben wird ueber dasselbe Handle zurueckgelesen und per Hash
+# verglichen - die Datei enthaelt danach nachweislich exakt $Bytes.
+# (Nicht zu verwechseln mit Write-FileInPlaceIfUnchanged der Passwortaenderung:
+# dort Rueckgabe true/false, ohne Anlegen und ohne Ruecklesen.)
+function Write-FileInPlaceVerified {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes, [string]$ExpectedHash = '')
+    $mode = [System.IO.FileMode]::Open
+    if ($ExpectedHash -eq '') { $mode = [System.IO.FileMode]::CreateNew }
+    $readAll = {
+        param($Stream)
+        $ms = New-Object System.IO.MemoryStream
+        try { $Stream.CopyTo($ms); return ,$ms.ToArray() }
+        finally { $ms.Dispose() }
+    }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $stream = $null
+        try {
+            $stream = New-Object System.IO.FileStream($Path, $mode, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+        }
+        catch [System.IO.FileNotFoundException] {
+            throw (New-Object System.InvalidOperationException 'VAULT_EXTERNAL_CHANGE')
+        }
+        catch [System.IO.IOException] {
+            # CreateNew scheitert, weil die Datei inzwischen extern angelegt wurde
+            if ($ExpectedHash -eq '' -and (Test-Path -LiteralPath $Path)) {
+                throw (New-Object System.InvalidOperationException 'VAULT_EXTERNAL_CHANGE')
+            }
+            if ($attempt -ge 3 -or $_.Exception -is [System.IO.DirectoryNotFoundException]) { throw }
+            Start-Sleep -Milliseconds 150
+            continue
+        }
+        try {
+            if ($ExpectedHash -ne '') {
+                if ($stream.Length -gt $script:VaultConst.MaxFileBytes) {
+                    throw (New-Object System.InvalidOperationException 'VAULT_EXTERNAL_CHANGE')
+                }
+                $current = & $readAll $stream
+                if ((Get-BytesSha256Hex -Bytes $current) -ne $ExpectedHash) {
+                    throw (New-Object System.InvalidOperationException 'VAULT_EXTERNAL_CHANGE')
+                }
+                $stream.Position = 0
+            }
+            $stream.Write($Bytes, 0, $Bytes.Length)
+            $stream.SetLength($Bytes.Length)
+            $stream.Flush($true)
+            $stream.Position = 0
+            $written = & $readAll $stream
+            if ((Get-BytesSha256Hex -Bytes $written) -ne (Get-BytesSha256Hex -Bytes $Bytes)) {
+                throw (New-Object System.IO.IOException 'Zurueckgelesener Inhalt weicht vom geschriebenen ab.')
+            }
+        }
+        finally { $stream.Dispose() }
+        return
+    }
+}
+
 function Get-BytesSha256Hex {
     param([Parameter(Mandatory)][byte[]]$Bytes)
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -1729,12 +1823,16 @@ function Save-Vault {
             # entfernt oder ersetzt - es wird nichts stillschweigend neu angelegt.
             $externalChange = 'extern entfernt'
         }
-        if ($externalChange -ne '') {
-            # Vorhandene Dateien nicht ueberschreiben; eigenen (verschluesselten)
-            # Stand als NEUE Datei neutral in Recovery sichern (keine Loeschung,
-            # kein Verschieben); keine automatische Zusammenfuehrung.
-            # Erfolg wird nur gemeldet, wenn die Kopie nachweislich vollstaendig
-            # geschrieben wurde (Bytes erneut gelesen und per Hash verglichen).
+        # Konfliktbehandlung - auch fuer die spaete Erkennung unmittelbar vor
+        # dem Schreiben der Hauptdatei (Schritt 6, siehe aeusserer catch):
+        # Vorhandene Dateien nicht ueberschreiben; eigenen (verschluesselten)
+        # Stand als NEUE Datei neutral in Recovery sichern (keine Loeschung,
+        # kein Verschieben); keine automatische Zusammenfuehrung.
+        # Erfolg wird nur gemeldet, wenn die Kopie nachweislich vollstaendig
+        # geschrieben wurde (Bytes erneut gelesen und per Hash verglichen).
+        $handleExternalChange = {
+            param([string]$ExternalChange)
+            $externalChange = $ExternalChange
             $conflictPath = $null
             $conflictSaved = $false
             try {
@@ -1773,6 +1871,9 @@ function Save-Vault {
                         "Notieren Sie wichtige Änderungen gegebenenfalls manuell. Es findet keine automatische Zusammenführung statt.")
                 }
             }
+        }
+        if ($externalChange -ne '') {
+            & $handleExternalChange $externalChange
             return $false
         }
         # Hauptdatei ist unveraendert (oder existierte weder beim Laden noch jetzt).
@@ -1814,15 +1915,28 @@ function Save-Vault {
         if ([long]$verify['Revision'] -ne [long]$vault['Revision']) {
             throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
         }
-        # 6. Hauptdatei in-place ueberschreiben und vollstaendig pruefen
+        # 6. Hauptdatei in-place ueberschreiben und vollstaendig pruefen.
+        #    Vergleich mit dem in Schritt 4 geprueften Stand und Schreiben
+        #    erfolgen unter EINEM Handle (Write-FileInPlaceVerified): eine
+        #    zwischenzeitliche Fremdaenderung (zweite Instanz, Sync-Client)
+        #    wird erkannt und NICHT ueberschrieben.
         $mainWriteOk = $false
+        $mainWriteCompleted = $false
+        $mainExternalChange = $false
         try {
             if ($script:TestMode -and $script:App.Flags.TestFailMainWrite) {
                 # Simuliert einen Abbruch MITTEN im Schreiben (Datei beschaedigt)
                 Write-FileInPlace -Path $script:Paths.VaultFile -Bytes ([System.Text.Encoding]::UTF8.GetBytes('TESTHOOK-HALB-GESCHRIEBEN'))
                 throw (New-Object System.IO.IOException 'TESTHOOK: Schreiben der Hauptdatei deaktiviert')
             }
-            Write-FileInPlace -Path $script:Paths.VaultFile -Bytes $newBytes
+            if ($script:TestMode -and $null -ne $script:App.Flags.TestBeforeMainWrite) {
+                # Simuliert eine Fremdaenderung zwischen Pruefung und Schreiben
+                & $script:App.Flags.TestBeforeMainWrite
+            }
+            $expectedMainHash = ''
+            if ($mainExists) { $expectedMainHash = $currentHash }
+            Write-FileInPlaceVerified -Path $script:Paths.VaultFile -Bytes $newBytes -ExpectedHash $expectedMainHash
+            $mainWriteCompleted = $true
             $verifyMain = Read-VaultFromFile -Path $script:Paths.VaultFile `
                 -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
             if ([long]$verifyMain['Revision'] -ne [long]$vault['Revision']) {
@@ -1830,7 +1944,26 @@ function Save-Vault {
             }
             $mainWriteOk = $true
         }
-        catch { $mainWriteOk = $false }
+        catch {
+            $mainWriteOk = $false
+            if ([string]$_.Exception.Message -eq 'VAULT_EXTERNAL_CHANGE') { $mainExternalChange = $true }
+        }
+        if (-not $mainWriteOk -and -not $mainExternalChange -and $mainWriteCompleted) {
+            # Eigene Bytes wurden nachweislich geschrieben, die anschliessende
+            # Pruefung scheiterte: Liegt inzwischen nicht mehr der eigene Stand
+            # in der Datei, wurde sie extern veraendert - dann NICHT zurueck-
+            # schreiben (sonst ginge die Fremdaenderung verloren).
+            $hashNow = $null
+            try { $hashNow = Get-FileSha256Hex -Path $script:Paths.VaultFile } catch { }
+            if ($hashNow -ne (Get-BytesSha256Hex -Bytes $newBytes)) { $mainExternalChange = $true }
+        }
+        if ($mainExternalChange) {
+            # Die Hauptdatei enthaelt einen fremden Stand und bleibt unangetastet;
+            # Journal und Metadaten nimmt der aeussere catch zurueck, danach
+            # folgt die regulaere Konfliktbehandlung (Sicherung nach Recovery).
+            Write-AppLog -Level 'WARN' -Message 'Externe Änderung der Tresordatei unmittelbar vor bzw. während des Schreibens erkannt - Hauptdatei NICHT überschrieben.'
+            throw (New-Object System.InvalidOperationException 'VAULT_EXTERNAL_CHANGE')
+        }
         if (-not $mainWriteOk) {
             # Alten Hauptstand sofort aus dem Speicher zurueckschreiben und
             # pruefen; das Journal wird unten ebenfalls zurueckgenommen.
@@ -1880,12 +2013,16 @@ function Save-Vault {
         # Kann der Referenzhash der bereits gueltig gespeicherten Hauptdatei
         # nicht ermittelt werden, bleibt der Speichervorgang erfolgreich;
         # weitere Speichervorgaenge werden aber kontrolliert blockiert.
+        # Der Hash wird aus den SELBST geschriebenen (unter dem Handle
+        # zurueckgelesenen) Bytes gebildet - ein erneutes Lesen der Datei
+        # koennte eine zwischenzeitliche Fremdaenderung als Referenz
+        # uebernehmen und sie beim naechsten Speichern ueberschreiben.
         $newMainHash = $null
         try {
             if ($script:TestMode -and $script:App.Flags.TestFailPostCommitHash) {
                 throw (New-Object System.IO.IOException 'TESTHOOK: Referenzhash deaktiviert')
             }
-            $newMainHash = Get-FileSha256Hex -Path $script:Paths.VaultFile
+            $newMainHash = Get-BytesSha256Hex -Bytes $newBytes
         }
         catch { $newMainHash = $null }
         if ($null -eq $newMainHash) {
@@ -2010,6 +2147,12 @@ function Save-Vault {
                 }
             }
             catch { }
+        }
+        # Spaet erkannte Fremdaenderung (Schritt 6): Hauptdatei unangetastet,
+        # Journal zurueckgenommen - jetzt regulaere Konfliktbehandlung
+        if ([string]$_.Exception.Message -eq 'VAULT_EXTERNAL_CHANGE') {
+            & $handleExternalChange 'unmittelbar vor dem Schreiben verändert'
+            return $false
         }
         Set-VaultSaveFailedState
         if (-not $Quiet -and [string]$_.Exception.Message -ne 'VAULT_SWAP_CRITICAL') {
@@ -10266,7 +10409,7 @@ function Initialize-AppState {
         # Benutzerinfo bei fehlgeschlagener Best-Effort-Backuprotation.
         # TestFail*: reine Testhooks fuer -RunTests (nur bei $script:TestMode
         # wirksam, im normalen Programmbetrieb vollstaendig inaktiv).
-        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailMainWrite = $false; TestFailMainRestore = $false; TestFailBackupCopy = $false; TestFailBackup1Write = $false; TestFailPostCommitHash = $false; TestFailJournalMirror = $false; TestFailRecoveryWrite = $false; TestFailReencryptRollback = $false; TestFailRecoveryList = $false; TestRecoveryDenyRead = ''; TestRecoveryBeforeCommit = $null; TestFailRecoveryCleanup = $false; TestFailConflictCopy = $false; LastConflictCopySaved = $null }
+        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailMainWrite = $false; TestFailMainRestore = $false; TestFailBackupCopy = $false; TestFailBackup1Write = $false; TestFailPostCommitHash = $false; TestFailJournalMirror = $false; TestFailRecoveryWrite = $false; TestFailReencryptRollback = $false; TestFailRecoveryList = $false; TestRecoveryDenyRead = ''; TestRecoveryBeforeCommit = $null; TestFailRecoveryCleanup = $false; TestFailConflictCopy = $false; LastConflictCopySaved = $null; TestBeforeMainWrite = $null }
     }
 }
 
@@ -12081,6 +12224,8 @@ function Invoke-AppCleanup {
     # Hinweis: In verwaltetem .NET-Speicher ist kein absolut garantiertes
     # Loeschen saemtlicher zwischenzeitlicher Stringkopien moeglich.
     Clear-VaultSessionKeys
+    # Einzelinstanz-Sperre erst NACH dem finalen Speichern freigeben
+    Exit-SingleInstance
 }
 
 #endregion
@@ -13091,6 +13236,66 @@ function Invoke-InternalTests {
         & $assert 'Test 63d: Konfliktsicherung fehlgeschlagen - false, keine Erfolgsmeldung, Fehlschlag protokolliert, Datei unangetastet' "False|False|$recCountAfter|True|False|$($extBytes.Length + 1)" ("$extSave63d|$($script:App.Flags.LastConflictCopySaved)|$recCount63d|$($newLogs63d.Contains('FEHLGESCHLAGEN'))|$($newLogs63d.Contains('in Recovery gesichert'))|$(([System.IO.File]::ReadAllBytes($script:Paths.VaultFile)).Length)")
         Clear-VaultSaveFailedState
         $script:App.VaultFileHash = Get-FileSha256Hex -Path $script:Paths.VaultFile
+
+        # --- Test 63e-63j: Fremdaenderung zwischen Pruefung und Schreiben ---
+        $save63e = Save-Vault -Quiet
+        & $assert 'Test 63e: Referenzhash nach dem Speichern = Hash der geschriebenen Hauptdatei' "True|$(Get-FileSha256Hex -Path $script:Paths.VaultFile)" ("$save63e|$($script:App.VaultFileHash)")
+        $mainBefore63 = [System.IO.File]::ReadAllBytes($script:Paths.VaultFile)
+        $pendingHash63 = Get-FileSha256Hex -Path $script:Paths.VaultPending
+        $revBefore63 = [long]$script:App.Vault['Revision']
+        $foreign63 = Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
+        $foreign63['Revision'] = 50
+        $foreignBytes63 = ConvertTo-VaultFileBytes -Vault $foreign63 -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey `
+            -Salt $script:VaultSession.Salt -Iterations $script:VaultSession.Iterations
+        $mainPath63 = $script:Paths.VaultFile
+        $script:App.Flags.TestBeforeMainWrite = { [System.IO.File]::WriteAllBytes($mainPath63, $foreignBytes63) }.GetNewClosure()
+        $recBefore63f = @(Get-ChildItem -LiteralPath $script:Paths.Recovery -Filter 'vault-*.azt' -File -ErrorAction SilentlyContinue).Count
+        $save63f = Save-Vault -Quiet
+        $script:App.Flags.TestBeforeMainWrite = $null
+        $recAfter63f = @(Get-ChildItem -LiteralPath $script:Paths.Recovery -Filter 'vault-*.azt' -File -ErrorAction SilentlyContinue).Count
+        $disk63f = Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
+        & $assert 'Test 63f: Fremdaenderung zwischen Pruefung und Schreiben - false, fremder Stand (Rev. 50) bleibt, Konfliktkopie gesichert' 'False|50|True|True' ("$save63f|$($disk63f['Revision'])|$($recAfter63f -gt $recBefore63f)|$($script:App.Flags.LastConflictCopySaved)")
+        & $assert 'Test 63g: Journal und Revision zurueckgenommen' "$pendingHash63|$revBefore63" ("$(Get-FileSha256Hex -Path $script:Paths.VaultPending)|$($script:App.Vault['Revision'])")
+        Clear-VaultSaveFailedState
+        $save63h = Save-Vault -Quiet
+        & $assert 'Test 63h: Folgespeichern ueberschreibt den fremden Stand ebenfalls NICHT (Referenz unveraendert)' 'False|50' ("$save63h|$((Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey)['Revision'])")
+        [System.IO.File]::WriteAllBytes($script:Paths.VaultFile, $mainBefore63)
+        Clear-VaultSaveFailedState
+        $script:App.VaultFileHash = Get-FileSha256Hex -Path $script:Paths.VaultFile
+        # Bedingtes Schreiben: Abweichung, Erfolg, unerwartet vorhandene und fehlende Datei
+        $f63 = Join-Path $testRoot3 'Data\ifunchanged63.bin'
+        [System.IO.File]::WriteAllBytes($f63, [byte[]](1, 2, 3))
+        $h63 = Get-FileSha256Hex -Path $f63
+        $r63a = ''; try { Write-FileInPlaceVerified -Path $f63 -Bytes ([byte[]](9, 9)) -ExpectedHash ('0' * 64) } catch { $r63a = $_.Exception.Message }
+        $len63a = ([System.IO.File]::ReadAllBytes($f63)).Length
+        Write-FileInPlaceVerified -Path $f63 -Bytes ([byte[]](7, 7, 7, 7)) -ExpectedHash $h63
+        $len63b = ([System.IO.File]::ReadAllBytes($f63)).Length
+        $r63c = ''; try { Write-FileInPlaceVerified -Path $f63 -Bytes ([byte[]](5)) } catch { $r63c = $_.Exception.Message }
+        $r63d = ''; try { Write-FileInPlaceVerified -Path (Join-Path $testRoot3 'Data\fehlt63.bin') -Bytes ([byte[]](5)) -ExpectedHash $h63 } catch { $r63d = $_.Exception.Message }
+        Remove-Item -LiteralPath $f63 -Force
+        & $assert 'Test 63i: bedingtes Schreiben - Abweichung unangetastet, Erfolg, extern angelegte/entfernte Datei erkannt' 'VAULT_EXTERNAL_CHANGE|3|4|VAULT_EXTERNAL_CHANGE|VAULT_EXTERNAL_CHANGE' "$r63a|$len63a|$len63b|$r63c|$r63d"
+        # Einzelinstanz: ein zweiter Thread/Prozess erhaelt den Mutex nicht
+        $dataBefore63 = $script:Paths.Data
+        $script:Paths.Data = Join-Path $testRoot3 'Data'
+        $probe63 = {
+            param([string]$Name)
+            $rs = [runspacefactory]::CreateRunspace()
+            $rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
+            $rs.Open()
+            $ps = [powershell]::Create()
+            $ps.Runspace = $rs
+            try {
+                [void]$ps.AddScript('param($n) $m = New-Object System.Threading.Mutex($false, $n); $ok = $false; try { $ok = $m.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $ok = $true }; if ($ok) { $m.ReleaseMutex() }; $m.Dispose(); $ok').AddArgument($Name)
+                return [bool](@($ps.Invoke())[0])
+            }
+            finally { $ps.Dispose(); $rs.Dispose() }
+        }
+        $enter63 = Enter-SingleInstance
+        $second63 = & $probe63 (Get-SingleInstanceMutexName)
+        Exit-SingleInstance
+        $afterExit63 = & $probe63 (Get-SingleInstanceMutexName)
+        $script:Paths.Data = $dataBefore63
+        & $assert 'Test 63j: Einzelinstanz - erste Instanz erhaelt die Sperre, zweite nicht, nach Freigabe wieder verfuegbar' 'True|False|True' "$enter63|$second63|$afterExit63"
 
         # --- Test 64: uebermaessig grosse Tresordatei wird vor ReadAllText abgelehnt ---
         $limitBefore = $script:VaultConst.MaxFileBytes
@@ -15277,8 +15482,55 @@ function Invoke-SessionStartSave {
     return [bool](Save-Vault -NoTrackingCheckpoint)
 }
 
+# Einzelinstanz je Datenordner: Zwei gleichzeitig laufende
+# Instanzen auf denselben Tresordateien koennten sich gegenseitig Aenderungen
+# ueberschreiben. Benannter Mutex in der Windows-Sitzung; der Name wird aus
+# dem Hash des vollstaendigen Datenpfads gebildet (keine Pfad-/Benutzernamen
+# im Objektnamen). Grenzen: schuetzt nicht gegen andere Rechner bzw. Sync-
+# Clients (dafuer: Hash-Pruefung in Save-Vault) und nicht, wenn derselbe
+# Ordner ueber verschiedene Pfade (z. B. Laufwerksbuchstabe vs. UNC) geoeffnet
+# wird. Ein verwaister Mutex (Absturz) gilt als frei.
+function Get-SingleInstanceMutexName {
+    $fullPath = [System.IO.Path]::GetFullPath($script:Paths.Data).TrimEnd('\').ToLowerInvariant()
+    $hash = Get-BytesSha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes($fullPath))
+    return ('Local\ArbeitszeitTool-' + $hash.Substring(0, 32))
+}
+
+function Enter-SingleInstance {
+    $mutex = New-Object System.Threading.Mutex($false, (Get-SingleInstanceMutexName))
+    $acquired = $false
+    try { $acquired = $mutex.WaitOne(0) }
+    catch [System.Threading.AbandonedMutexException] { $acquired = $true }
+    if (-not $acquired) {
+        $mutex.Dispose()
+        return $false
+    }
+    $script:InstanceMutex = $mutex
+    return $true
+}
+
+function Exit-SingleInstance {
+    if ($null -eq $script:InstanceMutex) { return }
+    try { $script:InstanceMutex.ReleaseMutex() } catch { }
+    try { $script:InstanceMutex.Dispose() } catch { }
+    $script:InstanceMutex = $null
+}
+
 function Start-Application {
     Initialize-Folders
+
+    if (-not (Enter-SingleInstance)) {
+        try {
+            [System.Windows.MessageBox]::Show(
+                ("Das ArbeitszeitTool läuft bereits mit diesem Datenordner.`r`n`r`n" +
+                    "Bitte die bereits geöffnete Instanz verwenden (ggf. im Infobereich der Taskleiste). " +
+                    "Zwei gleichzeitig laufende Instanzen könnten sich gegenseitig Änderungen überschreiben."),
+                'ArbeitszeitTool - bereits gestartet',
+                [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+        }
+        catch { }
+        return
+    }
 
     # Ohne funktionsfaehige SHA256-Kryptografie werden keine Dateien veraendert
     # und keine schwaechere Verschluesselung verwendet.
