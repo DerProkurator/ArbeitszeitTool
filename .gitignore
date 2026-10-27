@@ -3,6 +3,7 @@ Data/
 Logs/
 Exports/
 Recovery/
+Local/
 *.azt
 vault.txn
 

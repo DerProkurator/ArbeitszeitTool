@@ -357,7 +357,11 @@ Deshalb verwendet die Anwendung stabile, neutrale Dateinamen ohne Datums-/Uhrzei
   Ist das der Fall, wird sie **nicht überschrieben**: Der eigene Stand wird verschlüsselt
   unter einem neutralen GUID-Namen (`Recovery\vault-<GUID>.azt`, keine Arbeitszeitdaten
   im Dateinamen) gesichert, der Benutzer informiert und keine automatische
-  Zusammenführung durchgeführt.
+  Zusammenführung durchgeführt. Die Sicherung wird nach dem Schreiben per Hash geprüft;
+  nur dann wird sie als erfolgreich gemeldet. Scheitert sie (z. B. Recovery-Ordner nicht
+  beschreibbar, Speicher voll), erscheint eine Fehlermeldung, dass die lokalen
+  Änderungen **nicht** gesichert sind und die Anwendung nicht beendet werden sollte
+  (seit 1.3.3).
 - Neben der Hauptdatei bleiben mindestens zwei vorherige gültige verschlüsselte Stände
   (`backup1`, `backup2`) erhalten. Ein Absturz während des Schreibens führt dank Journal
   nie dazu, dass kein gültiger aktueller Stand mehr vorhanden ist.

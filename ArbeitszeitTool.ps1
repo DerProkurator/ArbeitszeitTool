@@ -33,6 +33,17 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+27.10.2026 - VERSION 1.3.3: KONFLIKTSICHERUNG EHRLICH MELDEN
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (Test 63c/63d).
+ - Externe Aenderung erkannt: Die Sicherung des eigenen
+   Standes nach Recovery wird per Hash geprueft. Nur bei
+   Erfolg Warnung mit Pfad ("gesichert"); bei Fehlschlag
+   Fehlermeldung "NICHT gesichert - Anwendung nicht beenden"
+   und ERROR-Protokolleintrag (zuvor leerer catch und
+   unbedingte Erfolgsmeldung).
+ - Testhook TestFailConflictCopy, Flag LastConflictCopySaved.
+--------------------------------------------------
 27.10.2026 - VERSION 1.3.2: TAGES-EDITOR LAYOUT UND
 KOMMENTARZUGANG
 --------------------------------------------------
@@ -759,7 +770,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.3.2'
+$script:AppVersion = '1.3.3'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -1709,25 +1720,45 @@ function Save-Vault {
             # Vorhandene Dateien nicht ueberschreiben; eigenen (verschluesselten)
             # Stand als NEUE Datei neutral in Recovery sichern (keine Loeschung,
             # kein Verschieben); keine automatische Zusammenfuehrung.
+            # Erfolg wird nur gemeldet, wenn die Kopie nachweislich vollstaendig
+            # geschrieben wurde (Bytes erneut gelesen und per Hash verglichen).
             $conflictPath = $null
+            $conflictSaved = $false
             try {
-                if (-not (Test-Path -LiteralPath $script:Paths.Recovery)) {
-                    New-Item -ItemType Directory -Path $script:Paths.Recovery -Force | Out-Null
+                if ($script:TestMode -and $script:App.Flags.TestFailConflictCopy) {
+                    throw (New-Object System.IO.IOException 'TESTHOOK: Konfliktsicherung deaktiviert')
+                }
+                if (-not (Test-Path -LiteralPath $script:Paths.Recovery -PathType Container)) {
+                    New-Item -ItemType Directory -Path $script:Paths.Recovery -Force -ErrorAction Stop | Out-Null
                 }
                 $conflictPath = Join-Path $script:Paths.Recovery ('vault-{0}.azt' -f ([guid]::NewGuid().ToString()))
                 [System.IO.File]::WriteAllBytes($conflictPath, $newBytes)
+                $conflictSaved = ((Get-FileSha256Hex -Path $conflictPath) -eq (Get-BytesSha256Hex -Bytes $newBytes))
             }
-            catch { }
+            catch { $conflictSaved = $false }
             & $restoreMeta
             Set-VaultSaveFailedState
             # Keine automatische Wiederholung: sie wuerde nur weitere
             # Konfliktkopien erzeugen - der Benutzer muss entscheiden.
             $script:App.Flags.SaveRetryCount = 3
-            Write-AppLog -Level 'WARN' -Message ("Externe Änderung der Tresordatei erkannt ({0}) - Speichern abgebrochen, eigener Stand in Recovery gesichert." -f $externalChange)
-            if (-not $Quiet) {
-                Show-Warning -Message (("Die Tresordatei wurde außerhalb dieser Anwendung verändert ({0}), z. B. durch eine Cloud-Synchronisierung. " -f $externalChange) +
-                    "Vorhandene Dateien wurden NICHT überschrieben. Der aktuelle lokale Stand wurde verschlüsselt im Ordner 'Recovery' gesichert:`r`n`r`n" +
-                    [string]$conflictPath + "`r`n`r`nEs findet keine automatische Zusammenführung statt. Bitte die Anwendung neu starten und den gewünschten Stand wählen.")
+            $script:App.Flags.LastConflictCopySaved = $conflictSaved
+            $conflictIntro = ("Die Tresordatei wurde außerhalb dieser Anwendung verändert ({0}), z. B. durch eine Cloud-Synchronisierung. " -f $externalChange) +
+                "Vorhandene Dateien wurden NICHT überschrieben. "
+            if ($conflictSaved) {
+                Write-AppLog -Level 'WARN' -Message ("Externe Änderung der Tresordatei erkannt ({0}) - Speichern abgebrochen, eigener Stand in Recovery gesichert." -f $externalChange)
+                if (-not $Quiet) {
+                    Show-Warning -Message ($conflictIntro + "Der aktuelle lokale Stand wurde verschlüsselt im Ordner 'Recovery' gesichert:`r`n`r`n" +
+                        [string]$conflictPath + "`r`n`r`nEs findet keine automatische Zusammenführung statt. Bitte die Anwendung neu starten und den gewünschten Stand wählen.")
+                }
+            }
+            else {
+                Write-AppLog -Level 'ERROR' -Message ("Externe Änderung der Tresordatei erkannt ({0}) - Speichern abgebrochen. Sicherung des eigenen Standes in Recovery FEHLGESCHLAGEN - lokale Änderungen sind nicht gesichert." -f $externalChange)
+                if (-not $Quiet) {
+                    Show-AppError -Message ($conflictIntro + "ACHTUNG: Der aktuelle lokale Stand konnte NICHT im Ordner 'Recovery' gesichert werden. " +
+                        "Ihre lokalen Änderungen sind derzeit nur im Arbeitsspeicher vorhanden.`r`n`r`n" +
+                        "Bitte die Anwendung NICHT beenden oder neu starten, solange der Ordner 'Recovery' nicht beschreibbar ist (z. B. Speicherplatz, Berechtigungen, gesperrte Datei). " +
+                        "Notieren Sie wichtige Änderungen gegebenenfalls manuell. Es findet keine automatische Zusammenführung statt.")
+                }
             }
             return $false
         }
@@ -10192,7 +10223,7 @@ function Initialize-AppState {
         # Benutzerinfo bei fehlgeschlagener Best-Effort-Backuprotation.
         # TestFail*: reine Testhooks fuer -RunTests (nur bei $script:TestMode
         # wirksam, im normalen Programmbetrieb vollstaendig inaktiv).
-        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailMainWrite = $false; TestFailMainRestore = $false; TestFailBackupCopy = $false; TestFailBackup1Write = $false; TestFailPostCommitHash = $false; TestFailJournalMirror = $false; TestFailRecoveryWrite = $false; TestFailReencryptRollback = $false; TestFailRecoveryList = $false; TestRecoveryDenyRead = ''; TestRecoveryBeforeCommit = $null; TestFailRecoveryCleanup = $false }
+        Flags               = @{ Warn945Logged = $false; MaxHandled = $false; SaveInProgress = $false; UnsavedChanges = $false; SaveRetryCount = 0; ActiveDayDecisionCompleted = $false; SimulatedShutdownRequested = $false; SimulatedShutdownRequestCount = 0; SimulatedShutdownStartFails = $false; RolloverWarnLogged = $false; RolloverNextRetryAt = $null; SaveBlockedReason = ''; SaveBlockedLogged = $false; BackupWarningShown = $false; TestFailMainWrite = $false; TestFailMainRestore = $false; TestFailBackupCopy = $false; TestFailBackup1Write = $false; TestFailPostCommitHash = $false; TestFailJournalMirror = $false; TestFailRecoveryWrite = $false; TestFailReencryptRollback = $false; TestFailRecoveryList = $false; TestRecoveryDenyRead = ''; TestRecoveryBeforeCommit = $null; TestFailRecoveryCleanup = $false; TestFailConflictCopy = $false; LastConflictCopySaved = $null }
     }
 }
 
@@ -13002,7 +13033,15 @@ function Invoke-InternalTests {
         $recCountAfter = @(Get-ChildItem -LiteralPath $script:Paths.Recovery -Filter 'vault-*.azt' -File -ErrorAction SilentlyContinue).Count
         & $assert 'Test 63a: extern veraenderte Tresordatei wird NICHT ueberschrieben' 'False' ([string]$extSave)
         & $assert 'Test 63b: extern veraenderte Datei bleibt unangetastet' ([string]($extBytes.Length + 1)) ([string]$extLenAfter)
-        & $assert 'Test 63c: eigener Stand als neutrale Konfliktdatei (GUID) in Recovery gesichert' 'True' ([string]($recCountAfter -gt $recCountBefore))
+        & $assert 'Test 63c: eigener Stand als neutrale Konfliktdatei (GUID) in Recovery gesichert' 'True|True' ("$($recCountAfter -gt $recCountBefore)|$($script:App.Flags.LastConflictCopySaved)")
+        # Fehlgeschlagene Konfliktsicherung darf NIE als gesichert gemeldet werden
+        $logCount63d = @($script:App.Vault['Logs']).Count
+        $script:App.Flags.TestFailConflictCopy = $true
+        $extSave63d = Save-Vault
+        $script:App.Flags.TestFailConflictCopy = $false
+        $recCount63d = @(Get-ChildItem -LiteralPath $script:Paths.Recovery -Filter 'vault-*.azt' -File -ErrorAction SilentlyContinue).Count
+        $newLogs63d = (@(@($script:App.Vault['Logs']) | Select-Object -Skip $logCount63d) | ForEach-Object { [string]$_['Message'] }) -join "`n"
+        & $assert 'Test 63d: Konfliktsicherung fehlgeschlagen - false, keine Erfolgsmeldung, Fehlschlag protokolliert, Datei unangetastet' "False|False|$recCountAfter|True|False|$($extBytes.Length + 1)" ("$extSave63d|$($script:App.Flags.LastConflictCopySaved)|$recCount63d|$($newLogs63d.Contains('FEHLGESCHLAGEN'))|$($newLogs63d.Contains('in Recovery gesichert'))|$(([System.IO.File]::ReadAllBytes($script:Paths.VaultFile)).Length)")
         Clear-VaultSaveFailedState
         $script:App.VaultFileHash = Get-FileSha256Hex -Path $script:Paths.VaultFile
 
