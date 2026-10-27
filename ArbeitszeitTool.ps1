@@ -33,6 +33,20 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+27.10.2026 - VERSION 1.3.6: KALENDERDATUM VALIDIEREN
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (Test 122o).
+ - Test-VaultStructure prueft das Tagesdatum per
+   TryParseExact (bisher nur Format): z. B. 2026-99-99 oder
+   2026-02-30 werden abgelehnt, statt spaeter Export und
+   Tages-Editor abstuerzen zu lassen. Vom Tool selbst
+   angelegte Tage sind immer gueltige Kalenderdaten.
+ - BEWUSST NICHT umgesetzt (Risiko, bestehende Tresore
+   unladbar bzw. nicht mehr speicherbar zu machen):
+   Pflicht-EndedAt / 10h-Pruefung fuer beendete Tage ohne
+   Abschlusszeit (Altdaten), Eindeutigkeit des Datums,
+   innere WorkData-Schemaversion.
+--------------------------------------------------
 27.10.2026 - VERSION 1.3.5: KONKURRIERENDE TRESORZUGRIFFE
 --------------------------------------------------
  Status: umgesetzt, automatisiert getestet (Tests 63e-63j);
@@ -810,7 +824,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.3.5'
+$script:AppVersion = '1.3.6'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -1335,6 +1349,13 @@ function Test-VaultStructure {
         $dayLabel = '?'
         if ($day.Contains('Date')) { $dayLabel = [string]$day['Date'] }
         if ($dayLabel -notmatch '^\d{4}-\d{2}-\d{2}$') { [void]$errors.Add("Tag '$dayLabel': ungültiges Datum."); continue }
+        # Format allein genuegt nicht (z. B. 2026-99-99): ein ungueltiger
+        # Kalendertag liesse Export und Tages-Editor an ParseExact scheitern
+        $calendarDate = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($dayLabel, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::None, [ref]$calendarDate)) {
+            [void]$errors.Add("Tag '$dayLabel': ungültiges Kalenderdatum."); continue
+        }
         if (@('Aktiv', 'Beendet') -notcontains [string]$day['Status']) { [void]$errors.Add("Tag '$dayLabel': ungültiger Status.") }
         if ([string]$day['Status'] -eq 'Aktiv') { $activeCount++ }
         $regMinutes = 0
@@ -15133,6 +15154,17 @@ function Invoke-InternalTests {
         $lastLog122 = [string]@($script:App.Vault['Logs'])[-1]['Message']
         & $assert 'Test 122k: Kommentar wird im Tresor gespeichert, Protokoll ohne Kommentarinhalt' 'True|True|True|False' ("$saved122|$($raw122.Contains('MARKER_122_KOMMENTAR'))|$($lastLog122.Contains('Kommentar hinzugefuegt'))|$($lastLog122.Contains('MARKER_122'))")
         & $assert 'Test 122l: Tresor mit Kommentaren besteht die Strukturpruefung' '0' ([string](Test-VaultStructure -Vault $script:App.Vault).Count)
+        # Formal korrekte, aber unmoegliche Kalenderdaten
+        $dateVault = New-VaultDataObject
+        $dateErrors = @{}
+        foreach ($dateText in @('2026-07-10', '2026-99-99', '2026-02-30')) {
+            $dateDay = New-TestDay
+            $dateDay['Date'] = $dateText
+            $dateVault['WorkData']['Days'] = New-Object System.Collections.ArrayList
+            [void]$dateVault['WorkData']['Days'].Add($dateDay)
+            $dateErrors[$dateText] = (Test-VaultStructure -Vault $dateVault).Count
+        }
+        & $assert 'Test 122o: ungueltiges Kalenderdatum (99-99, 30.02.) wird abgelehnt, gueltiges Datum akzeptiert' '0|1|1' ("$($dateErrors['2026-07-10'])|$($dateErrors['2026-99-99'])|$($dateErrors['2026-02-30'])")
         $corrBefore122 = @($d122['Corrections']).Count
         $script:App.Flags.TestFailMainWrite = $true
         $failed122 = Set-DayItemCommentSaved -Day $d122 -Item $d122 -Text 'NICHT_GESPEICHERT' -Label 'Tag'
