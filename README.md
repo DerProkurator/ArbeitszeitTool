@@ -1,5 +1,7 @@
 ﻿# ArbeitszeitTool
 
+**Versionshistorie:** [CHANGELOG.md](https://github.com/DerProkurator/ArbeitszeitTool/blob/main/CHANGELOG.md)
+
 Lokale Arbeitszeit-Erfassung für Windows 10/11 als portables PowerShell-Skript mit WPF-Oberfläche.
 Keine Installation, keine externen Module, keine Telemetrie, keine Adminrechte. Die Anwendung
 läuft vollständig offline — einzige Ausnahme ist das optionale Internetradio (siehe Abschnitt
