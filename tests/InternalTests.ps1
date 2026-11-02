@@ -3071,6 +3071,41 @@ function Invoke-InternalTests {
         $comp125e = Get-DayComputation -Day $d125e -Now (Get-TestNow $d125e '20:00')
         & $assert 'Test 125d: Auto-Stopp bei zwei Abschnitten - Ende 16:30, Netto exakt 10:00' 'True|16:30|10:00|True' ("$stopped125e|$(Format-Clock (ConvertFrom-DateTimeString $d125e.Segments[1].End))|$(Format-Duration $comp125e.Netto)|$($d125e.MaxReached)")
 
+        # --- Tests 126: Speicherzyklus-Performance (GitHub-Issue #2) ---
+        # C#-Umwandlung liefert exakt dieselbe Struktur wie die PowerShell-Fassung
+        $sig126 = $null
+        $sig126 = {
+            param($o)
+            if ($null -eq $o) { return 'null' }
+            if ($o -is [System.Collections.Specialized.OrderedDictionary]) { return 'OD{' + ((@($o.Keys) | ForEach-Object { "$_=" + (& $sig126 $o[$_]) }) -join ',') + '}' }
+            if ($o -is [System.Collections.ArrayList]) { return 'AL[' + ((@($o) | ForEach-Object { & $sig126 $_ }) -join ',') + ']' }
+            return $o.GetType().Name + ':' + [string]$o
+        }
+        $json126 = '{"a":1,"b":"äöü €","c":true,"d":null,"e":1.5,"f":12345678901,"g":[],"h":[1],"i":[{"k":"v"},[2,[]]],"j":{}}'
+        $parsed126 = $json126 | ConvertFrom-Json
+        $vaultParsed126 = ($script:App.Vault | ConvertTo-Json -Depth 30) | ConvertFrom-Json
+        $fast126 = ConvertTo-PlainObject $vaultParsed126
+        & $assert 'Test 126a: C#-Umwandlung aktiv und identisch zur PowerShell-Fassung (Sonderfaelle und kompletter Tresor)' 'True|True|True|True' ("$($script:PlainObjectFast)|$((& $sig126 (ConvertTo-PlainObjectScript $parsed126)) -eq (& $sig126 (ConvertTo-PlainObject $parsed126)))|$((& $sig126 (ConvertTo-PlainObjectScript $vaultParsed126)) -eq (& $sig126 $fast126))|$($fast126['workdata']['days'] -is [System.Collections.ArrayList])")
+        # Grosse Byte-Arrays ohne Mandatory, $null und leere Arrays weiter abgelehnt
+        $reject126 = @()
+        foreach ($b126 in @($null, (New-Object byte[] 0))) {
+            try { Get-BytesSha256Hex -Bytes $b126 | Out-Null; $reject126 += 'akzeptiert' } catch { $reject126 += 'abgelehnt' }
+        }
+        $empty126 = Join-Path $script:Paths.Data 'leer126.bin'
+        [System.IO.File]::WriteAllBytes($empty126, [byte[]](1, 2, 3))
+        try { Write-FileInPlace -Path $empty126 -Bytes (New-Object byte[] 0); $reject126 += 'akzeptiert' } catch { $reject126 += 'abgelehnt' }
+        $len126 = (Get-Item -LiteralPath $empty126).Length
+        Remove-Item -LiteralPath $empty126 -Force
+        $src126 = [System.IO.File]::ReadAllText($script:AppScriptPath)
+        & $assert 'Test 126b: $null/leere Bytes abgelehnt (Datei nicht gekuerzt), kein Mandatory an $Bytes im Quelltext' 'abgelehnt,abgelehnt,abgelehnt|3|False' ("$($reject126 -join ',')|$len126|$($src126 -match '\[Parameter\(Mandatory\)\]\[byte\[\]\]\$Bytes')")
+        # Checkpoint: genau EINE Vollpruefung (Journal), Hauptdatei byte-identisch
+        $readCount126 = @{ N = 0 }
+        $origRead126 = ${function:Read-VaultFromFile}
+        ${function:Read-VaultFromFile} = { $readCount126.N++; & $origRead126 @args }.GetNewClosure()
+        try { $saved126 = Save-Vault -Quiet -NoBackupRotation }
+        finally { ${function:Read-VaultFromFile} = $origRead126 }
+        & $assert 'Test 126c: Checkpoint gespeichert, eine Vollpruefung, Haupt- und Journaldatei identisch' 'True|1|True' ("$saved126|$($readCount126.N)|$((Get-FileSha256Hex -Path $script:Paths.VaultFile) -eq (Get-FileSha256Hex -Path $script:Paths.VaultPending))")
+
         Clear-VaultKeys -Keys $newKeys116
         Clear-VaultKeys -Keys $keysF116
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($newPwd116)

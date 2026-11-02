@@ -33,6 +33,36 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+02.11.2026 - VERSION 1.5.2: SPEICHERZYKLUS OHNE EINFRIEREN
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (alle Tests gruen,
+         Tests 126a-126c neu); Laufzeit gemessen, Bedienung
+         manuell NICHT getestet (GitHub-Issue #2).
+ - 30-Sekunden-Checkpoint (Save-Vault -NoBackupRotation) im
+   UI-Thread, gemessen mit synthetischen Tresoren (lokal):
+     klein  (2 Tage, 300 Logs, 0,1 MB):     300 ms ->    50 ms
+     mittel (60 Tage, 2.000 Logs, 1,2 MB): 3.000 ms ->   630 ms
+     gross  (250 Tage, 25.000 Logs, 14 MB): 25 s   -> 3,1 s
+   Netzlaufwerk (NAS): jeweils etwa 10-20 % mehr.
+ - ConvertTo-PlainObject in C# (ArbeitszeitTool.PlainObject),
+   identische Semantik; PowerShell-Fassung bleibt als Rueckfall
+   (ConvertTo-PlainObjectScript). Bisher ein Funktionsaufruf
+   pro JSON-Wert: 28x schneller.
+ - [Parameter(Mandatory)] an grossen Byte-Arrays entfernt
+   (Write-FileInPlace, Write-FileInPlaceVerified,
+   Write-FileInPlaceIfUnchanged, Get-BytesSha256Hex): PowerShell
+   prueft dabei jedes Element auf $null (0,6 s je Aufruf bei
+   14 MB, rund 10 Aufrufe pro Speichervorgang). Ersatz
+   Assert-ByteArray lehnt $null und leere Arrays weiter ab.
+ - Hauptdatei nach dem Schreiben nicht mehr ein zweites Mal
+   vollstaendig entschluesselt und geprueft: sie ist per SHA-256
+   unter demselben Handle byte-identisch mit dem Journal, das
+   (neu zusaetzlich per Hashvergleich belegt) vollstaendig
+   geprueft wurde.
+ - Unveraendert: Journal, In-place-Schreiben, Erkennung externer
+   Aenderungen, Ruecksicherung, Tresorformat. Verbleibender
+   Hauptanteil: Test-VaultStructure (Tagesberechnung je Tag).
+--------------------------------------------------
 02.11.2026 - VERSION 1.5.1: ABSTURZ BEI TAGEN MIT MEHREREN
 ABSCHNITTEN
 --------------------------------------------------
@@ -881,6 +911,73 @@ catch {
     $script:VaultCryptoError = $_.Exception.Message
 }
 
+# Schnelle Umwandlung der ConvertFrom-Json-Ausgabe in geordnete Hashtables und
+# ArrayLists (identische Semantik wie ConvertTo-PlainObjectScript). Die
+# rekursive PowerShell-Funktion braucht pro Wert einen Funktionsaufruf und
+# dominierte die Laufzeit jedes Speichervorgangs (Ruecklesepruefung,
+# GitHub-Issue #2). Faellt die Kompilierung aus, bleibt die PowerShell-
+# Fassung aktiv - an der Funktionalitaet aendert sich nichts.
+$plainObjectSource = @'
+using System;
+using System.Collections;
+using System.Collections.Specialized;
+using System.Management.Automation;
+
+namespace ArbeitszeitTool
+{
+    public static class PlainObject
+    {
+        public static object Convert(object input)
+        {
+            if (input == null) return null;
+            PSObject pso = input as PSObject;
+            if (pso != null)
+            {
+                if (pso.BaseObject is PSCustomObject)
+                {
+                    // wie [ordered]@{}: Schluessel ohne Beachtung der Gross-/Kleinschreibung
+                    OrderedDictionary ht = new OrderedDictionary(StringComparer.OrdinalIgnoreCase);
+                    foreach (PSPropertyInfo prop in pso.Properties)
+                    {
+                        ht[prop.Name] = Convert(prop.Value);
+                    }
+                    return ht;
+                }
+                input = pso.BaseObject;
+            }
+            IDictionary dict = input as IDictionary;
+            if (dict != null)
+            {
+                OrderedDictionary ht = new OrderedDictionary(StringComparer.OrdinalIgnoreCase);
+                foreach (object key in dict.Keys)
+                {
+                    ht[key] = Convert(dict[key]);
+                }
+                return ht;
+            }
+            if (input is IEnumerable && !(input is string))
+            {
+                ArrayList list = new ArrayList();
+                foreach (object item in (IEnumerable)input)
+                {
+                    list.Add(Convert(item));
+                }
+                return list;
+            }
+            return input;
+        }
+    }
+}
+'@
+$script:PlainObjectFast = $false
+try {
+    if (-not ('ArbeitszeitTool.PlainObject' -as [type])) {
+        Add-Type -TypeDefinition $plainObjectSource -ReferencedAssemblies @('System', ([psobject].Assembly.Location)) -Language CSharp
+    }
+    $script:PlainObjectFast = $true
+}
+catch { }
+
 #endregion
 
 #region ===== Pfade, Konstanten, Logging =====
@@ -908,7 +1005,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.5.1'
+$script:AppVersion = '1.5.2'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -1685,6 +1782,15 @@ function ConvertTo-VaultFileBytes {
     return ,$bytes
 }
 
+# Ersatz fuer Mandatory bei grossen Byte-Arrays: lehnt $null und leere Arrays
+# ab (wie die Parameterbindung), ohne jedes Element einzeln zu pruefen
+function Assert-ByteArray {
+    param($Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
+        throw (New-Object System.ArgumentException 'Byte-Array fehlt oder ist leer.')
+    }
+}
+
 # Schreibt Bytes IN-PLACE in eine Datei: eine vorhandene Datei wird geoeffnet,
 # ueberschrieben und auf die neue Laenge gekuerzt - sie wird weder geloescht
 # noch umbenannt oder ersetzt. Cloud-Ordner (OneDrive/SharePoint) sehen
@@ -1692,7 +1798,11 @@ function ConvertTo-VaultFileBytes {
 # Papierkorbeintrag). Fehlt die Datei, wird sie angelegt. Kurze Wiederholung
 # bei voruebergehender Sperre (z. B. waehrend eines Sync-Uploads).
 function Write-FileInPlace {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes)
+    # $Bytes bewusst ohne Mandatory: PowerShell prueft dabei jedes Array-
+    # element einzeln auf $null - bei einem Tresor von 14 MB rund 0,6 s pro
+    # Aufruf im UI-Thread (GitHub-Issue #2). Ersatz: Assert-ByteArray.
+    param([Parameter(Mandatory)][string]$Path, [byte[]]$Bytes)
+    Assert-ByteArray -Bytes $Bytes
     $attempt = 0
     while ($true) {
         $attempt++
@@ -1729,7 +1839,8 @@ function Write-FileInPlace {
 # (Nicht zu verwechseln mit Write-FileInPlaceIfUnchanged der Passwortaenderung:
 # dort Rueckgabe true/false, ohne Anlegen und ohne Ruecklesen.)
 function Write-FileInPlaceVerified {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes, [string]$ExpectedHash = '')
+    param([Parameter(Mandatory)][string]$Path, [byte[]]$Bytes, [string]$ExpectedHash = '')
+    Assert-ByteArray -Bytes $Bytes   # statt Mandatory, siehe Write-FileInPlace
     $mode = [System.IO.FileMode]::Open
     if ($ExpectedHash -eq '') { $mode = [System.IO.FileMode]::CreateNew }
     $readAll = {
@@ -1783,7 +1894,8 @@ function Write-FileInPlaceVerified {
 }
 
 function Get-BytesSha256Hex {
-    param([Parameter(Mandatory)][byte[]]$Bytes)
+    param([byte[]]$Bytes)
+    Assert-ByteArray -Bytes $Bytes   # statt Mandatory, siehe Write-FileInPlace
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes)) -replace '-', '') }
     finally { $sha.Dispose() }
@@ -2026,6 +2138,12 @@ function Save-Vault {
         if ([long]$verify['Revision'] -ne [long]$vault['Revision']) {
             throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
         }
+        # Das Journal enthaelt nachweislich exakt $newBytes - diese EINE
+        # Vollpruefung (HMAC, Entschluesselung, JSON, Struktur, Revision) gilt
+        # damit fuer jede Datei mit identischen Bytes (Hauptdatei, Schritt 6)
+        if ((Get-FileSha256Hex -Path $script:Paths.VaultPending) -ne (Get-BytesSha256Hex -Bytes $newBytes)) {
+            throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
+        }
         # 6. Hauptdatei in-place ueberschreiben und vollstaendig pruefen.
         #    Vergleich mit dem in Schritt 4 geprueften Stand und Schreiben
         #    erfolgen unter EINEM Handle (Write-FileInPlaceVerified): eine
@@ -2048,11 +2166,11 @@ function Save-Vault {
             if ($mainExists) { $expectedMainHash = $currentHash }
             Write-FileInPlaceVerified -Path $script:Paths.VaultFile -Bytes $newBytes -ExpectedHash $expectedMainHash
             $mainWriteCompleted = $true
-            $verifyMain = Read-VaultFromFile -Path $script:Paths.VaultFile `
-                -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
-            if ([long]$verifyMain['Revision'] -ne [long]$vault['Revision']) {
-                throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
-            }
+            # Keine zweite Vollpruefung: Write-FileInPlaceVerified hat unter
+            # demselben Handle per SHA-256 belegt, dass die Hauptdatei exakt
+            # $newBytes enthaelt - und genau diese Bytes wurden im Journal
+            # (Schritt 5) vollstaendig geprueft. Eine erneute Entschluesselung
+            # und Strukturpruefung kostete nur Zeit (GitHub-Issue #2).
             $mainWriteOk = $true
         }
         catch {
@@ -2117,8 +2235,9 @@ function Save-Vault {
             throw (New-Object System.InvalidOperationException 'VAULT_SWAP_CRITICAL')
         }
         # ----- COMMIT-PUNKT ERREICHT -----
-        # Die neue Hauptdatei wurde geschrieben und vollstaendig geprueft
-        # (Authentizitaet, Entschluesselung, JSON, Struktur, Revision).
+        # Die neue Hauptdatei wurde geschrieben und ist nachweislich byte-
+        # identisch mit dem vollstaendig geprueften Journal (Authentizitaet,
+        # Entschluesselung, JSON, Struktur, Revision).
         $commitCompleted = $true
         # Referenzdaten nach dem Commit (Best Effort - niemals Rollback):
         # Kann der Referenzhash der bereits gueltig gespeicherten Hauptdatei
@@ -2326,27 +2445,36 @@ function Remove-PlaintextFileSecure {
 
 # ConvertFrom-Json liefert PSCustomObject; intern arbeiten wir mit
 # (geordneten) Hashtables und ArrayLists, damit Werte einfach aenderbar sind.
+# Standardweg ist die C#-Umwandlung ([ArbeitszeitTool.PlainObject]); die
+# PowerShell-Fassung bleibt als Rueckfall und Vergleichsmassstab der Tests.
 function ConvertTo-PlainObject {
+    param($InputObject)
+    if ($null -eq $InputObject) { return $null }
+    if ($script:PlainObjectFast) { return ,([ArbeitszeitTool.PlainObject]::Convert($InputObject)) }
+    return ,(ConvertTo-PlainObjectScript $InputObject)
+}
+
+function ConvertTo-PlainObjectScript {
     param($InputObject)
     if ($null -eq $InputObject) { return $null }
     if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
         $ht = [ordered]@{}
         foreach ($prop in $InputObject.PSObject.Properties) {
-            $ht[$prop.Name] = ConvertTo-PlainObject $prop.Value
+            $ht[$prop.Name] = ConvertTo-PlainObjectScript $prop.Value
         }
         return $ht
     }
     if ($InputObject -is [System.Collections.IDictionary]) {
         $ht = [ordered]@{}
         foreach ($key in $InputObject.Keys) {
-            $ht[$key] = ConvertTo-PlainObject $InputObject[$key]
+            $ht[$key] = ConvertTo-PlainObjectScript $InputObject[$key]
         }
         return $ht
     }
     if (($InputObject -is [System.Collections.IEnumerable]) -and ($InputObject -isnot [string])) {
         $list = New-Object System.Collections.ArrayList
         foreach ($item in $InputObject) {
-            [void]$list.Add((ConvertTo-PlainObject $item))
+            [void]$list.Add((ConvertTo-PlainObjectScript $item))
         }
         return ,$list
     }
@@ -9823,9 +9951,10 @@ function Invoke-VaultReencryption {
 function Write-FileInPlaceIfUnchanged {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][byte[]]$Bytes,
+        [byte[]]$Bytes,
         [Parameter(Mandatory)][string]$ExpectedSha256
     )
+    Assert-ByteArray -Bytes $Bytes   # statt Mandatory, siehe Write-FileInPlace
     $attempt = 0
     while ($true) {
         $attempt++
