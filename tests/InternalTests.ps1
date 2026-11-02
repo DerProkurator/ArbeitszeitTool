@@ -2952,6 +2952,91 @@ function Invoke-InternalTests {
         & $assert 'Test 123c: Einzelfelder Soll-Ende/Max-Ende unveraendert' ('Soll-Ende: ' + (Format-Clock $c123a.SollEnde) + ' | Max-Ende: ' + (Format-Clock $c123a.MaxEnde)) ((@((Get-CompactStatusText -Comp $c123a -Day $d123) -split ' \| ')[0..1]) -join ' | ')
         $script:App.Settings['CompactFields'] = $fields123
 
+        # --- Tests 124: Teilabschnitte (Arbeitsphasen zwischen den Pausen) ---
+        $fmt124 = { param($List) (@($List) | ForEach-Object { '{0}-{1} {2}' -f (Format-Clock $_.Start), (Format-Clock $_.End), (Format-Duration $_.Duration) }) -join ', ' }
+        $sum124 = { param($List) $t = [TimeSpan]::Zero; foreach ($p in @($List)) { $t += $p.Duration }; Format-Duration $t }
+        # Beispiel aus dem Issue: Homeoffice mit manueller Pause und Windows-Sperre
+        $d124 = New-TestDay
+        Add-TestSegment -Day $d124 -Mode 'Homeoffice' -StartText '08:00' -EndText '16:30' | Out-Null
+        Add-TestInterval -Day $d124 -ListName 'ManualPauses' -StartText '12:00' -EndText '12:30' | Out-Null
+        Add-TestInterval -Day $d124 -ListName 'LockIntervals' -StartText '14:10' -EndText '14:20' | Out-Null
+        $n124 = Get-TestNow $d124 '17:00'
+        $fp124 = Get-DayContentFingerprint -Day $d124
+        $p124 = Get-WorkPhases -Day $d124 -Now $n124
+        $c124 = Get-DayComputation -Day $d124 -Now $n124
+        & $assert 'Test 124a: Homeoffice - Pause und Sperre teilen den Abschnitt in drei Teilabschnitte' '08:00-12:00 04:00, 12:30-14:10 01:40, 14:20-16:30 02:10' (& $fmt124 $p124)
+        & $assert 'Test 124b: Summe der Teilabschnitte = Netto, keine Datenaenderung' "$(Format-Duration $c124.Netto)|True" ("$(& $sum124 $p124)|$($fp124 -eq (Get-DayContentFingerprint -Day $d124))")
+        # Ueberlappende Pause und Sperre werden vereinigt
+        $d124b = New-TestDay
+        Add-TestSegment -Day $d124b -Mode 'Homeoffice' -StartText '08:00' -EndText '12:00' | Out-Null
+        Add-TestInterval -Day $d124b -ListName 'ManualPauses' -StartText '09:00' -EndText '09:30' | Out-Null
+        Add-TestInterval -Day $d124b -ListName 'LockIntervals' -StartText '09:15' -EndText '09:45' | Out-Null
+        $p124b = Get-WorkPhases -Day $d124b -Now (Get-TestNow $d124b '12:30')
+        & $assert 'Test 124c: ueberlappende Pause/Sperre - eine Unterbrechung, Summe = Netto' '08:00-09:00 01:00, 09:45-12:00 02:15|03:15' ("$(& $fmt124 $p124b)|$(& $sum124 $p124b)")
+        # Pausen am Abschnittsrand (vor Beginn bzw. ueber das Ende hinaus) kuerzen nur den Rand
+        $d124c = New-TestDay
+        Add-TestSegment -Day $d124c -Mode 'Homeoffice' -StartText '08:00' -EndText '12:00' | Out-Null
+        Add-TestInterval -Day $d124c -ListName 'LockIntervals' -StartText '07:30' -EndText '08:30' | Out-Null
+        Add-TestInterval -Day $d124c -ListName 'ManualPauses' -StartText '11:30' -EndText '12:30' | Out-Null
+        Add-TestInterval -Day $d124c -ListName 'ManualPauses' -StartText '12:30' -EndText '13:00' | Out-Null
+        $p124c = Get-WorkPhases -Day $d124c -Now (Get-TestNow $d124c '13:30')
+        & $assert 'Test 124d: Pausen am Abschnittsrand - ein Teilabschnitt, Summe = Netto' "08:30-11:30 03:00|$(Format-Duration (Get-DayComputation -Day $d124c -Now (Get-TestNow $d124c '13:30')).Netto)" ("$(& $fmt124 $p124c)|$(& $sum124 $p124c)")
+        # Laufender Abschnitt: letzte Phase laeuft; waehrend einer offenen Pause laeuft keine
+        $d124d = New-TestDay
+        Add-TestSegment -Day $d124d -Mode 'Homeoffice' -StartText '08:00' | Out-Null
+        Add-TestInterval -Day $d124d -ListName 'LockIntervals' -StartText '09:00' -EndText '09:10' | Out-Null
+        $p124d = Get-WorkPhases -Day $d124d -Now (Get-TestNow $d124d '11:00')
+        $t124d = Get-WorkPhasesTable -Day $d124d -Now (Get-TestNow $d124d '11:00')
+        Add-TestInterval -Day $d124d -ListName 'ManualPauses' -StartText '11:00' | Out-Null
+        $p124e = Get-WorkPhases -Day $d124d -Now (Get-TestNow $d124d '11:20')
+        & $assert 'Test 124e: laufender Abschnitt - nur die letzte Phase laeuft und zeigt "läuft"' '08:00-09:00 01:00, 09:10-11:00 01:50|False,True|läuft|1. Homeoffice (08:00–läuft)' ("$(& $fmt124 $p124d)|$((@($p124d) | ForEach-Object { $_.Running }) -join ',')|$($t124d.Rows[1]['Ende'])|$($t124d.Rows[1]['Abschnitt'])")
+        & $assert 'Test 124f: laufende Pause beendet die Phase - keine laufende Phase, Summe = Netto' "08:00-09:00 01:00, 09:10-11:00 01:50|False,False|$(Format-Duration (Get-DayComputation -Day $d124d -Now (Get-TestNow $d124d '11:20')).Netto)" ("$(& $fmt124 $p124e)|$((@($p124e) | ForEach-Object { $_.Running }) -join ',')|$(& $sum124 $p124e)")
+        # Tageswechsel: Abschnitt und Pause ueber Mitternacht
+        $d124e = New-TestDay
+        $s124e = Get-TestNow $d124e '22:00'
+        [void]$d124e['Segments'].Add((New-SegmentObject -Mode 'Homeoffice' -Start $s124e -End $s124e.AddHours(4)))
+        [void]$d124e['ManualPauses'].Add((New-IntervalObject -Start $s124e.AddMinutes(90) -End $s124e.AddMinutes(135)))
+        $p124f = Get-WorkPhases -Day $d124e -Now $s124e.AddHours(5)
+        & $assert 'Test 124g: Tageswechsel - Pause 23:30-00:15 teilt den Abschnitt, Summe = Netto' "22:00-23:30 01:30, 00:15-02:00 01:45|$(Format-Duration (Get-DayComputation -Day $d124e -Now $s124e.AddHours(5)).Netto)" ("$(& $fmt124 $p124f)|$(& $sum124 $p124f)")
+        # Betrieb: feste Betriebspause an den Grenzen 06:00 und 06:45
+        $d124f = New-TestDay
+        Add-TestSegment -Day $d124f -Mode 'Betrieb' -StartText '06:00' | Out-Null
+        Add-TestInterval -Day $d124f -ListName 'LockIntervals' -StartText '08:00' -EndText '08:30' | Out-Null
+        $p124g = Get-WorkPhases -Day $d124f -Now (Get-TestNow $d124f '12:00')
+        $p124h = Get-WorkPhases -Day $d124f -Now (Get-TestNow $d124f '12:45')
+        $p124i = Get-WorkPhases -Day $d124f -Now (Get-TestNow $d124f '13:00')
+        & $assert 'Test 124h: Betrieb bei 06:00 - noch ungeteilt, Sperren teilen im Betrieb nicht' '06:00-12:00 06:00|True' ("$(& $fmt124 $p124g)|$(@($p124g)[0].Running)")
+        & $assert 'Test 124i: Betrieb bei 06:45 - Phase endet um 12:00, keine laufende Phase' '06:00-12:00 06:00|False|06:00' ("$(& $fmt124 $p124h)|$(@($p124h)[0].Running)|$(Format-Duration (Get-DayComputation -Day $d124f -Now (Get-TestNow $d124f '12:45')).Netto)")
+        & $assert 'Test 124j: Betrieb nach der Pause - zweite Phase ab 12:45 laeuft, Summe = Netto' "06:00-12:00 06:00, 12:45-13:00 00:15|False,True|$(Format-Duration (Get-DayComputation -Day $d124f -Now (Get-TestNow $d124f '13:00')).Netto)" ("$(& $fmt124 $p124i)|$((@($p124i) | ForEach-Object { $_.Running }) -join ',')|$(& $sum124 $p124i)")
+        # Betrieb ueber mehrere Abschnitte: die Pause liegt nach 6 h kumulierter Betriebszeit
+        $d124g = New-TestDay
+        Add-TestSegment -Day $d124g -Mode 'Betrieb' -StartText '06:00' -EndText '10:00' | Out-Null
+        Add-TestSegment -Day $d124g -Mode 'Homeoffice' -StartText '10:00' -EndText '11:00' | Out-Null
+        Add-TestSegment -Day $d124g -Mode 'Betrieb' -StartText '11:00' -EndText '14:00' | Out-Null
+        $p124j = Get-WorkPhases -Day $d124g -Now (Get-TestNow $d124g '15:00')
+        & $assert 'Test 124k: Betrieb ueber mehrere Abschnitte - Pause 13:00-13:45 nur im dritten Abschnitt, Summe = Netto' "1:06:00-10:00 04:00, 2:10:00-11:00 01:00, 3:11:00-13:00 02:00, 3:13:45-14:00 00:15|$(Format-Duration (Get-DayComputation -Day $d124g -Now (Get-TestNow $d124g '15:00')).Netto)" ("$((@($p124j) | ForEach-Object { '{0}:{1}-{2} {3}' -f $_.SegmentNo, (Format-Clock $_.Start), (Format-Clock $_.End), (Format-Duration $_.Duration) }) -join ', ')|$(& $sum124 $p124j)")
+        # Reiter im Tageseditor und eigene Exportdatei
+        $t124 = Get-WorkPhasesTable -Day $d124 -Now $n124
+        & $assert 'Test 124l: Tabelle der Teilabschnitte (Abschnitt, Teil, Beginn, Ende, Dauer)' '3|1. Homeoffice (08:00–16:30)|2|12:30|14:10|01:40' ("$($t124.Rows.Count)|$($t124.Rows[1]['Abschnitt'])|$($t124.Rows[1]['Teil'])|$($t124.Rows[1]['Beginn'])|$($t124.Rows[1]['Ende'])|$($t124.Rows[1]['Dauer'])")
+        $d124['Status'] = 'Beendet'
+        $d124['EndedAt'] = ConvertTo-DateTimeString (Get-TestNow $d124 '16:30')
+        $csv124 = Export-WorkDataCsv -Days @($d124) -Suffix 'Test124' -IncludePhases $true
+        $phaseCsv124 = [System.IO.File]::ReadAllLines([string]$csv124[1])
+        & $assert 'Test 124m: CSV - eigene Datei Teilabschnitte, Detail-Datei nur auf Wunsch' "2|True|Datum;Abschnitt;Modus;Abschnitt Beginn;Teil;Beginn;Ende;Dauer|10.07.2026;1;Homeoffice;08:00;3;14:20;16:30;02:10|4" ("$(@($csv124).Count)|$(([string]$csv124[1]).Contains('Arbeitszeiten_Teilabschnitte_Test124_'))|$($phaseCsv124[0])|$($phaseCsv124[3])|$(@($phaseCsv124).Count)")
+        foreach ($f124 in $csv124) { Remove-Item -LiteralPath ([string]$f124) -Force -ErrorAction SilentlyContinue }
+        $csvNo124 = Export-WorkDataCsv -Days @($d124) -Suffix 'Test124b'
+        & $assert 'Test 124n: CSV ohne Option - keine Teilabschnitt-Datei' '1' ([string]@($csvNo124).Count)
+        foreach ($f124 in $csvNo124) { Remove-Item -LiteralPath ([string]$f124) -Force -ErrorAction SilentlyContinue }
+        try {
+            $edWin124 = New-XamlWindow -Xaml $script:DayEditorXaml
+            $tabs124 = $edWin124.FindName('TabLists')
+            & $assert 'Test 124o: Tageseditor - Reiter Teilabschnitte vorhanden, nicht vorausgewaehlt' 'True|True|False' ("$($null -ne $edWin124.FindName('TabPhases'))|$($null -ne $edWin124.FindName('GridPhases'))|$($tabs124.SelectedItem -eq $edWin124.FindName('TabPhases'))")
+            $edWin124.Close()
+        }
+        catch {
+            Write-Host ('[SKIP] Test 124o (UI): in dieser Umgebung nicht ausfuehrbar: ' + $_.Exception.Message) -ForegroundColor Yellow
+        }
+
         Clear-VaultKeys -Keys $newKeys116
         Clear-VaultKeys -Keys $keysF116
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($newPwd116)

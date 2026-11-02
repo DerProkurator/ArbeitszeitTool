@@ -506,6 +506,13 @@ Wo:
   Korrektur. Der volle Kommentar erscheint außerdem als Tooltip über der Zeile.
 - **Aufbau des Tages-Editors** (seit 1.3.2): Arbeitsabschnitte oben, darunter Reiter für
   Manuelle Pausen, Sperrintervalle und Änderungsprotokoll (jeweils mit Anzahl im Titel).
+- **Teilabschnitte** (seit 1.5.0): Ein weiterer Reiter im Tages-Editor zeigt die
+  Arbeitsphasen zwischen den Pausen je Abschnitt mit Beginn, Ende und Dauer. Im
+  Homeoffice trennen manuelle Pausen und Windows-Sperren (überlappende werden
+  zusammengefasst), im Betrieb die feste Betriebspause. Die Summe der Teilabschnitte
+  entspricht dem Netto des Abschnitts; ein laufender Teilabschnitt zeigt „läuft". Die
+  Werte werden nur berechnet, solange der Reiter ausgewählt ist, und nicht gespeichert.
+  Die erweiterte Ansicht bleibt bewusst unverändert.
 - **Anzeige**: Spalte „Kommentar" in den Tabellen, im Verlauf und im CSV-Export (dort
   einzeilig, Zeilenumbrüche als ` / `).
 - **Verlauf** (seit 1.4.1): Der Tageskommentar steht vollständig in einer Zeile; die
@@ -584,6 +591,13 @@ von anderen Personen oder Cloud-Diensten gelesen werden." — der Export erfolgt
 ausdrücklicher Bestätigung und niemals automatisch. Passwort und Schlüssel werden niemals
 exportiert. **Kommentare** (Tag bzw. Abschnitt) werden als letzte Spalte „Kommentar"
 mitexportiert – vor der Weitergabe einer CSV-Datei also auf persönliche Inhalte achten.
+
+Optional entstehen zusätzliche Dateien: der **Detail-Export** (eine Zeile pro
+Arbeitsabschnitt) und seit 1.5.0 die **Teilabschnitte** als eigene Datei
+`Arbeitszeiten_Teilabschnitte_*.csv` (Datum, Abschnitt, Modus, Abschnitt Beginn, Teil,
+Beginn, Ende, Dauer). Die Teilabschnitte stehen bewusst nicht in der Detail-Datei,
+damit deren Netto-Summen in Excel nicht doppelt zählen. Sie verraten indirekt die
+Pausen- und Sperrzeiten.
 
 Alle Textfelder sind gegen **CSV-/Formelinjektion** geschützt: Werte, die mit `=`, `+`,
 `-`, `@`, Tabulator, Wagenrücklauf oder Zeilenumbruch beginnen (auch als Text exportierte

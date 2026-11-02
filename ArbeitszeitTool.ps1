@@ -33,6 +33,25 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+02.11.2026 - VERSION 1.5.0: TEILABSCHNITTE ZWISCHEN DEN PAUSEN
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (alle Tests gruen,
+         Tests 124a-124o neu); Tages-Editor und Export-Dialog
+         manuell NICHT getestet.
+ - Get-WorkPhases: reine Anzeigeberechnung der Arbeitsphasen
+   je Abschnitt (Abschnitt minus vereinigte Pausenintervalle;
+   Homeoffice: manuelle Pausen + Sperren, Betrieb: feste
+   Betriebspause). Summe der Teilabschnitte = Netto des
+   Abschnitts; jede Unterbrechung trennt.
+ - Tages-Editor: neuer Reiter "Teilabschnitte" (Abschnitt,
+   Teil, Beginn, Ende, Dauer). Berechnet wird nur, solange der
+   Reiter ausgewaehlt ist - nicht dauerhaft im Blickfeld.
+ - CSV-Export: Option "Teilabschnitte als eigene Datei"
+   (Arbeitszeiten_Teilabschnitte_*.csv); die Detail-Datei
+   bleibt unveraendert, damit deren Netto-Summen stimmen.
+ - Unveraendert: erweiterte Ansicht, Sichtschutz, Datenmodell,
+   Berechnung, Speicherung (GitHub-Issue #3).
+--------------------------------------------------
 27.10.2026 - VERSION 1.4.1: VERLAUF - DOPPELKLICK UND
 HORIZONTALES SCROLLEN
 --------------------------------------------------
@@ -871,7 +890,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.4.1'
+$script:AppVersion = '1.5.0'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -3064,6 +3083,59 @@ function Get-SegmentDisplayRows {
             })
     }
     return ,$rows
+}
+
+# Reine ANZEIGE-Berechnung der Teilabschnitte: die Arbeitsphasen jedes
+# Abschnitts zwischen den Pausen (Abschnitt minus vereinigte Pausenintervalle).
+# Homeoffice: manuelle Pausen und Sperrintervalle; Betrieb: feste Betriebspause.
+# Identische Grundlage wie Get-SegmentDisplayRows - die Summe der Teilabschnitte
+# eines Abschnitts entspricht exakt dessen Netto. Jede Unterbrechung trennt.
+# Veraendert keine Daten und loest keinen Speichervorgang aus.
+function Get-WorkPhases {
+    param(
+        [Parameter(Mandatory)]$Day,
+        $Comp = $null,
+        [datetime]$Now = (Get-Date)
+    )
+    if ($null -eq $Comp) { $Comp = Get-DayComputation -Day $Day -Now $Now }
+    $nonWork = New-Object System.Collections.ArrayList
+    foreach ($iv in @($Day.LockIntervals)) { [void]$nonWork.Add($iv) }
+    foreach ($iv in @($Day.ManualPauses)) { [void]$nonWork.Add($iv) }
+    $nonWorkMerged = Merge-TimeIntervals -Intervals $nonWork -Now $Now
+    $phases = New-Object System.Collections.ArrayList
+    $segNo = 0
+    foreach ($seg in $Comp.Segments) {
+        $segNo++
+        $breaks = $nonWorkMerged
+        if ($seg.Mode -eq 'Betrieb') { $breaks = $Comp.PauseWindows }
+        $cuts = New-Object System.Collections.ArrayList
+        $cursor = $seg.Start
+        foreach ($iv in @($breaks | Sort-Object -Property @{ Expression = { $_.Start } })) {
+            if ($null -eq $iv -or $iv.End -le $cursor -or $iv.Start -ge $seg.End) { continue }
+            if ($iv.Start -gt $cursor) { [void]$cuts.Add(@{ Start = $cursor; End = $iv.Start }) }
+            if ($iv.End -gt $cursor) { $cursor = $iv.End }
+        }
+        if ($seg.End -gt $cursor) { [void]$cuts.Add(@{ Start = $cursor; End = $seg.End }) }
+        $partNo = 0
+        foreach ($cut in $cuts) {
+            $partNo++
+            [void]$phases.Add(@{
+                    SegmentNo  = $segNo
+                    Mode       = [string]$seg.Mode
+                    SegStart   = $seg.Start
+                    SegEnd     = $seg.End
+                    SegRunning = [bool]$seg.Running
+                    Part       = $partNo
+                    Start      = $cut.Start
+                    End        = $cut.End
+                    Duration   = ($cut.End - $cut.Start)
+                    # Nur die letzte Phase eines laufenden Abschnitts laeuft - und
+                    # nur, solange sie nicht durch eine offene Pause/Sperre beendet wurde
+                    Running    = ([bool]$seg.Running -and $cut.End -eq $seg.End)
+                })
+        }
+    }
+    return ,$phases
 }
 
 #endregion
@@ -7310,6 +7382,11 @@ $script:DayEditorXaml = @'
                     <DataGrid x:Name="GridLocks" CanUserSortColumns="False"/>
                 </DockPanel>
             </TabItem>
+            <TabItem x:Name="TabPhases" Header="Teilabschnitte" ToolTip="Arbeitsphasen zwischen den Pausen und Sperrzeiten (nur Anzeige)">
+                <DockPanel Margin="4">
+                    <DataGrid x:Name="GridPhases" CanUserSortColumns="False"/>
+                </DockPanel>
+            </TabItem>
             <TabItem x:Name="TabCorrections" Header="Änderungsprotokoll">
                 <DockPanel Margin="4">
                     <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,6,0,0">
@@ -7355,6 +7432,23 @@ function Get-IntervalTable {
     return ,$dt
 }
 
+# Tabelle der Teilabschnitte (Arbeitsphasen zwischen den Pausen) fuer den
+# Reiter im Tageseditor - reine Anzeige auf Basis von Get-WorkPhases
+function Get-WorkPhasesTable {
+    param([Parameter(Mandatory)]$Day, [datetime]$Now = (Get-Date))
+    $dt = New-Object System.Data.DataTable
+    foreach ($col in @('Abschnitt', 'Teil', 'Beginn', 'Ende', 'Dauer')) { [void]$dt.Columns.Add($col) }
+    foreach ($ph in (Get-WorkPhases -Day $Day -Now $Now)) {
+        $segEndText = 'läuft'
+        if (-not $ph.SegRunning) { $segEndText = Format-Clock $ph.SegEnd }
+        $endText = 'läuft'
+        if (-not $ph.Running) { $endText = Format-Clock $ph.End }
+        [void]$dt.Rows.Add(('{0}. {1} ({2}–{3})' -f $ph.SegmentNo, $ph.Mode, (Format-Clock $ph.SegStart), $segEndText),
+            [string]$ph.Part, (Format-Clock $ph.Start), $endText, (Format-Duration $ph.Duration))
+    }
+    return ,$dt
+}
+
 # Tabelle des Aenderungsprotokolls (Korrekturen) eines Tages - in der
 # gespeicherten Reihenfolge (Zeilenindex = Index in Day.Corrections)
 function Get-CorrectionsTable {
@@ -7381,6 +7475,20 @@ function Show-DayEditor {
     $isActive = ($Day.Status -eq 'Aktiv')
     $state = @{ SegIds = @(); PauseIds = @(); LockIds = @() }
 
+    # Teilabschnitte nur berechnen, solange ihr Reiter sichtbar ist; sonst
+    # bleibt die Tabelle leer (nicht dauerhaft im Blickfeld, keine Rechenlast)
+    $refreshPhases = {
+        $grid = $win.FindName('GridPhases')
+        if ($win.FindName('TabPhases').IsSelected) { $grid.ItemsSource = (Get-WorkPhasesTable -Day $Day).DefaultView }
+        else { $grid.ItemsSource = $null }
+    }
+    $win.FindName('TabLists').Add_SelectionChanged({
+            param($src, $e)
+            # SelectionChanged der DataGrids in den Reitern blubbert hier hoch
+            if ($e.OriginalSource -ne $src) { return }
+            & $refreshPhases
+        })
+
     $refresh = {
         Update-DayTotals -Day $Day | Out-Null
         $comp = Get-DayComputation -Day $Day -Now (Get-Date)
@@ -7396,6 +7504,7 @@ function Show-DayEditor {
         $win.FindName('GridPauses').ItemsSource = (Get-IntervalTable -Intervals $Day.ManualPauses).DefaultView
         $win.FindName('GridLocks').ItemsSource = (Get-IntervalTable -Intervals $Day.LockIntervals).DefaultView
         $win.FindName('GridCorrections').ItemsSource = (Get-CorrectionsTable -Corrections $Day.Corrections).DefaultView
+        & $refreshPhases
         $win.FindName('TabPauses').Header = 'Manuelle Pausen ({0})' -f $state.PauseIds.Count
         $win.FindName('TabLocks').Header = 'Sperrintervalle ({0})' -f $state.LockIds.Count
         $win.FindName('TabCorrections').Header = 'Änderungsprotokoll ({0})' -f @(@($Day.Corrections) | Where-Object { $null -ne $_ }).Count
@@ -7935,7 +8044,10 @@ function Export-WorkDataCsv {
     param(
         [Parameter(Mandatory)]$Days,
         [string]$Suffix = 'Export',
-        [bool]$IncludeDetail = $false
+        [bool]$IncludeDetail = $false,
+        # Eigene Datei mit den Teilabschnitten (Arbeitsphasen zwischen den Pausen);
+        # bewusst nicht in der Detail-Datei, damit deren Netto-Summen stimmen
+        [bool]$IncludePhases = $false
     )
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     $utf8Bom = New-Object System.Text.UTF8Encoding($true)
@@ -7948,6 +8060,8 @@ function Export-WorkDataCsv {
     [void]$lines.Add(($header -join ';'))
     $detailLines = New-Object System.Collections.ArrayList
     [void]$detailLines.Add((@('Datum', 'Modus', 'Beginn', 'Ende', 'Bruttozeit', 'Pausenzeit', 'Nettozeit', 'Manuell erfasst', 'Korrigiert', 'Kommentar') -join ';'))
+    $phaseLines = New-Object System.Collections.ArrayList
+    [void]$phaseLines.Add((@('Datum', 'Abschnitt', 'Modus', 'Abschnitt Beginn', 'Teil', 'Beginn', 'Ende', 'Dauer') -join ';'))
     # Kommentare einzeilig (Zeilenumbrueche als ' / '), ungekuerzt
     $csvComment = { param($Item) Get-CommentPreview -Text (Get-ItemComment -Item $Item) -MaxLength ([int]$script:CommentConst.MaxLength * 4) }
 
@@ -7993,6 +8107,18 @@ function Export-WorkDataCsv {
                 [void]$detailLines.Add((($detailRow | ForEach-Object { Get-CsvEscaped ([string]$_) }) -join ';'))
             }
         }
+
+        if ($IncludePhases) {
+            foreach ($ph in (Get-WorkPhases -Day $day -Comp $comp -Now $refTime)) {
+                $phEnd = Format-Clock $ph.End
+                if ($ph.Running) { $phEnd = 'läuft' }
+                $phaseRow = @(
+                    $dayDate.ToString('dd.MM.yyyy'), [string]$ph.SegmentNo, $ph.Mode, (Format-Clock $ph.SegStart),
+                    [string]$ph.Part, (Format-Clock $ph.Start), $phEnd, (Format-Duration $ph.Duration)
+                )
+                [void]$phaseLines.Add((($phaseRow | ForEach-Object { Get-CsvEscaped ([string]$_) }) -join ';'))
+            }
+        }
     }
 
     $mainPath = Join-Path $script:Paths.Exports ("Arbeitszeiten_{0}_{1}.csv" -f $Suffix, $stamp)
@@ -8002,6 +8128,11 @@ function Export-WorkDataCsv {
         $detailPath = Join-Path $script:Paths.Exports ("Arbeitszeiten_Detail_{0}_{1}.csv" -f $Suffix, $stamp)
         [System.IO.File]::WriteAllLines($detailPath, [string[]]$detailLines.ToArray(), $utf8Bom)
         [void]$written.Add($detailPath)
+    }
+    if ($IncludePhases) {
+        $phasePath = Join-Path $script:Paths.Exports ("Arbeitszeiten_Teilabschnitte_{0}_{1}.csv" -f $Suffix, $stamp)
+        [System.IO.File]::WriteAllLines($phasePath, [string[]]$phaseLines.ToArray(), $utf8Bom)
+        [void]$written.Add($phasePath)
     }
     Write-AppLog -Message ('CSV-Export erstellt: ' + ($written.ToArray() -join ', '))
     return ,$written
@@ -8030,6 +8161,9 @@ $script:ExportXaml = @'
         <CheckBox x:Name="ChkDetail" Margin="0,10,0,0">
             <TextBlock Text="Zusätzlich Detail-Export (eine Zeile pro Arbeitsabschnitt)" TextWrapping="Wrap"/>
         </CheckBox>
+        <CheckBox x:Name="ChkPhases" Margin="0,4,0,0">
+            <TextBlock Text="Zusätzlich Teilabschnitte als eigene Datei (Arbeitsphasen zwischen den Pausen)" TextWrapping="Wrap"/>
+        </CheckBox>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
             <Button x:Name="BtnOk" Content="Exportieren" IsDefault="True" Width="120" Height="30" Margin="0,0,8,0" Padding="4,2"/>
             <Button x:Name="BtnCancel" Content="Abbrechen" IsCancel="True" Width="120" Height="30" Margin="0" Padding="4,2"/>
@@ -8050,6 +8184,7 @@ function Show-ExportDialog {
     $win.FindName('TxtTo').Text = $today.ToString('dd.MM.yyyy')
     $win.FindName('BtnOk').Add_Click({
             $detail = [bool]$win.FindName('ChkDetail').IsChecked
+            $phases = [bool]$win.FindName('ChkPhases').IsChecked
             $days = $null
             $suffix = ''
             if ($win.FindName('RbAll').IsChecked) {
@@ -8102,7 +8237,7 @@ function Show-ExportDialog {
                 "oder Cloud-Diensten gelesen werden.`r`n`r`nSoll der Export trotzdem erstellt werden?")
             if (-not (Confirm-Question -Message $warnText -Title 'Unverschlüsselter CSV-Export')) { return }
             try {
-                $files = Export-WorkDataCsv -Days $days -Suffix $suffix -IncludeDetail $detail
+                $files = Export-WorkDataCsv -Days $days -Suffix $suffix -IncludeDetail $detail -IncludePhases $phases
                 Show-Info -Message ("Export abgeschlossen:`r`n`r`n" + (($files | ForEach-Object { [string]$_ }) -join "`r`n") +
                     "`r`n`r`nHinweis: Die Dateien sind unverschlüsselt.")
             }
