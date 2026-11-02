@@ -33,6 +33,24 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+02.11.2026 - VERSION 1.5.1: ABSTURZ BEI TAGEN MIT MEHREREN
+ABSCHNITTEN
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (alle Tests gruen,
+         Tests 125a-125d neu; Gegenprobe mit altem Stand
+         schlaegt fehl).
+ - Get-AutoEndSuggestedEnd und Find-DayMaxNettoReachedTime:
+   foreach ueber @(Get-ParsedSegments) verpackte die
+   Abschnittsliste als EIN Element (Fehler seit 1.0.0). Ab zwei
+   Abschnitten (z. B. nach Moduswechsel):
+   * Absturz bei jedem Start in der Vortagsklaerung
+     ("Unerwarteter Fehler - die Anwendung wird beendet")
+   * 10-Stunden-Stopp im Haupt-Timer schlug jede Sekunde fehl
+     (kein Stopp, keine Anzeigeaktualisierung, Protokollflut)
+ - Fehlerdialog zeigt zusaetzlich die technische Kurzmeldung
+   (ohne Stacktrace); bisher nur im Protokoll.
+ - Unveraendert: Tresorformat, Datenmodell, gespeicherte Daten.
+--------------------------------------------------
 02.11.2026 - VERSION 1.5.0: TEILABSCHNITTE ZWISCHEN DEN PAUSEN
 --------------------------------------------------
  Status: umgesetzt, automatisiert getestet (alle Tests gruen,
@@ -890,7 +908,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.5.0'
+$script:AppVersion = '1.5.1'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -1050,8 +1068,14 @@ function Show-AppError {
         try { Write-Host ('(Testlauf-Fehler) ' + $Message + $detail) -ForegroundColor DarkYellow } catch { }
         return
     }
+    # Technische Kurzmeldung auch im Dialog (ohne Stacktrace) - sonst ist die
+    # Ursache vor Ort nur ueber das verschluesselte Protokoll ermittelbar
+    $shown = $Message
+    if ($ErrorRecord -and $ErrorRecord.Exception) {
+        $shown += "`r`n`r`nTechnisch: " + $ErrorRecord.Exception.Message
+    }
     try {
-        [System.Windows.MessageBox]::Show($Message, 'ArbeitszeitTool - Fehler',
+        [System.Windows.MessageBox]::Show($shown, 'ArbeitszeitTool - Fehler',
             [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
     }
     catch { }
@@ -3759,7 +3783,9 @@ function Find-DayMaxNettoReachedTime {
     $tol = [TimeSpan]::FromMilliseconds(20)
     if ((Get-DayNettoAtTime -Day $Day -Time $Cutoff) -lt $maxTs) { return $null }
     $lo = $null
-    foreach ($seg in @(Get-ParsedSegments -Day $Day -Now $Cutoff)) {
+    # Ohne @(): Get-ParsedSegments liefert bereits ein Array (return ,@(...));
+    # @() wuerde es als EIN Element verpacken (Fehler ab zwei Abschnitten)
+    foreach ($seg in (Get-ParsedSegments -Day $Day -Now $Cutoff)) {
         if ($null -eq $lo -or $seg.Start -lt $lo) { $lo = $seg.Start }
     }
     if ($null -eq $lo) { return $null }
@@ -3864,7 +3890,8 @@ function Get-AutoEndSuggestedEnd {
     }
     $beginn = $null
     $workEnd = $null
-    foreach ($seg in @(Get-ParsedSegments -Day $Day -Now $limit)) {
+    # Ohne @() - siehe Find-DayMaxNettoReachedTime
+    foreach ($seg in (Get-ParsedSegments -Day $Day -Now $limit)) {
         if ($null -eq $beginn -or $seg.Start -lt $beginn) { $beginn = $seg.Start }
         $e = $seg.End
         if ($e -gt $limit) { $e = $limit }

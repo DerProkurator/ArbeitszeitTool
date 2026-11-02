@@ -3037,6 +3037,40 @@ function Invoke-InternalTests {
             Write-Host ('[SKIP] Test 124o (UI): in dieser Umgebung nicht ausfuehrbar: ' + $_.Exception.Message) -ForegroundColor Yellow
         }
 
+        # --- Tests 125: Tage mit MEHREREN Abschnitten (Regression: @(Get-ParsedSegments)
+        # verpackte die Abschnittsliste als ein Element -> Absturz beim Start in der
+        # Vortagsklaerung bzw. im Haupt-Timer beim 10-Stunden-Stopp) ---
+        $d125 = New-TestDay -DateText $yesterdayText
+        Add-TestSegment -Day $d125 -Mode 'Homeoffice' -StartText '08:00' -EndText '12:00' | Out-Null
+        Add-TestSegment -Day $d125 -Mode 'Betrieb' -StartText '12:30' -EndText '16:00' | Out-Null
+        $midnight125 = (Get-DayDateTime -DayDate $yesterdayText -TimeText '00:00').AddDays(1)
+        & $assert 'Test 125a: Endvorschlag bei zwei abgeschlossenen Abschnitten = Ende des letzten (16:00)' "$yesterdayText 16:00:00" (ConvertTo-DateTimeString (Get-AutoEndSuggestedEnd -Day $d125 -Cutoff $midnight125))
+        # Tageswechsel nach Moduswechsel, PC ab 16:30 gesperrt: Start-Klaerung laeuft durch
+        $d125b = New-TestDay -DateText $yesterdayText
+        Add-TestSegment -Day $d125b -Mode 'Homeoffice' -StartText '08:00' -EndText '12:00' | Out-Null
+        Add-TestSegment -Day $d125b -Mode 'Homeoffice' -StartText '12:30' | Out-Null
+        Add-TestInterval -Day $d125b -ListName 'LockIntervals' -StartText '16:30' | Out-Null
+        Invoke-MidnightRolloverIfNeeded -Day $d125b | Out-Null
+        $sugg125b = Get-AutoEndSuggestedEnd -Day $d125b -Cutoff $midnight125
+        $flow125b = Invoke-AutoEndReviewFlow -Day $d125b -ChoiceResolver { param($d, $c, $a) @{ Choice = 'Bestaetigen'; EndTime = $null } }
+        $comp125b = Get-DayComputation -Day $d125b -Now (ConvertFrom-DateTimeString $d125b.EndedAt)
+        & $assert 'Test 125b: Vortagsklaerung mit zwei Abschnitten - Vorschlag 16:30, Bestaetigen ohne Fehler, Netto 08:00' "$yesterdayText 16:30:00|True|$yesterdayText 16:30:00|08:00" ("$(ConvertTo-DateTimeString $sugg125b)|$flow125b|$($d125b['EndedAt'])|$(Format-Duration $comp125b.Netto)")
+        # 10-Stunden-Zeitpunkt ueber mehrere Abschnitte (direkt anschliessend bzw. mit Luecke)
+        $d125c = New-TestDay
+        Add-TestSegment -Day $d125c -Mode 'Homeoffice' -StartText '07:00' -EndText '12:00' | Out-Null
+        Add-TestSegment -Day $d125c -Mode 'Homeoffice' -StartText '12:00' | Out-Null
+        $d125d = New-TestDay
+        Add-TestSegment -Day $d125d -Mode 'Homeoffice' -StartText '07:00' -EndText '12:00' | Out-Null
+        Add-TestSegment -Day $d125d -Mode 'Homeoffice' -StartText '13:00' | Out-Null
+        & $assert 'Test 125c: 10:00 erreicht ueber zwei Abschnitte - 17:00 ohne, 18:00 mit einer Stunde Luecke' '2026-07-10 17:00:00|2026-07-10 18:00:00' ("$(ConvertTo-DateTimeString (Find-DayMaxNettoReachedTime -Day $d125c -Cutoff (Get-TestNow $d125c '18:00')))|$(ConvertTo-DateTimeString (Find-DayMaxNettoReachedTime -Day $d125d -Cutoff (Get-TestNow $d125d '19:00')))")
+        # Auto-Stopp im Haupt-Timer nach Moduswechsel
+        $d125e = New-TestDay
+        Add-TestSegment -Day $d125e -Mode 'Homeoffice' -StartText '06:00' -EndText '11:00' | Out-Null
+        Add-TestSegment -Day $d125e -Mode 'Homeoffice' -StartText '11:30' | Out-Null
+        $stopped125e = Invoke-AutoStopIfNeeded -Day $d125e -Now (Get-TestNow $d125e '20:00')
+        $comp125e = Get-DayComputation -Day $d125e -Now (Get-TestNow $d125e '20:00')
+        & $assert 'Test 125d: Auto-Stopp bei zwei Abschnitten - Ende 16:30, Netto exakt 10:00' 'True|16:30|10:00|True' ("$stopped125e|$(Format-Clock (ConvertFrom-DateTimeString $d125e.Segments[1].End))|$(Format-Duration $comp125e.Netto)|$($d125e.MaxReached)")
+
         Clear-VaultKeys -Keys $newKeys116
         Clear-VaultKeys -Keys $keysF116
         [ArbeitszeitTool.VaultCrypto]::ClearBytes($newPwd116)
