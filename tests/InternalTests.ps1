@@ -3100,11 +3100,62 @@ function Invoke-InternalTests {
         & $assert 'Test 126b: $null/leere Bytes abgelehnt (Datei nicht gekuerzt), kein Mandatory an $Bytes im Quelltext' 'abgelehnt,abgelehnt,abgelehnt|3|False' ("$($reject126 -join ',')|$len126|$($src126 -match '\[Parameter\(Mandatory\)\]\[byte\[\]\]\$Bytes')")
         # Checkpoint: genau EINE Vollpruefung (Journal), Hauptdatei byte-identisch
         $readCount126 = @{ N = 0 }
-        $origRead126 = ${function:Read-VaultFromFile}
-        ${function:Read-VaultFromFile} = { $readCount126.N++; & $origRead126 @args }.GetNewClosure()
+        $origRead126 = ${function:Read-VaultFromBytes}
+        ${function:Read-VaultFromBytes} = { $readCount126.N++; & $origRead126 @args }.GetNewClosure()
         try { $saved126 = Save-Vault -Quiet -NoBackupRotation }
-        finally { ${function:Read-VaultFromFile} = $origRead126 }
+        finally { ${function:Read-VaultFromBytes} = $origRead126 }
         & $assert 'Test 126c: Checkpoint gespeichert, eine Vollpruefung, Haupt- und Journaldatei identisch' 'True|1|True' ("$saved126|$($readCount126.N)|$((Get-FileSha256Hex -Path $script:Paths.VaultFile) -eq (Get-FileSha256Hex -Path $script:Paths.VaultPending))")
+
+        # --- Tests 127: Referenzhash aus dem gelesenen Byte-Stand (Audit AZT-SEC-01) ---
+        # Eigener Ordner mit frischem Tresor (Revision 10, 07:00); "fremder"
+        # gueltiger Stand Revision 20 / 08:00 kommt z. B. per Cloud-Sync.
+        $paths127Before = $script:Paths
+        $root127 = Join-Path $testRoot5 'sec01'
+        New-Item -ItemType Directory -Path (Join-Path $root127 'Data') -Force | Out-Null
+        $script:Paths = (& $newTestPaths $root127)
+        Initialize-AppState
+        $script:App.Settings = Get-DefaultSettings
+        Set-VaultSessionKeys -Keys (& $cloneKeys $keys) -Salt $salt -Iterations $iter
+        $v127 = New-VaultDataObject
+        $v127['Revision'] = [long]10
+        Write-VaultToFile -Path $script:Paths.VaultFile -Vault $v127 -AesKey $keys.Aes -HmacKey $keys.Hmac -Salt $salt -Iterations $iter
+        $ext127 = New-VaultDataObject
+        $ext127['Revision'] = [long]20
+        $ext127['Settings']['RegularTime'] = '08:00'
+        $extBytes127 = ConvertTo-VaultFileBytes -Vault $ext127 -AesKey $keys.Aes -HmacKey $keys.Hmac -Salt $salt -Iterations $iter
+        # Scan liefert Hash der gelesenen Bytes; danach ersetzt der Sync die Datei
+        $scan127 = Get-VaultCandidates -PasswordBytes $testPwdBytes
+        $sel127 = @($scan127.Candidates | Where-Object { $_.Valid -and $_.Kind -eq 'Haupt' })[0]
+        $scanHashOk127 = ($scan127.Main.Existed -and $scan127.Main.Hash -eq (Get-FileSha256Hex -Path $script:Paths.VaultFile) -and $sel127.Hash -eq $scan127.Main.Hash)
+        $unchanged127 = Test-VaultScanMainChanged -MainSnapshot $scan127.Main
+        [System.IO.File]::WriteAllBytes($script:Paths.VaultFile, $extBytes127)
+        $changed127 = Test-VaultScanMainChanged -MainSnapshot $scan127.Main
+        & $assert 'Test 127a: Scan merkt Hash der gelesenen Hauptdatei; Aenderung danach wird erkannt' 'True|False|True' ("$scanHashOk127|$unchanged127|$changed127")
+        # Selbst wenn der gescannte Stand trotzdem aktiviert wird: kein stilles Ueberschreiben
+        Clear-UnusedScanKeys -KeyCache $scan127.KeyCache -KeepKeys $null
+        Set-ActiveVault -Vault $sel127.Vault
+        Set-VaultLoadReference -Kind 'Haupt' -Revision $sel127.Revision -MainSnapshot $scan127.Main
+        $saved127 = Save-Vault -Quiet -NoBackupRotation
+        $disk127 = Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $keys.Aes -HmacKey $keys.Hmac
+        $rec127 = @(Get-ChildItem -LiteralPath $script:Paths.Recovery -Filter 'vault-*.azt' -ErrorAction SilentlyContinue).Count
+        & $assert 'Test 127b: Speichern meldet Konflikt, fremder Stand (Revision 20, 08:00) bleibt erhalten, eigener Stand in Recovery' 'False|20|08:00|1' ("$saved127|$($disk127['Revision'])|$($disk127['Settings']['RegularTime'])|$rec127")
+        # Hauptdatei unveraendert / neu angelegt / entfernt seit dem Scan
+        $snap127 = @{ Existed = $true; Hash = (Get-FileSha256Hex -Path $script:Paths.VaultFile) }
+        $same127 = Test-VaultScanMainChanged -MainSnapshot $snap127
+        $new127 = Test-VaultScanMainChanged -MainSnapshot @{ Existed = $false; Hash = $null }
+        $keep127 = [System.IO.File]::ReadAllBytes($script:Paths.VaultFile)
+        Remove-Item -LiteralPath $script:Paths.VaultFile -Force
+        $gone127 = Test-VaultScanMainChanged -MainSnapshot $snap127
+        [System.IO.File]::WriteAllBytes($script:Paths.VaultFile, $keep127)
+        & $assert 'Test 127c: unveraenderte Hauptdatei nicht gemeldet, neu angelegte und entfernte erkannt' 'False|True|True' ("$same127|$new127|$gone127")
+        # Container aus Bytes identisch zum Dateiweg (inkl. BOM), leere Bytes abgelehnt
+        $cFile127 = Read-VaultContainerFromFile -Path $script:Paths.VaultFile
+        $cBytes127 = Read-VaultContainerFromBytes -Bytes $extBytes127
+        $emptyRej127 = $false
+        try { Read-VaultContainerFromBytes -Bytes (New-Object byte[] 0) | Out-Null } catch { $emptyRej127 = ($_.Exception.Message -eq 'VAULT_INVALID') }
+        & $assert 'Test 127d: Container aus Byte-Snapshot identisch zum Dateiweg, leere Bytes -> VAULT_INVALID' 'True|True' ("$([Convert]::ToBase64String($cFile127.Hmac) -eq [Convert]::ToBase64String($cBytes127.Hmac))|$emptyRej127")
+        Clear-VaultSessionKeys
+        $script:Paths = $paths127Before
 
         Clear-VaultKeys -Keys $newKeys116
         Clear-VaultKeys -Keys $keysF116

@@ -33,6 +33,29 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+02.11.2026 - VERSION 1.5.3: REFERENZHASH AUS DEM GELESENEN STAND
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (alle Tests gruen,
+         Tests 127a-127d neu); Entsperrdialog manuell NICHT
+         getestet. Security-Audit 02.11.2026, AZT-SEC-01.
+ - Problem: Beim Entsperren wurde der Inhalt im Kandidatenscan
+   gelesen, der Referenzhash der Hauptdatei aber spaeter durch
+   erneutes Oeffnen gebildet. Ersetzte ein Cloud-Sync die Datei
+   dazwischen (z. B. waehrend des Wiederherstellungsdialogs),
+   ueberschrieb das naechste Speichern den neueren Stand still.
+ - Read-VaultFileSnapshot: jede Tresordatei wird genau einmal
+   gelesen (Groessenpruefung unter demselben Handle); Container,
+   HMAC, Inhalt und Hash stammen aus diesem Byte-Snapshot
+   (Read-VaultContainerFromBytes, Read-VaultFromBytes).
+ - Get-VaultCandidates liefert den Zustand der Hauptdatei beim
+   Scan (Existed/Hash); Set-VaultLoadReference -MainSnapshot
+   uebernimmt ihn statt neu zu lesen.
+ - Nach der Auswahl (ggf. Wiederherstellungsdialog) wird eine
+   seitdem veraenderte Hauptdatei erkannt: erneutes Entsperren
+   mit dem aktuellen Stand statt Uebernahme des alten.
+ - Journalpruefung in Save-Vault: Hashvergleich und
+   Vollpruefung auf demselben Byte-Snapshot.
+--------------------------------------------------
 02.11.2026 - VERSION 1.5.2: SPEICHERZYKLUS OHNE EINFRIEREN
 --------------------------------------------------
  Status: umgesetzt, automatisiert getestet (alle Tests gruen,
@@ -1005,7 +1028,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.5.2'
+$script:AppVersion = '1.5.3'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -1374,16 +1397,49 @@ function Protect-VaultContainer {
 
 # Liest und validiert einen Container von der Platte (nur Header/Metadaten,
 # noch keine Entschluesselung). Wirft 'VAULT_INVALID' bzw. 'VAULT_NEWER'.
+# Liest eine Tresordatei GENAU EINMAL als Byte-Stand (Snapshot) samt SHA-256.
+# Groessenpruefung und Lesen erfolgen unter demselben Handle; FileShare.Read
+# schliesst fremde Schreiber waehrend des Lesens aus. Pruefung, Inhalt und
+# Referenzhash werden aus diesem einen Snapshot abgeleitet - ein erneutes
+# Oeffnen koennte einen inzwischen (z. B. per Cloud-Sync) ersetzten Stand
+# liefern (Audit AZT-SEC-01).
+function Read-VaultFileSnapshot {
+    param([Parameter(Mandatory)][string]$Path)
+    $stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        # Plausibilitaet VOR dem Einlesen: uebergrosse Dateien werden abgelehnt,
+        # ohne dass ihr Inhalt in den Speicher geladen wird.
+        if ($stream.Length -gt $script:VaultConst.MaxFileBytes) {
+            throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
+        }
+        $ms = New-Object System.IO.MemoryStream
+        try { $stream.CopyTo($ms); $bytes = $ms.ToArray() }
+        finally { $ms.Dispose() }
+    }
+    finally { $stream.Dispose() }
+    # Hash direkt (auch fuer eine leere Datei - deren Zustand ist ebenfalls Referenz)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = [System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '' }
+    finally { $sha.Dispose() }
+    return @{ Bytes = $bytes; Hash = $hash }
+}
+
 function Read-VaultContainerFromFile {
     param([Parameter(Mandatory)][string]$Path)
-    # Plausibilitaet VOR dem Einlesen: uebergrosse Dateien werden abgelehnt,
-    # ohne dass ihr Inhalt in den Speicher geladen wird.
-    $fileInfo = New-Object System.IO.FileInfo $Path
-    if (-not $fileInfo.Exists) { throw (New-Object System.IO.FileNotFoundException $Path) }
-    if ($fileInfo.Length -gt $script:VaultConst.MaxFileBytes) {
-        throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
-    }
-    $raw = [System.IO.File]::ReadAllText($Path)
+    return (Read-VaultContainerFromBytes -Bytes (Read-VaultFileSnapshot -Path $Path).Bytes)
+}
+
+# Prueft und zerlegt einen Tresorcontainer aus einem Byte-Snapshot.
+# $Bytes bewusst ohne Mandatory (siehe Write-FileInPlace).
+function Read-VaultContainerFromBytes {
+    param([byte[]]$Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { throw (New-Object System.InvalidOperationException 'VAULT_INVALID') }
+    if ($Bytes.Length -gt $script:VaultConst.MaxFileBytes) { throw (New-Object System.InvalidOperationException 'VAULT_INVALID') }
+    # Dekodierung wie File.ReadAllText: UTF-8, BOM-Erkennung
+    $ms = New-Object System.IO.MemoryStream(, $Bytes)
+    $reader = New-Object System.IO.StreamReader($ms, [System.Text.Encoding]::UTF8, $true)
+    try { $raw = $reader.ReadToEnd() }
+    finally { $reader.Dispose() }
     if ([string]::IsNullOrWhiteSpace($raw)) { throw (New-Object System.InvalidOperationException 'VAULT_INVALID') }
     $obj = $null
     try { $obj = ConvertTo-PlainObject ($raw | ConvertFrom-Json) }
@@ -1658,7 +1714,18 @@ function Read-VaultFromFile {
         [Parameter(Mandatory)][byte[]]$AesKey,
         [Parameter(Mandatory)][byte[]]$HmacKey
     )
-    $container = Read-VaultContainerFromFile -Path $Path
+    return (Read-VaultFromBytes -Bytes (Read-VaultFileSnapshot -Path $Path).Bytes -AesKey $AesKey -HmacKey $HmacKey)
+}
+
+# Wie Read-VaultFromFile, aber auf einem bereits gelesenen Byte-Snapshot
+# (Read-VaultFileSnapshot). $Bytes bewusst ohne Mandatory (siehe Write-FileInPlace).
+function Read-VaultFromBytes {
+    param(
+        [byte[]]$Bytes,
+        [Parameter(Mandatory)][byte[]]$AesKey,
+        [Parameter(Mandatory)][byte[]]$HmacKey
+    )
+    $container = Read-VaultContainerFromBytes -Bytes $Bytes
     $plainJson = Unprotect-VaultContainer -Container $container -AesKey $AesKey -HmacKey $HmacKey
     $vault = $null
     try { $vault = ConvertTo-PlainObject ($plainJson | ConvertFrom-Json) }
@@ -2124,8 +2191,9 @@ function Save-Vault {
             # spiegelt das Journal die Hauptdatei; dann entfaellt die Pruefung.
             if ($null -ne $oldPendingBytes -and -not ($null -ne $oldMainBytes -and
                     (Get-BytesSha256Hex -Bytes $oldPendingBytes) -eq (Get-BytesSha256Hex -Bytes $oldMainBytes))) {
+                # Pruefung auf genau den gemerkten Bytes (kein erneutes Oeffnen)
                 try {
-                    Read-VaultFromFile -Path $script:Paths.VaultPending `
+                    Read-VaultFromBytes -Bytes $oldPendingBytes `
                         -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey | Out-Null
                 }
                 catch { $oldPendingUnreadable = $oldPendingBytes; $oldPendingBytes = $null }
@@ -2133,15 +2201,17 @@ function Save-Vault {
         }
         $journalTouched = $true
         Write-FileInPlace -Path $script:Paths.VaultPending -Bytes $newBytes
-        $verify = Read-VaultFromFile -Path $script:Paths.VaultPending `
-            -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
-        if ([long]$verify['Revision'] -ne [long]$vault['Revision']) {
+        # EIN Byte-Snapshot des Journals: Hashvergleich und Vollpruefung (HMAC,
+        # Entschluesselung, JSON, Struktur, Revision) betreffen dieselben Bytes.
+        # Das Journal enthaelt damit nachweislich exakt $newBytes, und die
+        # Pruefung gilt fuer jede Datei mit identischen Bytes (Hauptdatei, Schritt 6).
+        $pendingSnapshot = Read-VaultFileSnapshot -Path $script:Paths.VaultPending
+        if ($pendingSnapshot.Hash -ne (Get-BytesSha256Hex -Bytes $newBytes)) {
             throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
         }
-        # Das Journal enthaelt nachweislich exakt $newBytes - diese EINE
-        # Vollpruefung (HMAC, Entschluesselung, JSON, Struktur, Revision) gilt
-        # damit fuer jede Datei mit identischen Bytes (Hauptdatei, Schritt 6)
-        if ((Get-FileSha256Hex -Path $script:Paths.VaultPending) -ne (Get-BytesSha256Hex -Bytes $newBytes)) {
+        $verify = Read-VaultFromBytes -Bytes $pendingSnapshot.Bytes `
+            -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
+        if ([long]$verify['Revision'] -ne [long]$vault['Revision']) {
             throw (New-Object System.InvalidOperationException 'VAULT_INVALID')
         }
         # 6. Hauptdatei in-place ueberschreiben und vollstaendig pruefen.
@@ -8952,13 +9022,24 @@ function Set-ActiveVault {
 #  - Der Hash ist nur dann $null, wenn beim Entsperren keine Hauptdatei
 #    vorhanden war (oder die Hash-Berechnung selbst fehlschlug; dieser Fall
 #    wird beim Speichern konservativ als "nicht vergleichbar" behandelt).
+#  -MainSnapshot: Zustand der Hauptdatei aus dem Kandidatenscan
+#   (Get-VaultCandidates: Existed/Hash der TATSAECHLICH gelesenen Bytes).
+#   Beim Entsperren immer zu uebergeben - ein erneutes Lesen koennte einen
+#   inzwischen per Cloud-Sync ersetzten Stand als Referenz uebernehmen, der
+#   beim naechsten Speichern still ueberschrieben wuerde (Audit AZT-SEC-01).
 function Set-VaultLoadReference {
     param(
         [Parameter(Mandatory)][string]$Kind,
-        [Parameter(Mandatory)][long]$Revision
+        [Parameter(Mandatory)][long]$Revision,
+        $MainSnapshot = $null
     )
     $script:App.LoadedFrom = $Kind
     $script:App.VaultLoadedRevision = $Revision
+    if ($null -ne $MainSnapshot) {
+        $script:App.VaultFileExistedAtLoad = [bool]$MainSnapshot.Existed
+        $script:App.VaultFileHash = $MainSnapshot.Hash
+        return
+    }
     $script:App.VaultFileExistedAtLoad = (Test-Path -LiteralPath $script:Paths.VaultFile)
     $script:App.VaultFileHash = $null
     if ($script:App.VaultFileExistedAtLoad) {
@@ -8966,8 +9047,26 @@ function Set-VaultLoadReference {
     }
 }
 
+# Hat sich die Hauptdatei seit dem Kandidatenscan veraendert (neu angelegt,
+# entfernt oder anderer Inhalt)? Dient nach Auswahl-/Wiederherstellungsdialog
+# beim Entsperren dazu, einen zwischenzeitlich synchronisierten Stand zu
+# erkennen, statt ihn spaeter zu ueberschreiben.
+function Test-VaultScanMainChanged {
+    param([Parameter(Mandatory)]$MainSnapshot)
+    $existsNow = Test-Path -LiteralPath $script:Paths.VaultFile
+    if ($existsNow -ne [bool]$MainSnapshot.Existed) { return $true }
+    if (-not $existsNow) { return $false }
+    $hashNow = $null
+    try { $hashNow = Get-FileSha256Hex -Path $script:Paths.VaultFile } catch { return $true }
+    return ($null -eq $MainSnapshot.Hash -or $hashNow -ne $MainSnapshot.Hash)
+}
+
 # Prueft alle Tresordateien (Haupt, Pending, Backups) kryptografisch und
 # strukturell. Die Schluessel werden pro Salt nur einmal abgeleitet.
+# Jede Datei wird genau einmal gelesen (Read-VaultFileSnapshot); Pruefung,
+# Inhalt und Hash stammen aus diesem Snapshot. Main beschreibt den Zustand
+# der Hauptdatei beim Scan (Existed/Hash) - auch wenn sie unbrauchbar ist -
+# und ist die Referenz fuer Set-VaultLoadReference -MainSnapshot.
 function Get-VaultCandidates {
     param([Parameter(Mandatory)][byte[]]$PasswordBytes)
     $files = @(
@@ -8978,17 +9077,22 @@ function Get-VaultCandidates {
     )
     $keyCache = @{}
     $candidates = New-Object System.Collections.ArrayList
+    $main = @{ Existed = $false; Hash = $null }
     foreach ($file in $files) {
         if (-not (Test-Path -LiteralPath $file.Path)) { continue }
-        $entry = @{ Path = $file.Path; Kind = $file.Kind; Valid = $false; Vault = $null; Keys = $null; Salt = $null; Iterations = 0; Revision = [long]-1 }
+        if ($file.Kind -eq 'Haupt') { $main.Existed = $true }
+        $entry = @{ Path = $file.Path; Kind = $file.Kind; Valid = $false; Vault = $null; Keys = $null; Salt = $null; Iterations = 0; Revision = [long]-1; Hash = $null }
         try {
-            $container = Read-VaultContainerFromFile -Path $file.Path
+            $snapshot = Read-VaultFileSnapshot -Path $file.Path
+            $entry.Hash = $snapshot.Hash
+            if ($file.Kind -eq 'Haupt') { $main.Hash = $snapshot.Hash }
+            $container = Read-VaultContainerFromBytes -Bytes $snapshot.Bytes
             $cacheKey = [Convert]::ToBase64String($container.Salt) + '|' + $container.Iterations
             if (-not $keyCache.ContainsKey($cacheKey)) {
                 $keyCache[$cacheKey] = Get-VaultKeysFromPassword -PasswordBytes $PasswordBytes -Salt $container.Salt -Iterations $container.Iterations
             }
             $keys = $keyCache[$cacheKey]
-            $vault = Read-VaultFromFile -Path $file.Path -AesKey $keys.Aes -HmacKey $keys.Hmac
+            $vault = Read-VaultFromBytes -Bytes $snapshot.Bytes -AesKey $keys.Aes -HmacKey $keys.Hmac
             $entry.Valid = $true
             $entry.Vault = $vault
             $entry.Keys = $keys
@@ -8999,7 +9103,7 @@ function Get-VaultCandidates {
         catch { }
         [void]$candidates.Add($entry)
     }
-    return @{ Candidates = $candidates; KeyCache = $keyCache }
+    return @{ Candidates = $candidates; KeyCache = $keyCache; Main = $main }
 }
 
 # Gibt alle abgeleiteten Schluessel eines Scans frei - ausser dem ausgewaehlten
@@ -9216,6 +9320,18 @@ function Invoke-VaultUnlockFlow {
             $selected = $main
         }
 
+        # Hauptdatei seit dem Scan veraendert (z. B. SharePoint-/OneDrive-
+        # Synchronisierung, waehrend der Auswahldialog offen war)? Dann den
+        # gescannten Stand NICHT uebernehmen, sondern neu entsperren - so wird
+        # der aktuelle Stand geladen statt spaeter still ueberschrieben.
+        if (Test-VaultScanMainChanged -MainSnapshot $scan.Main) {
+            Clear-UnusedScanKeys -KeyCache $scan.KeyCache -KeepKeys $null
+            Write-AppLog -Level 'WARN' -Message 'Tresordatei wurde während des Entsperrens extern verändert - Entsperren wird mit dem aktuellen Stand wiederholt.'
+            Show-Warning -Message ('Die Tresordatei wurde während des Entsperrens außerhalb dieser Anwendung verändert (z. B. durch eine Cloud-Synchronisierung). ' +
+                'Damit der aktuelle Stand geladen wird, bitte den Tresor erneut entsperren.') -Title 'Datentresor'
+            continue
+        }
+
         Clear-UnusedScanKeys -KeyCache $scan.KeyCache -KeepKeys $selected.Keys
         Set-VaultSessionKeys -Keys $selected.Keys -Salt $selected.Salt -Iterations $selected.Iterations
         Set-ActiveVault -Vault $selected.Vault
@@ -9223,7 +9339,7 @@ function Invoke-VaultUnlockFlow {
         # dient der Wiederherstellung (RecoveryState) und der Erkennung
         # externer Dateiaenderungen beim naechsten Speichern. Der Hash der
         # Hauptdatei wird auch beim Laden aus Pending/Backup erfasst.
-        Set-VaultLoadReference -Kind ([string]$selected.Kind) -Revision ([long]$selected.Revision)
+        Set-VaultLoadReference -Kind ([string]$selected.Kind) -Revision ([long]$selected.Revision) -MainSnapshot $scan.Main
         if ($selected.Kind -ne 'Haupt' -and $script:App.VaultFileExistedAtLoad) {
             Write-AppLog -Level 'WARN' -Message ("Bewusste Wiederherstellung: Stand '{0}' geladen; die vorhandene Hauptdatei wird beim nächsten Speichern als explizit erkannter Wiederherstellungsvorgang ersetzt, sofern sie unverändert ist." -f $selected.Kind)
         }
