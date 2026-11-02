@@ -967,7 +967,7 @@ function Invoke-InternalTests {
         # Nachbildung des Entsperr-Ablaufs: Der Hash der (hier beschaedigten)
         # Hauptdatei wird auch beim Laden aus Backup2 erfasst; das Ersetzen
         # ist danach ein explizit erkannter Wiederherstellungsvorgang.
-        Set-VaultLoadReference -Kind 'Backup2' -Revision ([long]$b2Vault['Revision'])
+        Set-VaultLoadReference -Kind 'Backup2' -Revision ([long]$b2Vault['Revision']) -FromCurrentFile
         $b2SaveOk = Save-Vault
         $mainReadable = $true
         try { Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey | Out-Null }
@@ -1629,7 +1629,7 @@ function Invoke-InternalTests {
         Set-VaultSessionKeys -Keys (& $cloneKeys $keys) -Salt $salt -Iterations $iter
         $v96 = New-VaultDataObject
         Set-ActiveVault -Vault $v96
-        Set-VaultLoadReference -Kind 'Haupt' -Revision ([long]$v96['Revision'])
+        Set-VaultLoadReference -Kind 'Haupt' -Revision ([long]$v96['Revision']) -FromCurrentFile
         $saveWd96 = Save-WorkData
         $saveSet96 = Save-Settings
         & $assert 'Test 96a: Save-WorkData und Save-Settings liefern booleschen Erfolg' 'True True|Boolean Boolean' ("$saveWd96 $saveSet96|$($saveWd96.GetType().Name) $($saveSet96.GetType().Name)")
@@ -1897,7 +1897,7 @@ function Invoke-InternalTests {
         Set-VaultSessionKeys -Keys (& $cloneKeys $keys) -Salt $salt -Iterations $iter
         $v102 = New-VaultDataObject
         Set-ActiveVault -Vault $v102
-        Set-VaultLoadReference -Kind 'Haupt' -Revision ([long]$v102['Revision'])
+        Set-VaultLoadReference -Kind 'Haupt' -Revision ([long]$v102['Revision']) -FromCurrentFile
         $goodPending102 = $script:Paths.VaultPending
         $successLogCount102 = {
             $n = 0
@@ -2194,7 +2194,7 @@ function Invoke-InternalTests {
         # Start-Auswahl simulieren: neuester gueltiger Stand = Journal
         $pendVault109 = Read-VaultFromFile -Path $script:Paths.VaultPending -AesKey $script:VaultSession.AesKey -HmacKey $script:VaultSession.HmacKey
         Set-ActiveVault -Vault $pendVault109
-        Set-VaultLoadReference -Kind 'Pending' -Revision ([long]$pendVault109['Revision'])
+        Set-VaultLoadReference -Kind 'Pending' -Revision ([long]$pendVault109['Revision']) -FromCurrentFile
         $script:App.Flags.SaveBlockedReason = ''
         $script:App.Flags.SaveBlockedLogged = $false
         Clear-VaultSaveFailedState
@@ -2520,7 +2520,7 @@ function Invoke-InternalTests {
         Initialize-AppState
         Set-VaultSessionKeys -Keys (& $cloneKeys $keys) -Salt $salt -Iterations $iter
         Set-ActiveVault -Vault (New-VaultDataObject)
-        Set-VaultLoadReference -Kind 'Neu' -Revision 0
+        Set-VaultLoadReference -Kind 'Neu' -Revision 0 -FromCurrentFile
         $saved116 = "$(Save-Vault)|$(Save-Vault)"
         # Recovery-Inhalte wie im Betrieb: Konfliktkopie und Altdatenarchiv
         # (Sitzungsschluessel), Tresorstand eines frueheren Salts mit demselben
@@ -3154,8 +3154,79 @@ function Invoke-InternalTests {
         $emptyRej127 = $false
         try { Read-VaultContainerFromBytes -Bytes (New-Object byte[] 0) | Out-Null } catch { $emptyRej127 = ($_.Exception.Message -eq 'VAULT_INVALID') }
         & $assert 'Test 127d: Container aus Byte-Snapshot identisch zum Dateiweg, leere Bytes -> VAULT_INVALID' 'True|True' ("$([Convert]::ToBase64String($cFile127.Hmac) -eq [Convert]::ToBase64String($cBytes127.Hmac))|$emptyRej127")
+        $refRej127 = $false
+        try { Set-VaultLoadReference -Kind 'Haupt' -Revision 1 } catch { $refRej127 = $true }
+        & $assert 'Test 127e: Referenz ohne Scan-Snapshot nur ausdruecklich (-FromCurrentFile), sonst Abbruch' 'True' ([string]$refRej127)
         Clear-VaultSessionKeys
         $script:Paths = $paths127Before
+
+        # --- Tests 128: Passwortwechsel gegen konkurrierende Schreiber (Audit AZT-SEC-02) ---
+        $paths128Before = $script:Paths
+        $newPwd128 = [System.Text.Encoding]::UTF8.GetBytes('Neues Passwort 128 äöü!')
+        $newSalt128 = [ArbeitszeitTool.VaultCrypto]::GetRandomBytes($script:VaultConst.SaltBytes)
+        $newKeys128 = Get-VaultKeysFromPassword -PasswordBytes $newPwd128 -Salt $newSalt128 -Iterations $iter
+        $ext128 = New-VaultDataObject
+        $ext128['Revision'] = [long]20
+        $ext128['Settings']['RegularTime'] = '08:00'
+        $extBytes128 = ConvertTo-VaultFileBytes -Vault $ext128 -AesKey $keys.Aes -HmacKey $keys.Hmac -Salt $salt -Iterations $iter
+        $extHash128 = Get-BytesSha256Hex -Bytes $extBytes128
+        # Frischer Ordner: Hauptdatei Revision 10 + Backup1, Sitzungsreferenz = Hauptdatei
+        $setup128 = {
+            param([string]$Name)
+            $r = Join-Path $testRoot5 $Name
+            New-Item -ItemType Directory -Path (Join-Path $r 'Data') -Force | Out-Null
+            $script:Paths = (& $newTestPaths $r)
+            Initialize-AppState
+            $script:App.Settings = Get-DefaultSettings
+            $v = New-VaultDataObject
+            $v['Revision'] = [long]10
+            Write-VaultToFile -Path $script:Paths.VaultFile -Vault $v -AesKey $keys.Aes -HmacKey $keys.Hmac -Salt $salt -Iterations $iter
+            $v['Revision'] = [long]9
+            Write-VaultToFile -Path $script:Paths.VaultBackup1 -Vault $v -AesKey $keys.Aes -HmacKey $keys.Hmac -Salt $salt -Iterations $iter
+            $script:App.VaultFileHash = Get-FileSha256Hex -Path $script:Paths.VaultFile
+        }
+        $leftovers128 = { @(Get-ChildItem -LiteralPath $script:Paths.Data -File | Where-Object { $_.Name -like '*.old' -or $_.Name -like '*.new' }).Count }
+        $reencrypt128 = { Invoke-VaultReencryption -OldPasswordBytes $testPwdBytes -NewAesKey $newKeys128.Aes -NewHmacKey $newKeys128.Hmac -NewSalt $newSalt128 -NewIterations $iter }
+        # a) Szenario des Audits: Sync-Stand trifft nach Erstellen von vault.azt.new ein
+        & $setup128 'sec02a'
+        $inject128 = @{ Done = $false; Main = $script:Paths.VaultFile; Bytes = $extBytes128 }
+        $origWriter128 = ${function:Write-VaultToFile}
+        ${function:Write-VaultToFile} = {
+            & $origWriter128 @args
+            if (-not $inject128.Done -and $args -contains ($inject128.Main + '.new')) {
+                [System.IO.File]::WriteAllBytes($inject128.Main, $inject128.Bytes)
+                $inject128.Done = $true
+            }
+        }.GetNewClosure()
+        try { $err128a = & $reencrypt128 }
+        finally { ${function:Write-VaultToFile} = $origWriter128 }
+        $b1Old128 = & $readable29 $script:Paths.VaultBackup1 $keys
+        & $assert 'Test 128a: Sync-Stand waehrend der Umverschluesselung - Konflikt gemeldet, fremder Stand unveraendert, Backup zurueck, keine Reste' 'True|True|True|True|0' ("$($inject128.Done)|$($err128a.Contains('NICHT geändert'))|$((Get-FileSha256Hex -Path $script:Paths.VaultFile) -eq $extHash128)|$b1Old128|$(& $leftovers128)")
+        # b) Sync-Stand trifft schon VOR dem Einlesen ein: nichts umschluesseln
+        & $setup128 'sec02b'
+        [System.IO.File]::WriteAllBytes($script:Paths.VaultFile, $extBytes128)
+        $err128b = & $reencrypt128
+        & $assert 'Test 128b: Hauptdatei weicht vom Sitzungsstand ab - Abbruch vor jeder Aenderung, keine .new-Dateien' 'True|True|0' ("$($err128b.Contains('NICHT geändert'))|$((Get-FileSha256Hex -Path $script:Paths.VaultFile) -eq $extHash128)|$(& $leftovers128)")
+        # c) Fremde Datei erscheint, nachdem das Original beiseitegelegt wurde:
+        #    .new darf sie nicht ersetzen, die .old-Kopie bleibt erhalten
+        & $setup128 'sec02c'
+        $origMove128 = ${function:Move-FileIfUnchanged}
+        $inject128c = @{ Main = $script:Paths.VaultFile; Bytes = $extBytes128 }
+        ${function:Move-FileIfUnchanged} = {
+            param($Path, $Destination, $ExpectedSha256)
+            $r = & $origMove128 -Path $Path -Destination $Destination -ExpectedSha256 $ExpectedSha256
+            if ($r -and $Path -eq $inject128c.Main -and $Destination -like '*.old') { [System.IO.File]::WriteAllBytes($inject128c.Main, $inject128c.Bytes) }
+            return $r
+        }.GetNewClosure()
+        try { $err128c = & $reencrypt128 }
+        finally { ${function:Move-FileIfUnchanged} = $origMove128 }
+        & $assert 'Test 128c: fremde Datei am Ziel - nicht ersetzt, .old-Kopie erhalten, unvollstaendige Ruecknahme ehrlich gemeldet' 'True|True|True' ("$((Get-FileSha256Hex -Path $script:Paths.VaultFile) -eq $extHash128)|$(& $readable29 ($script:Paths.VaultFile + '.old') $keys)|$($err128c.Contains('NICHT vollständig'))")
+        # d) Ohne Konkurrenz: erfolgreich, Referenzhash = eigene neue Bytes
+        & $setup128 'sec02d'
+        $err128d = & $reencrypt128
+        & $assert 'Test 128d: ohne Konkurrenz erfolgreich, Referenzhash aus den eigenen neuen Bytes, keine Reste' '|True|True|0' ("$err128d|$($script:App.VaultFileHash -eq (Get-FileSha256Hex -Path $script:Paths.VaultFile))|$(& $readable29 $script:Paths.VaultFile $newKeys128)|$(& $leftovers128)")
+        Clear-VaultKeys -Keys $newKeys128
+        $script:Paths = $paths128Before
 
         Clear-VaultKeys -Keys $newKeys116
         Clear-VaultKeys -Keys $keysF116

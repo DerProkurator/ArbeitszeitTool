@@ -33,6 +33,32 @@
 ==================================================================
  AENDERUNGSJOURNAL
 --------------------------------------------------
+02.11.2026 - VERSION 1.5.4: PASSWORTWECHSEL GEGEN KONKURRIERENDE
+SCHREIBER
+--------------------------------------------------
+ Status: umgesetzt, automatisiert getestet (alle Tests gruen,
+         Tests 127e und 128a-128d neu); Passwortdialog manuell
+         NICHT getestet. Security-Audit 02.11.2026, AZT-SEC-02.
+ - Problem: Die Vorpruefung "Hauptdatei unveraendert" galt nur
+   fuer ihren Zeitpunkt; danach wurden die Dateien bedingungslos
+   ausgetauscht und die .old-Rueckisicherung geloescht. Ein
+   zwischenzeitlicher Cloud-Sync-Stand ging verloren - ebenso,
+   wenn er vor dem Einlesen eintraf (Referenzhash wurde danach
+   aus der Datei neu gelesen, das Speichern ersetzte ihn).
+ - Invoke-VaultReencryption liest jede Datei als Snapshot; die
+   Hauptdatei muss dem Referenzhash der Sitzung entsprechen,
+   sonst Abbruch vor jeder Aenderung.
+ - Move-FileIfUnchanged: Hashvergleich und Umbenennen unter
+   einem Handle, das fremde Schreiber aussperrt (nur
+   FileShare.Delete). .new wird nie ueber eine fremd angelegte
+   Datei gesetzt; die Ruecknahme ersetzt keine fremden Staende,
+   .old-Kopien bleiben dann erhalten.
+ - Abschlusspruefung, Journalspiegel und Referenzhash aus den
+   eigenen, in Phase A geprueften Bytes (kein erneutes Lesen).
+ - Set-VaultLoadReference ohne Scan-Snapshot nur noch
+   ausdruecklich (-FromCurrentFile, Tests); Tresor-Neuanlage mit
+   explizitem Zustand "keine Hauptdatei" (AZT-SEC-01).
+--------------------------------------------------
 02.11.2026 - VERSION 1.5.3: REFERENZHASH AUS DEM GELESENEN STAND
 --------------------------------------------------
  Status: umgesetzt, automatisiert getestet (alle Tests gruen,
@@ -1028,7 +1054,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.5.3'
+$script:AppVersion = '1.5.4'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -9027,12 +9053,18 @@ function Set-ActiveVault {
 #   Beim Entsperren immer zu uebergeben - ein erneutes Lesen koennte einen
 #   inzwischen per Cloud-Sync ersetzten Stand als Referenz uebernehmen, der
 #   beim naechsten Speichern still ueberschrieben wuerde (Audit AZT-SEC-01).
+#  -FromCurrentFile: Referenz ausdruecklich aus dem JETZIGEN Dateizustand
+#   (nur fuer Testaufbauten); ohne einen der beiden Parameter Abbruch.
 function Set-VaultLoadReference {
     param(
         [Parameter(Mandatory)][string]$Kind,
         [Parameter(Mandatory)][long]$Revision,
-        $MainSnapshot = $null
+        $MainSnapshot = $null,
+        [switch]$FromCurrentFile
     )
+    if ($null -eq $MainSnapshot -and -not $FromCurrentFile) {
+        throw (New-Object System.ArgumentException 'Set-VaultLoadReference: -MainSnapshot oder -FromCurrentFile erforderlich.')
+    }
     $script:App.LoadedFrom = $Kind
     $script:App.VaultLoadedRevision = $Revision
     if ($null -ne $MainSnapshot) {
@@ -9189,7 +9221,9 @@ function Invoke-VaultCreationFlow {
     }
     Set-VaultSessionKeys -Keys $keys -Salt $salt -Iterations $script:VaultConst.Iterations
     Set-ActiveVault -Vault $vault
-    Set-VaultLoadReference -Kind 'Neu' -Revision ([long]$vault['Revision'])
+    # Neuer Tresor: es gab keine Hauptdatei. Taucht vor dem ersten Speichern
+    # eine auf (z. B. Cloud-Sync), gilt sie als extern angelegt (Konflikt).
+    Set-VaultLoadReference -Kind 'Neu' -Revision ([long]$vault['Revision']) -MainSnapshot @{ Existed = $false; Hash = $null }
     Write-AppLog -Message 'Neuer Datentresor erstellt.'
     if (-not (Save-Vault)) {
         Clear-VaultSessionKeys
@@ -9897,14 +9931,29 @@ function New-VaultTxnContent {
 # Verschluesselt alle vorhandenen Tresordateien transaktional mit neuen
 # Schluesseln um. Liefert '' bei Erfolg, sonst eine Fehlermeldung.
 # Reine Dateilogik (auch von den Tests verwendet).
+# Schutz vor konkurrierenden Schreibern (Audit AZT-SEC-02):
+#  - Jede Datei wird genau einmal gelesen (Snapshot samt Hash). Die
+#    Hauptdatei muss dem Referenzhash der Sitzung entsprechen
+#    (-ExpectedMainHash, Standard: $script:App.VaultFileHash) - sonst wird
+#    nichts veraendert.
+#  - Beim Austausch wird jede Datei nur umbenannt, wenn sie noch ihrem
+#    Snapshot entspricht (Move-FileIfUnchanged); .new wird nie ueber eine
+#    inzwischen fremd angelegte Datei gesetzt. Die Ruecknahme ersetzt
+#    ebenfalls keine fremden Staende; .old-Kopien bleiben dann erhalten.
+#  - Bei Erfolg wird der Referenzhash aus den EIGENEN neuen Bytes gesetzt.
 function Invoke-VaultReencryption {
     param(
         [Parameter(Mandatory)][byte[]]$OldPasswordBytes,
         [Parameter(Mandatory)][byte[]]$NewAesKey,
         [Parameter(Mandatory)][byte[]]$NewHmacKey,
         [Parameter(Mandatory)][byte[]]$NewSalt,
-        [Parameter(Mandatory)][int]$NewIterations
+        [Parameter(Mandatory)][int]$NewIterations,
+        [string]$ExpectedMainHash = ''
     )
+    if ($ExpectedMainHash -eq '' -and $script:App) { $ExpectedMainHash = [string]$script:App.VaultFileHash }
+    $conflictText = ('Die Tresordatei wurde außerhalb dieser Anwendung verändert (z. B. durch eine Cloud-Synchronisierung) ' +
+        'oder ihr Prüfwert ist nicht verfügbar. Das Passwort wurde NICHT geändert, vorhandene Dateien blieben unverändert. ' +
+        'Bitte die Anwendung neu starten und den Vorgang danach wiederholen.')
     $targets = New-Object System.Collections.ArrayList
     $keyCache = @{}
     $mainSeen = $false
@@ -9914,15 +9963,26 @@ function Invoke-VaultReencryption {
             @{ Path = $script:Paths.VaultBackup2; Kind = 'Backup2' })) {
         if (-not (Test-Path -LiteralPath $info.Path)) { continue }
         try {
-            $container = Read-VaultContainerFromFile -Path $info.Path
+            $snapshot = Read-VaultFileSnapshot -Path $info.Path
+            $container = Read-VaultContainerFromBytes -Bytes $snapshot.Bytes
             $cacheKey = [Convert]::ToBase64String($container.Salt) + '|' + $container.Iterations
             if (-not $keyCache.ContainsKey($cacheKey)) {
                 $keyCache[$cacheKey] = Get-VaultKeysFromPassword -PasswordBytes $OldPasswordBytes -Salt $container.Salt -Iterations $container.Iterations
             }
             $keys = $keyCache[$cacheKey]
-            $vault = Read-VaultFromFile -Path $info.Path -AesKey $keys.Aes -HmacKey $keys.Hmac
-            [void]$targets.Add(@{ Path = $info.Path; Vault = $vault; Kind = $info.Kind })
-            if ($info.Kind -eq 'Haupt') { $mainSeen = $true }
+            $vault = Read-VaultFromBytes -Bytes $snapshot.Bytes -AesKey $keys.Aes -HmacKey $keys.Hmac
+            [void]$targets.Add(@{ Path = $info.Path; Vault = $vault; Kind = $info.Kind; Hash = $snapshot.Hash })
+            if ($info.Kind -eq 'Haupt') {
+                $mainSeen = $true
+                # Nur den Stand umschluesseln, auf den sich die Sitzung bezieht -
+                # ein inzwischen synchronisierter Stand wuerde sonst nach dem
+                # abschliessenden Speichern durch den Sitzungsstand ersetzt.
+                if ($ExpectedMainHash -eq '' -or $snapshot.Hash -ne $ExpectedMainHash) {
+                    Clear-UnusedScanKeys -KeyCache $keyCache -KeepKeys $null
+                    Write-AppLog -Level 'WARN' -Message 'Passwortänderung abgebrochen: Hauptdatei weicht vom Referenzstand der Sitzung ab.'
+                    return $conflictText
+                }
+            }
         }
         catch {
             if ($info.Kind -eq 'Haupt') {
@@ -9955,8 +10015,10 @@ function Invoke-VaultReencryption {
         foreach ($target in @($targets)) {
             $newPath = $target.Path + '.new'
             Write-VaultToFile -Path $newPath -Vault $target.Vault -AesKey $NewAesKey -HmacKey $NewHmacKey -Salt $NewSalt -Iterations $NewIterations
-            Read-VaultFromFile -Path $newPath -AesKey $NewAesKey -HmacKey $NewHmacKey | Out-Null
-            [void]$prepared.Add(@{ Orig = $target.Path; New = $newPath; Kind = $target.Kind })
+            $newSnapshot = Read-VaultFileSnapshot -Path $newPath
+            Read-VaultFromBytes -Bytes $newSnapshot.Bytes -AesKey $NewAesKey -HmacKey $NewHmacKey | Out-Null
+            [void]$prepared.Add(@{ Orig = $target.Path; New = $newPath; Kind = $target.Kind; OrigHash = $target.Hash
+                    NewHash = $newSnapshot.Hash; NewBytes = $newSnapshot.Bytes })
         }
     }
     catch {
@@ -9982,18 +10044,28 @@ function Invoke-VaultReencryption {
     foreach ($p in @($prepared)) { if ($p.Kind -ne 'Haupt') { [void]$applyOrder.Add($p) } }
     foreach ($p in @($prepared)) { if ($p.Kind -eq 'Haupt') { [void]$applyOrder.Add($p) } }
     $done = New-Object System.Collections.ArrayList
+    $mainPrepared = $null
+    foreach ($p in @($prepared)) { if ($p.Kind -eq 'Haupt') { $mainPrepared = $p } }
     try {
         foreach ($p in @($applyOrder)) {
             $oldAside = $p.Orig + '.old'
-            Move-Item -LiteralPath $p.Orig -Destination $oldAside -Force
-            $entry = @{ Orig = $p.Orig; Old = $oldAside; Applied = $false }
+            # Nur beiseitelegen, was noch exakt dem gelesenen Stand entspricht
+            if (-not (Move-FileIfUnchanged -Path $p.Orig -Destination $oldAside -ExpectedSha256 $p.OrigHash)) {
+                throw (New-Object System.InvalidOperationException 'VAULT_EXTERNAL_CHANGE')
+            }
+            $entry = @{ Orig = $p.Orig; Old = $oldAside; Applied = $false; NewHash = $p.NewHash }
             [void]$done.Add($entry)
-            Move-Item -LiteralPath $p.New -Destination $p.Orig -Force
+            # File.Move ueberschreibt nie: eine inzwischen fremd angelegte
+            # Datei bleibt erhalten (Fehler -> Ruecknahme)
+            [System.IO.File]::Move($p.New, $p.Orig)
             $entry.Applied = $true
         }
-        # Abschlusspruefung: Die neue Hauptdatei muss sich mit dem neuen
-        # Passwort erneut oeffnen lassen, BEVOR alte Dateien entfernt werden.
-        Read-VaultFromFile -Path $script:Paths.VaultFile -AesKey $NewAesKey -HmacKey $NewHmacKey | Out-Null
+        # Abschlusspruefung: Die Hauptdatei muss exakt die eigenen, in Phase A
+        # vollstaendig mit dem neuen Passwort geprueften Bytes enthalten,
+        # BEVOR alte Dateien entfernt werden.
+        if ((Read-VaultFileSnapshot -Path $script:Paths.VaultFile).Hash -ne $mainPrepared.NewHash) {
+            throw (New-Object System.InvalidOperationException 'VAULT_EXTERNAL_CHANGE')
+        }
         # Das dauerhafte Journal darf keinen Stand mit dem alten Passwort
         # behalten: in-place mit der neuen Hauptdatei ueberschreiben (keine
         # Loeschung im Cloud-Ordner). Ein Fehler hier rollt die bereits
@@ -10003,7 +10075,8 @@ function Invoke-VaultReencryption {
                 if ($script:TestMode -and $script:App -and $script:App.Flags.TestFailJournalMirror) {
                     throw (New-Object System.IO.IOException 'TESTHOOK: Journalspiegel deaktiviert')
                 }
-                Write-FileInPlace -Path $script:Paths.VaultPending -Bytes ([System.IO.File]::ReadAllBytes($script:Paths.VaultFile))
+                # Eigene, in Phase A gepruefte Bytes - kein erneutes Lesen
+                Write-FileInPlace -Path $script:Paths.VaultPending -Bytes $mainPrepared.NewBytes
             }
             catch {
                 Write-AppLog -Level 'WARN' -Message 'Journal (vault.pending.azt) konnte nach der Passwortänderung nicht neu geschrieben werden; es wird beim nächsten Speichern ersetzt.'
@@ -10013,25 +10086,39 @@ function Invoke-VaultReencryption {
             try { Remove-Item -LiteralPath $d.Old -Force -ErrorAction SilentlyContinue } catch { }
         }
         try { Remove-Item -LiteralPath $script:Paths.VaultTxn -Force -ErrorAction SilentlyContinue } catch { }
+        # Referenz auf die Hauptdatei aus den EIGENEN neuen Bytes (ein erneutes
+        # Lesen koennte einen inzwischen synchronisierten Stand uebernehmen)
+        if ($script:App) {
+            $script:App.VaultFileHash = $mainPrepared.NewHash
+            $script:App.VaultFileExistedAtLoad = $true
+        }
         return ''
     }
     catch {
         $applyError = $_.Exception.Message
+        $externalChange = ($applyError -eq 'VAULT_EXTERNAL_CHANGE')
+        if ($externalChange) { Write-AppLog -Level 'WARN' -Message 'Passwortänderung: Tresordatei während der Übernahme extern verändert - Vorgang wird zurückgenommen, fremder Stand bleibt erhalten.' }
         # Ruecknahme wird ueberprueft: nur wenn jede Zieldatei wieder ihren
-        # alten Stand traegt, darf "wiederhergestellt" gemeldet werden.
+        # alten Stand traegt, darf "wiederhergestellt" gemeldet werden. Fremde
+        # Staende werden dabei nie ersetzt; die .old-Kopie bleibt dann liegen
+        # (Startbereinigung archiviert sie nach Recovery).
         $rollbackOk = $true
         $reverse = @($done)
         [array]::Reverse($reverse)
         foreach ($d in $reverse) {
             try {
                 if ($d.Applied -and (Test-Path -LiteralPath $d.Orig)) {
-                    Move-Item -LiteralPath $d.Orig -Destination ($d.Orig + '.new') -Force
+                    if (-not (Move-FileIfUnchanged -Path $d.Orig -Destination ($d.Orig + '.new') -ExpectedSha256 $d.NewHash)) {
+                        $rollbackOk = $false
+                        continue
+                    }
                 }
                 if ($script:TestMode -and $script:App -and $script:App.Flags.TestFailReencryptRollback) {
                     throw (New-Object System.IO.IOException 'TESTHOOK: Ruecknahme der Umbenennung deaktiviert')
                 }
                 if (Test-Path -LiteralPath $d.Old) {
-                    Move-Item -LiteralPath $d.Old -Destination $d.Orig -Force
+                    if (Test-Path -LiteralPath $d.Orig) { $rollbackOk = $false }
+                    else { [System.IO.File]::Move($d.Old, $d.Orig) }
                 }
             }
             catch { $rollbackOk = $false }
@@ -10044,13 +10131,41 @@ function Invoke-VaultReencryption {
             # vault.txn bleibt bewusst liegen (unklarer Dateisatz); Start-
             # Reparatur und Bereinigung nach dem Entsperren uebernehmen.
             Write-AppLog -Level 'ERROR' -Message ('Passwortänderung: Übernahme fehlgeschlagen UND Rücknahme unvollständig: ' + $applyError)
+            $cause = $applyError
+            if ($externalChange) { $cause = 'Tresordatei wurde extern verändert (z. B. Cloud-Synchronisierung); der fremde Stand wurde NICHT überschrieben.' }
             return ('Die Übernahme der neu verschlüsselten Dateien ist fehlgeschlagen, und der bisherige Zustand konnte NICHT vollständig wiederhergestellt werden. ' +
                 'Bitte die Anwendung beenden und neu starten - beim Start werden die beiseitegelegten Dateien (.old/.new) erkannt und repariert. ' +
-                'Das bisherige Passwort bleibt bis dahin gültig. Details: ' + $applyError)
+                'Das bisherige Passwort bleibt bis dahin gültig. Details: ' + $cause)
         }
         try { Remove-Item -LiteralPath $script:Paths.VaultTxn -Force -ErrorAction SilentlyContinue } catch { }
+        if ($externalChange) { return $conflictText }
         return ('Die Übernahme der neu verschlüsselten Dateien ist fehlgeschlagen; der bisherige Zustand wurde wiederhergestellt. Details: ' + $applyError)
     }
+}
+
+# Benennt eine Datei NUR um, wenn ihr Inhalt noch dem SHA-256-Referenzwert
+# entspricht. Pruefung und Umbenennen laufen unter EINEM Handle, das nur
+# FileShare.Delete erlaubt: fremde Schreiber (Sync-Client, zweite Instanz)
+# sind von der Pruefung bis zum Umbenennen ausgesperrt (Audit AZT-SEC-02).
+# Liefert $true (umbenannt) oder $false (Inhalt abweichend, nichts geaendert);
+# technische Fehler (z. B. Datei anderweitig geoeffnet) als Ausnahme.
+function Move-FileIfUnchanged {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$ExpectedSha256
+    )
+    $stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Delete)
+    try {
+        if ($stream.Length -gt $script:VaultConst.MaxFileBytes) { return $false }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $hash = [System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '' }
+        finally { $sha.Dispose() }
+        if ($hash -ne $ExpectedSha256) { return $false }
+        Move-Item -LiteralPath $Path -Destination $Destination -Force
+        return $true
+    }
+    finally { $stream.Dispose() }
 }
 
 # Ueberschreibt eine vorhandene Datei in-place NUR, wenn ihr aktueller Inhalt
@@ -10822,11 +10937,8 @@ function Invoke-PasswordChangeFlow {
         # Sitzungsschluessel auf das neue Passwort umstellen
         Set-VaultSessionKeys -Keys $newKeys -Salt $newSalt -Iterations $script:VaultConst.Iterations
         $newKeys = $null   # Eigentum an die Sitzung uebergeben
-        # Die Umverschluesselung hat die Hauptdatei ausserhalb von Save-Vault
-        # neu geschrieben: Referenzhash nachziehen, damit der eigene Vorgang
-        # nicht faelschlich als externe Aenderung erkannt wird.
-        try { $script:App.VaultFileHash = Get-FileSha256Hex -Path $script:Paths.VaultFile } catch { }
-        $script:App.VaultFileExistedAtLoad = $true
+        # Den Referenzhash hat Invoke-VaultReencryption bereits aus den eigenen
+        # neuen Bytes gesetzt (kein erneutes Lesen der Datei).
         Write-AppLog -Message 'Verschlüsselungspasswort geändert; alle Tresordateien wurden neu verschlüsselt.'
         # Abschliessendes Speichern, Recovery-Neuverschluesselung und
         # Ergebnisbewertung (Complete-PasswordChangeFollowUp). Die
