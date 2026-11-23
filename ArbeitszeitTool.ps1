@@ -3311,6 +3311,41 @@ function Start-WorkDay {
     return $day
 }
 
+# Oeffnet einen bereits beendeten Tag wieder und fuegt einen neuen laufenden
+# Abschnitt an. Transaktional: Ueberschreitet die Nettozeit danach 10:00
+# (z. B. weil durch die Luecke die feste Betriebspause entfaellt, Issue #5)
+# oder schlaegt das Speichern fehl, wird alles zurueckgenommen ($false).
+# Rueckfrage und Ueberschneidungspruefung erfolgen vorher im Aufrufer.
+function Open-EndedWorkDay {
+    param(
+        [Parameter(Mandatory)]$Day,
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)][datetime]$Start
+    )
+    $reopenSnapshot = Get-DaySnapshot -Day $Day
+    $previousCurrent = $script:App.CurrentDay
+    $Day['Status'] = 'Aktiv'
+    $Day['EndedAt'] = $null
+    $Day['EndReason'] = $null
+    $Day['AutoEnded'] = $false
+    $Day['AutoEndReviewPending'] = $false
+    $seg = New-SegmentObject -Mode $Mode -Start $Start -Running $true
+    [void]$Day['Segments'].Add($seg)
+    if (-not (Test-ChangeKeepsDayUnderMax -Day $Day -At $Start -Snapshot $reopenSnapshot -Action 'Fortsetzen')) { return $false }
+    $reopenText = ('{0} ab {1}' -f $Mode, (Format-Clock $Start))
+    Add-Correction -Day $Day -Description 'Arbeitstag wieder geöffnet' -NewValue $reopenText -NoLog
+    $script:App.CurrentDay = $Day
+    Update-DayTotals -Day $Day | Out-Null
+    if (-not (Save-WorkData)) {
+        Restore-DayFromSnapshot -Day $Day -Snapshot $reopenSnapshot
+        $script:App.CurrentDay = $previousCurrent
+        Write-AppLog -Level 'WARN' -Message 'Wiedereröffnung des Arbeitstags NICHT gespeichert - Änderung zurückgenommen.'
+        return $false
+    }
+    Write-CorrectionLog -Day $Day -Description 'Arbeitstag wieder geöffnet' -NewValue $reopenText
+    return $true
+}
+
 # Beendet das laufende Segment zum angegebenen Zeitpunkt
 function Stop-RunningSegment {
     param([Parameter(Mandatory)]$Day, [Parameter(Mandatory)][datetime]$End)
@@ -3350,6 +3385,8 @@ function Switch-WorkMode {
 
     $newSeg = New-SegmentObject -Mode $NewMode -Start $StartTime -Running $true
     [void]$Day['Segments'].Add($newSeg)
+    # Ein Moduswechsel kann die feste Betriebspause abschalten (Issue #5)
+    if (-not (Test-ChangeKeepsDayUnderMax -Day $Day -At $StartTime -Snapshot $snapshot -Action 'Moduswechsel')) { return $null }
     Update-DayTotals -Day $Day | Out-Null
     if (-not (Save-WorkData)) {
         Restore-DayFromSnapshot -Day $Day -Snapshot $snapshot
@@ -3383,6 +3420,8 @@ function Start-ManualPauseInterval {
     $snapshot = Get-DaySnapshot -Day $Day
     $pause = New-IntervalObject -Start $Start
     [void]$Day['ManualPauses'].Add($pause)
+    # Eine Pause im Betrieb kann die feste Betriebspause abschalten (Issue #5)
+    if (-not (Test-ChangeKeepsDayUnderMax -Day $Day -At $Start -Snapshot $snapshot -Action 'Pause')) { return $null }
     Update-DayTotals -Day $Day | Out-Null
     if (-not (Save-WorkData)) {
         Restore-DayFromSnapshot -Day $Day -Snapshot $snapshot
@@ -3526,6 +3565,35 @@ function Test-DayUnderMax {
     $ref = Get-DayReferenceTime -Day $Day -Now $Now
     $comp = Get-DayComputation -Day $Day -Now $ref
     return ($comp.Netto.TotalMinutes -le ($script:Const.MaxMinutes + 0.02))
+}
+
+# 10-Stunden-Schutz fuer Aktionen, die die Nettozeit SPRUNGHAFT erhoehen
+# koennen: Nach neuer Pausenregel (Issue #5) schalten eine manuelle Pause, ein
+# Moduswechsel oder ein Fortsetzen nach einer Luecke die feste Betriebspause
+# rueckwirkend ab - die Nettozeit steigt dann um bis zu 00:45. Die Aenderung
+# ist bereits im Speicher vorgenommen; liegt die Nettozeit zum Zeitpunkt $At
+# danach ueber 10:00, wird der Tag aus $Snapshot vollstaendig zurueckgesetzt,
+# der Benutzer informiert und $false geliefert (nichts wird gespeichert).
+# Ohne diesen Schutz wuerde der Auto-Stopp den Abschnitt rueckwirkend kappen
+# bzw. bei bereits beendeten Abschnitten bliebe Netto dauerhaft ueber 10:00.
+function Test-ChangeKeepsDayUnderMax {
+    param(
+        [Parameter(Mandatory)]$Day,
+        [Parameter(Mandatory)][datetime]$At,
+        [Parameter(Mandatory)][string]$Snapshot,
+        [Parameter(Mandatory)][string]$Action
+    )
+    $after = Get-DayComputation -Day $Day -Now (Get-DayReferenceTime -Day $Day -Now $At)
+    if ($after.Netto.TotalMinutes -le ($script:Const.MaxMinutes + 0.02)) { return $true }
+    Restore-DayFromSnapshot -Day $Day -Snapshot $Snapshot
+    $before = Get-DayComputation -Day $Day -Now (Get-DayReferenceTime -Day $Day -Now $At)
+    $reason = ''
+    if ([bool]$before.FestePauseAktiv -and -not [bool]$after.FestePauseAktiv) {
+        $reason = (' Grund: Dadurch entfiele heute die feste Betriebspause ({0}).' -f (Format-Duration ([TimeSpan]::FromMinutes($script:Const.BetriebPauseMinutes))))
+    }
+    Write-AppLog -Level 'WARN' -Message ('{0} abgelehnt: Netto-Arbeitszeit läge über 10:00 ({1}).' -f $Action, (Format-Duration $after.Netto))
+    Show-Warning -Message ('{0} abgelehnt: Die Netto-Arbeitszeit läge danach bei {1} und damit über 10:00 Stunden.{2} Bitte stattdessen den Arbeitstag beenden.' -f $Action, (Format-Duration $after.Netto), $reason)
+    return $false
 }
 
 # Setzt MaxReached nach Korrekturen konsistent (auch Ruecknahme unter 10:00)
@@ -11959,27 +12027,10 @@ function Invoke-StartDayFlow {
             Show-Warning -Message 'Die Startzeit überschneidet sich mit einem vorhandenen Arbeitsabschnitt dieses Tages.'
             return
         }
-        $reopenSnapshot = Get-DaySnapshot -Day $existing
-        $previousCurrent = $script:App.CurrentDay
-        $existing['Status'] = 'Aktiv'
-        $existing['EndedAt'] = $null
-        $existing['EndReason'] = $null
-        $existing['AutoEnded'] = $false
-        $existing['AutoEndReviewPending'] = $false
-        $seg = New-SegmentObject -Mode $result.Mode -Start $result.Start -Running $true
-        [void]$existing['Segments'].Add($seg)
-        $reopenText = ('{0} ab {1}' -f $result.Mode, (Format-Clock $result.Start))
-        Add-Correction -Day $existing -Description 'Arbeitstag wieder geöffnet' -NewValue $reopenText -NoLog
-        $script:App.CurrentDay = $existing
-        Update-DayTotals -Day $existing | Out-Null
-        if (-not (Save-WorkData)) {
-            Restore-DayFromSnapshot -Day $existing -Snapshot $reopenSnapshot
-            $script:App.CurrentDay = $previousCurrent
-            Write-AppLog -Level 'WARN' -Message 'Wiedereröffnung des Arbeitstags NICHT gespeichert - Änderung zurückgenommen.'
+        if (-not (Open-EndedWorkDay -Day $existing -Mode $result.Mode -Start $result.Start)) {
             Invoke-MainRefresh -ForceTables
             return
         }
-        Write-CorrectionLog -Day $existing -Description 'Arbeitstag wieder geöffnet' -NewValue $reopenText
     }
     else {
         Start-WorkDay -Mode $result.Mode -StartTime $result.Start | Out-Null

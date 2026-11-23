@@ -562,6 +562,9 @@ Windows-Sperre, wird der Zeitraum nur **einmal** abgezogen.
   auch rückwirkend, wenn eine Pause nachgetragen wird. Dann werden nur die echten Pausen
   abgezogen: manuelle Pausen und Lücken. Windows-Sperren zählen im Betrieb weiterhin als
   Arbeitszeit.
+- Würde die Nettozeit durch das Entfallen der festen Pause **über 10:00** steigen (z. B.
+  „Pause starten" um 17:30 nach Arbeitsbeginn 07:00), lehnt das Tool die Pause, den
+  Moduswechsel bzw. das Fortsetzen ab; dann bitte den Arbeitstag beenden.
 - **Homeoffice** bleibt unverändert: manuelle Pausen und Windows-Sperren werden
   abgezogen, eine Pause wird nie automatisch eingetragen.
 - **Pausenanzeige Soll/Ist** (nur Information, keine Pflicht, ändert keine Zeiten) in den

@@ -53,6 +53,18 @@ function Get-TestNow {
     return Get-DayDateTime -DayDate $Day.Date -TimeText $TimeText
 }
 
+# Beginnzeit (HH:mm) "vor $Hours Stunden" fuer einen Testtag mit dem heutigen
+# Datum. Kurz nach Mitternacht laege dieser Zeitpunkt am Vortag - als Uhrzeit
+# auf das heutige Datum gelegt waere er dann in der ZUKUNFT. In diesem Fall
+# gilt 00:00 (Tests sind damit zu jeder Uhrzeit lauffaehig).
+function Get-TestRecentStartText {
+    param([int]$Hours = 2)
+    $now = Get-Date
+    $start = $now.AddHours(-$Hours)
+    if ($start.Date -lt $now.Date) { $start = $now.Date }
+    return $start.ToString('HH:mm')
+}
+
 function Invoke-InternalTests {
     $script:TestMode = $true   # keine Dialoge im Testlauf
     Initialize-AppState
@@ -1291,6 +1303,44 @@ function Invoke-InternalTests {
             $swEnd133 = (Get-Date).AddMinutes(-10)
             $seg133 = Switch-WorkMode -Day $daySw133 -NewMode 'Homeoffice' -EndTime $swEnd133 -StartTime (Get-Date)
             & $assert 'Test 133d: Moduswechsel Betrieb -> Homeoffice beendet die laufende Pause am Abschnittsende' 'True|True|2' ("$($null -ne $seg133)|$($daySw133['ManualPauses'][0]['End'] -eq (ConvertTo-DateTimeString $swEnd133))|$(@($daySw133['Segments']).Count)")
+
+            # --- Test 135 (Sicherheitspruefung 1.6.0): 10-Stunden-Schutz, wenn eine
+            # Aktion die feste Betriebspause rueckwirkend entfallen liesse.
+            # Betrieb ab 07:00: um 17:30 sind 09:45 netto (mit fester Pause),
+            # ohne feste Pause waeren es 10:30 -> Aktion muss abgelehnt werden.
+            $script:Const.PauseRuleNewFrom = '2026-11-24'
+            $mk135 = {
+                param([string]$EndText = '')
+                $d = New-TestDay -DateText '2026-11-25'
+                Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' -EndText $EndText | Out-Null
+                return $d
+            }
+            # a) Pause starten: um 17:30 abgelehnt (nichts geaendert), um 14:00 erlaubt
+            $p135 = & $mk135
+            $rp135 = Start-ManualPauseInterval -Day $p135 -Start (Get-TestNow $p135 '17:30')
+            $np135 = Format-Duration (Get-DayComputation -Day $p135 -Now (Get-TestNow $p135 '17:30')).Netto
+            $q135 = & $mk135
+            $rq135 = Start-ManualPauseInterval -Day $q135 -Start (Get-TestNow $q135 '14:00')
+            & $assert 'Test 135a: Pause, die Netto ueber 10:00 hebt, wird abgelehnt - frueher erlaubt' 'True|0|True|False|09:45 -> True|1' ("$($null -eq $rp135)|$(@($p135['ManualPauses']).Count)|$($p135['Segments'][0]['Running'])|$([bool]$p135['MaxReached'])|$np135 -> $($null -ne $rq135)|$(@($q135['ManualPauses']).Count)")
+
+            # b) Moduswechsel: um 17:30 abgelehnt (Abschnitt laeuft weiter), um 14:00 erlaubt
+            $s135 = & $mk135
+            $rs135 = Switch-WorkMode -Day $s135 -NewMode 'Homeoffice' -EndTime (Get-TestNow $s135 '17:30') -StartTime (Get-TestNow $s135 '17:30')
+            $t135 = & $mk135
+            $rt135 = Switch-WorkMode -Day $t135 -NewMode 'Homeoffice' -EndTime (Get-TestNow $t135 '14:00') -StartTime (Get-TestNow $t135 '14:00')
+            & $assert 'Test 135b: Moduswechsel, der Netto ueber 10:00 hebt, wird abgelehnt - frueher erlaubt' 'True|1|True -> True|2' ("$($null -eq $rs135)|$(@($s135['Segments']).Count)|$($s135['Segments'][0]['Running']) -> $($null -ne $rt135)|$(@($t135['Segments']).Count)")
+
+            # c) Fortsetzen nach Luecke: Ende 17:40, weiter 17:50 abgelehnt; Ende 15:00, weiter 15:10 erlaubt
+            $script:App.CurrentDay = $null
+            $e135 = & $mk135 '17:40'
+            $e135['Status'] = 'Beendet'; $e135['EndedAt'] = ConvertTo-DateTimeString (Get-TestNow $e135 '17:40')
+            $re135 = Open-EndedWorkDay -Day $e135 -Mode 'Betrieb' -Start (Get-TestNow $e135 '17:50')
+            $ne135 = Format-Duration (Get-DayComputation -Day $e135 -Now (Get-TestNow $e135 '17:50')).Netto
+            $curAfterReject135 = ($null -eq $script:App.CurrentDay)
+            $f135 = & $mk135 '15:00'
+            $f135['Status'] = 'Beendet'; $f135['EndedAt'] = ConvertTo-DateTimeString (Get-TestNow $f135 '15:00')
+            $rf135 = Open-EndedWorkDay -Day $f135 -Mode 'Betrieb' -Start (Get-TestNow $f135 '15:10')
+            & $assert 'Test 135c: Fortsetzen nach Luecke ueber 10:00 abgelehnt (Tag bleibt beendet) - frueher erlaubt' 'False|Beendet|1|True|09:55 -> True|Aktiv|2' ("$re135|$($e135['Status'])|$(@($e135['Segments']).Count)|$curAfterReject135|$ne135 -> $rf135|$($f135['Status'])|$(@($f135['Segments']).Count)")
         }
         finally {
             $script:Const.PauseRuleNewFrom = $origRule133
@@ -1445,7 +1495,7 @@ function Invoke-InternalTests {
             Initialize-AppState
             $script:App.Settings = Get-DefaultSettings
             $hideDay = New-TestDay -DateText ((Get-Date).ToString('yyyy-MM-dd'))
-            Add-TestSegment -Day $hideDay -Mode 'Betrieb' -StartText ((Get-Date).AddHours(-1).ToString('HH:mm')) | Out-Null
+            Add-TestSegment -Day $hideDay -Mode 'Betrieb' -StartText (Get-TestRecentStartText -Hours 1) | Out-Null
             $script:App.CurrentDay = $hideDay
             $cwin84 = New-XamlWindow -Xaml $script:CompactXaml
             $cwin84.Opacity = 0                      # fuer den Testlauf unsichtbar
@@ -1851,7 +1901,7 @@ function Invoke-InternalTests {
         }
         $script:App.Flags.SimulatedShutdownRequested = $false
         $d99 = New-TestDay -DateText ((Get-Date).ToString('yyyy-MM-dd'))
-        Add-TestSegment -Day $d99 -Mode 'Betrieb' -StartText ((Get-Date).AddHours(-2).ToString('HH:mm')) | Out-Null
+        Add-TestSegment -Day $d99 -Mode 'Betrieb' -StartText (Get-TestRecentStartText -Hours 2) | Out-Null
         [void]$script:App.Data.Days.Add($d99)
         Save-Vault | Out-Null
         $completed99 = Complete-WorkDay -Day $d99 -End (Get-Date) -Reason 'Manuell'
@@ -2092,7 +2142,7 @@ function Invoke-InternalTests {
 
         # --- Test 105: fehlgeschlagener Shutdownstart - Radio/Tag konsistent ----
         $d105 = New-TestDay -DateText ((Get-Date).ToString('yyyy-MM-dd'))
-        Add-TestSegment -Day $d105 -Mode 'Betrieb' -StartText ((Get-Date).AddHours(-2).ToString('HH:mm')) | Out-Null
+        Add-TestSegment -Day $d105 -Mode 'Betrieb' -StartText (Get-TestRecentStartText -Hours 2) | Out-Null
         [void]$script:App.Data.Days.Add($d105)
         Save-Vault | Out-Null
         $completed105 = Complete-WorkDay -Day $d105 -End (Get-Date) -Reason 'Manuell'
@@ -2430,7 +2480,7 @@ function Invoke-InternalTests {
         $fakeCompact114 | Add-Member -MemberType ScriptMethod -Name Close -Value { }
         $script:App.Ui.Compact = $fakeCompact114
         $d114 = New-TestDay -DateText ((Get-Date).ToString('yyyy-MM-dd'))
-        Add-TestSegment -Day $d114 -Mode 'Betrieb' -StartText ((Get-Date).AddHours(-2).ToString('HH:mm')) | Out-Null
+        Add-TestSegment -Day $d114 -Mode 'Betrieb' -StartText (Get-TestRecentStartText -Hours 2) | Out-Null
         [void]$script:App.Data.Days.Add($d114)
         Save-Vault | Out-Null
         $script:App.CloseConfirmed = $false
@@ -2460,7 +2510,7 @@ function Invoke-InternalTests {
         # 6) Aktiver Tag kann nicht beendet werden (Speicherfehler beim
         #    Tagesabschluss): kein Shutdown, Tag bleibt Aktiv
         $d114l = New-TestDay -DateText ((Get-Date).ToString('yyyy-MM-dd'))
-        Add-TestSegment -Day $d114l -Mode 'Betrieb' -StartText ((Get-Date).AddHours(-2).ToString('HH:mm')) | Out-Null
+        Add-TestSegment -Day $d114l -Mode 'Betrieb' -StartText (Get-TestRecentStartText -Hours 2) | Out-Null
         [void]$script:App.Data.Days.Add($d114l)
         Save-Vault | Out-Null
         $script:App.Flags.SimulatedShutdownRequested = $false
@@ -2492,7 +2542,7 @@ function Invoke-InternalTests {
         # 9) "Nur Anwendung schliessen" bei aktivem Tag: laufender Abschnitt
         #    bleibt UNVERAENDERT, kein Shutdown
         $d114p = New-TestDay -DateText ((Get-Date).ToString('yyyy-MM-dd'))
-        $seg114p = Add-TestSegment -Day $d114p -Mode 'Betrieb' -StartText ((Get-Date).AddHours(-1).ToString('HH:mm'))
+        $seg114p = Add-TestSegment -Day $d114p -Mode 'Betrieb' -StartText (Get-TestRecentStartText -Hours 1)
         [void]$script:App.Data.Days.Add($d114p)
         Save-Vault | Out-Null
         $segId114p = [string]$seg114p['Id']

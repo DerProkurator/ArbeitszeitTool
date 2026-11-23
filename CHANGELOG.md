@@ -27,6 +27,12 @@ Issue #5. Gilt für Arbeitstage ab dem 24.11.2026; ältere Tage rechnen unverän
 - Zentrales Pausenmodell `Get-DayPauseModel`: Tagesberechnung, Nettozeit zum Zeitpunkt,
   10-Stunden-Grenze und Werte je Abschnitt rechnen nach denselben Regeln. Die bisherige
   Formel liegt als Referenz in den Tests; alte Tage werden dagegen geprüft.
+- 10-Stunden-Schutz: Eine Pause, ein Moduswechsel oder das Fortsetzen nach einer Lücke wird
+  abgelehnt, wenn die Nettozeit dadurch über 10:00 stiege, weil die feste Betriebspause
+  entfiele. Ohne diesen Schutz hätte der Auto-Stopp den Abschnitt rückwirkend gekappt bzw.
+  Netto wäre dauerhaft über 10:00 geblieben (gefunden bei der Sicherheitsprüfung).
+- Tests: Beginnzeiten „vor x Stunden" liegen kurz nach Mitternacht nicht mehr in der Zukunft
+  (die Testsuite ist damit zu jeder Uhrzeit lauffähig).
 
 ## 1.5.4 – 02.11.2026 – Passwortwechsel gegen konkurrierende Schreiber
 
