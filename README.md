@@ -439,7 +439,10 @@ Beginn: 06:12 | Netto: 06:36 | Soll-Rest: 00:24 | Max-Ende: 16:57
   Kommentar, Aktivhaltung, in den Infobereich ausblenden, minimieren, Verlauf, Export,
   Einstellungen, Anwendung schließen)
 - Ein `*` hinter einer Endzeit bedeutet: die Prognose ist pausiert (z. B. laufende
-  Homeoffice-Pause)
+  manuelle Pause)
+- Ein ☕ am Ende der Zeile (seit 1.6.0) erinnert an noch offene Pausenzeit bzw. an einen
+  Arbeitsblock über 6 Stunden ohne Pause (siehe „Pausenregel"); abschaltbar unter
+  Einstellungen → Kompakte Ansicht → Pausensymbol
 - Die Felder der zweiten Zeile sind wählbar (Einstellungen → Kompakte Ansicht bzw. eigene
   Presets). Zwei Felder wechseln automatisch beim Erreichen der Sollzeit:
   **Soll-Rest → Überstunden** und **Soll-Ende → Max-Ende** (seit 1.3.1).
@@ -466,7 +469,8 @@ nachträglich korrigiert werden („Tag bearbeiten").
 
 **Feste Grenzen** (nicht über die Einstellungen änderbar): Warnung ab 09:45,
 automatischer Stopp bei exakt 10:00 Netto-Stunden, Betriebspause 00:45 ab exakt 06:00
-Betriebszeit. Diese Werte sind im Skript zentral als Konstanten hinterlegt
+Betriebszeit (seit 1.6.0 nur noch an reinen Betriebstagen ohne erfasste Pause, siehe
+„Pausenregel"). Diese Werte sind im Skript zentral als Konstanten hinterlegt
 (`$script:Const`) und entsprechen nicht automatisch dem Arbeitszeitgesetz (dort u. a.
 30 Minuten Pause bei mehr als 6 Stunden und 45 Minuten bei mehr als 9 Stunden) oder
 einem Tarif-/Betriebsvertrag — bitte für den eigenen Fall prüfen. Die **Regelarbeitszeit** ist einstellbar, muss größer als 00:00 sein und
@@ -511,7 +515,8 @@ Wo:
 - **Teilabschnitte** (seit 1.5.0): Ein weiterer Reiter im Tages-Editor zeigt die
   Arbeitsphasen zwischen den Pausen je Abschnitt mit Beginn, Ende und Dauer. Im
   Homeoffice trennen manuelle Pausen und Windows-Sperren (überlappende werden
-  zusammengefasst), im Betrieb die feste Betriebspause. Die Summe der Teilabschnitte
+  zusammengefasst), im Betrieb die feste Betriebspause bzw. (seit 1.6.0, ohne feste
+  Pause) die manuellen Pausen. Die Summe der Teilabschnitte
   entspricht dem Netto des Abschnitts; ein laufender Teilabschnitt zeigt „läuft". Die
   Werte werden nur berechnet, solange der Reiter ausgewählt ist, und nicht gespeichert.
   Die erweiterte Ansicht bleibt bewusst unverändert.
@@ -534,15 +539,41 @@ Kommentar. Tresore älterer Versionen bleiben unverändert ladbar.
 |---|---|---|
 | Berechnungsbasis | eingetragene Zeitstempel | tatsächliche aktive Zeit |
 | Windows-Sperre | Zeit läuft weiter | Zeit pausiert automatisch |
-| Manueller Pausenknopf | nicht vorgesehen | vorhanden |
-| Mittagspause | fest 45 Min. ab 6 h Betriebszeit | keine automatische Pause |
+| Manueller Pausenknopf | vorhanden (seit 1.6.0, Tage ab 24.11.2026) | vorhanden |
+| Mittagspause | fest 45 Min. ab 6 h Betriebszeit – nur an reinen Betriebstagen ohne erfasste Pause | keine automatische Pause |
 
 Ein Tag darf beliebig zwischen den Modi wechseln („Modus wechseln"). Die Zeit zwischen
-Ende des alten und Beginn des neuen Abschnitts gilt als Unterbrechung (keine Arbeitszeit).
+Ende des alten und Beginn des neuen Abschnitts gilt als Unterbrechung (keine Arbeitszeit);
+eine laufende manuelle Pause wird beim Wechsel beendet.
 Die 6-Stunden-Grenze für die Betriebspause zählt nur Betriebszeit (die Pause ist ab
 **exakt** 06:00 Betriebszeit aktiv); die 10-Stunden-Grenze gilt für die gesamte
 Netto-Arbeitszeit des Tages. Überlappen sich im Homeoffice eine manuelle Pause und eine
 Windows-Sperre, wird der Zeitraum nur **einmal** abgezogen.
+
+### Pausenregel (seit 1.6.0, für Arbeitstage ab dem 24.11.2026)
+
+Ältere Tage werden unverändert nach der bisherigen Regel berechnet; Verlauf und Export
+ändern sich für sie nicht.
+
+- **Feste Betriebspause** (45 Min. ab 6:00 h Betriebszeit) nur noch an einem **reinen
+  Betriebstag** ohne manuelle Pause und ohne Lücke zwischen Abschnitten.
+- Sie **entfällt für den ganzen Tag**, sobald eine manuelle Pause erfasst ist (egal wie
+  kurz), ein weiterer Betriebsabschnitt nach einer Lücke beginnt oder der Modus wechselt –
+  auch rückwirkend, wenn eine Pause nachgetragen wird. Dann werden nur die echten Pausen
+  abgezogen: manuelle Pausen und Lücken. Windows-Sperren zählen im Betrieb weiterhin als
+  Arbeitszeit.
+- **Homeoffice** bleibt unverändert: manuelle Pausen und Windows-Sperren werden
+  abgezogen, eine Pause wird nie automatisch eingetragen.
+- **Pausenanzeige Soll/Ist** (nur Information, keine Pflicht, ändert keine Zeiten) in den
+  Tageswerten der erweiterten Ansicht und in der Tageszusammenfassung:
+  - Soll: reiner Betriebstag 45 Min.; Homeoffice und gemischte Tage gestaffelt –
+    30 Min. ab Tagesbeginn, 45 Min. ab 9:00 h Arbeit.
+  - Ist: genommene Pausenblöcke ab 15 Minuten (Lücken, manuelle Pausen, im Homeoffice
+    auch Windows-Sperren; angrenzende Zeiten bilden einen Block) bzw. die abgezogene feste
+    Betriebspause.
+  - Hinweise: „Feste Betriebspause wird heute nicht automatisch abgezogen" und
+    „Über 6 Std. am Stück ohne Pause (§ 4 ArbZG)".
+  - Ist und offene Pausenzeit unterliegen dem Sichtschutz; das Soll bleibt sichtbar.
 
 ## Scroll-Lock-Aktivhaltung
 

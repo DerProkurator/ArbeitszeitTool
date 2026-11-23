@@ -1489,7 +1489,7 @@ function Invoke-InternalTests {
             $tab85 = $setWin85.FindName('TabSettings')
             $headers85 = (@($tab85.Items | ForEach-Object { [string]$_.Header }) -join '|')
             & $assert 'Test 85a: alle Einstellungsbereiche sind als Tabs erreichbar' 'Allgemein|Kompakte Ansicht|Aktivhaltung|Internetradio' $headers85
-            $sizeOk85 = ($setWin85.Width -ge 720 -and $setWin85.Width -le 820 -and $setWin85.Height -ge 560 -and $setWin85.Height -le 680 -and $setWin85.MinWidth -gt 0 -and $setWin85.MinHeight -gt 0 -and $setWin85.ResizeMode -eq [System.Windows.ResizeMode]::CanResize)
+            $sizeOk85 = ($setWin85.Width -ge 720 -and $setWin85.Width -le 820 -and $setWin85.Height -ge 880 -and $setWin85.Height -le 960 -and $setWin85.MinWidth -gt 0 -and $setWin85.MinHeight -gt 0 -and $setWin85.ResizeMode -eq [System.Windows.ResizeMode]::CanResize)
             & $assert 'Test 85b: feste sinnvolle Ausgangsgroesse mit Min-Grenzen, Fenster bleibt verkleinerbar' 'True' ([string]$sizeOk85)
             # Speichern/Abbrechen liegen AUSSERHALB des TabControls (immer sichtbar)
             $btnOk85 = $setWin85.FindName('BtnOk')
@@ -3617,6 +3617,86 @@ function Invoke-InternalTests {
     $stopped132 = Invoke-AutoStopIfNeeded -Day $d -Now (Get-TestNow $d '18:00')
     $c = Get-DayComputation -Day $d -Now (Get-TestNow $d '18:00')
     & $assert 'Test 132i: automatischer Stopp an der 10-h-Grenze (17:20), Netto exakt 10:00' 'True|10:00|17:20' ("$stopped132|$(& $fd $c.Netto)|$(Format-Clock (ConvertFrom-DateTimeString $d.Segments[0].End))")
+
+    # --- Test 134: Pausenanzeige Soll/Ist, Hinweise, Symbol in der Kompaktansicht ---
+    $origSettings134 = $script:App.Settings
+    $origPrivacy134 = $null
+    if ($script:App.UiPrivacy) { $origPrivacy134 = $script:App.UiPrivacy.PauseAndLockDetailsVisible }
+    try {
+        $script:App.Settings = Get-DefaultSettings
+        $cup = [string][char]0x2615
+        $check = [string][char]0x2713
+        $mkDay134 = {
+            param([string]$Date, [string]$PauseStart = '', [string]$PauseEnd = '')
+            $x = New-TestDay -DateText $Date
+            Add-TestSegment -Day $x -Mode 'Betrieb' -StartText '07:00' | Out-Null
+            if ($PauseStart -ne '') { Add-TestInterval -Day $x -ListName 'ManualPauses' -StartText $PauseStart -EndText $PauseEnd | Out-Null }
+            return $x
+        }
+        $ext134 = {
+            param($x, [string]$TimeText, [bool]$Visible)
+            if ($script:App.UiPrivacy) { $script:App.UiPrivacy.PauseAndLockDetailsVisible = $Visible }
+            return (Get-ExtendedValuesText -Comp (Get-DayComputation -Day $x -Now (Get-TestNow $x $TimeText)) -Day $x)
+        }
+        $compact134 = {
+            param($x, [string]$TimeText)
+            return (Get-CompactStatusText -Comp (Get-DayComputation -Day $x -Now (Get-TestNow $x $TimeText)) -Day $x)
+        }
+
+        # a) Alte Regel bzw. Tag ohne Abschnitt: keine Anzeige
+        $old134 = & $mkDay134 $oldDate '10:00' '10:20'
+        $empty134 = New-TestDay -DateText $newDate
+        & $assert 'Test 134a: keine Pausenanzeige vor dem Stichtag und ohne Abschnitt' 'True|True|False' ("$($null -eq (Get-PauseMarker -Comp (Get-DayComputation -Day $old134 -Now (Get-TestNow $old134 '14:20'))))|$($null -eq (Get-PauseMarker -Comp (Get-DayComputation -Day $empty134 -Now (Get-TestNow $empty134 '14:20'))))|$((& $ext134 $old134 '14:20' $true).Contains('Pausen Soll/Ist'))")
+
+        # b) Betrieb mit Pause 20 min: Soll/Ist, offen, Hinweis; Sichtschutz verdeckt Ist/offen
+        $d134 = & $mkDay134 $newDate '10:00' '10:20'
+        $vis134 = & $ext134 $d134 '14:20' $true
+        $hid134 = & $ext134 $d134 '14:20' $false
+        & $assert 'Test 134b: Tageswerte - Soll/Ist 00:45 / 00:20, offen 00:25, Hinweis keine feste Pause' 'True|True|True|True' ("$($vis134.Contains('Pausen Soll/Ist    00:45 / 00:20'))|$($vis134.Contains('Pause offen        00:25'))|$($vis134.Contains('! Feste Betriebspause wird heute'))|$($vis134.Contains('  nicht automatisch abgezogen'))")
+        & $assert 'Test 134c: Sichtschutz - Ist/offen verdeckt, Soll sichtbar, gleiche Zeilenanzahl' 'True|True|False|True' ("$($hid134.Contains('Pausen Soll/Ist    00:45 / ••:••'))|$($hid134.Contains('Pause offen        ••:••'))|$($hid134.Contains('00:25'))|$(@($vis134 -split "`r`n").Count -eq @($hid134 -split "`r`n").Count)")
+
+        # c) Reiner Betriebstag: offener Rest wird automatisch abgezogen, kein Hinweis, kein Symbol
+        $p134 = & $mkDay134 $newDate
+        $pText134 = & $ext134 $p134 '10:00' $true
+        & $assert 'Test 134d: reiner Betriebstag - "offen (autom.)", kein Hinweis, kein Symbol' 'True|False|False' ("$($pText134.Contains('Pause offen        00:45 (autom.)'))|$($pText134.Contains('! Feste'))|$((& $compact134 $p134 '10:00').Contains($cup))")
+
+        # d) Beispiel aus dem Issue: Soll erfuellt
+        $i134 = New-TestDay -DateText $newDate
+        Add-TestSegment -Day $i134 -Mode 'Betrieb' -StartText '07:30' -EndText '09:00' | Out-Null
+        Add-TestSegment -Day $i134 -Mode 'Betrieb' -StartText '09:40' | Out-Null
+        Add-TestInterval -Day $i134 -ListName 'ManualPauses' -StartText '12:00' -EndText '12:20' | Out-Null
+        & $assert 'Test 134e: Soll erfuellt - Haken in den Tageswerten, kein Symbol' 'True|False' ("$((& $ext134 $i134 '14:30' $true).Contains('Pausen-Soll        erfüllt ' + $check))|$((& $compact134 $i134 '14:30').Contains($cup))")
+
+        # e) Pause nur 10 min: ueber 6 h am Stueck -> Hinweis, Symbol
+        $s134 = & $mkDay134 $newDate '10:00' '10:10'
+        $sText134 = & $ext134 $s134 '14:10' $true
+        & $assert 'Test 134f: Arbeitsblock ueber 6 h - Hinweis (§ 4 ArbZG) und Symbol' 'True|True|True' ("$($sText134.Contains('! Über 6 Std. am Stück ohne Pause'))|$($sText134.Contains('(§ 4 ArbZG)'))|$((& $compact134 $s134 '14:10').Contains($cup))")
+
+        # f) Symbol bei offener Pausenzeit, aber nicht mehr nach Tagesende
+        $symOpen134 = (& $compact134 $d134 '14:20').Contains($cup)
+        $d134['Status'] = 'Beendet'
+        $symEnded134 = (& $compact134 $d134 '14:20').Contains($cup)
+        $d134['Status'] = 'Aktiv'
+        & $assert 'Test 134g: Symbol bei offener Pausenzeit, nicht bei beendetem Tag' 'True|False' ("$symOpen134|$symEnded134")
+
+        # f2) Symbol in den Einstellungen abschaltbar; Standard an, Wert wird plausibilisiert
+        $script:App.Settings['PauseSymbolEnabled'] = $false
+        $symOff134 = (& $compact134 $d134 '14:20').Contains($cup)
+        $script:App.Settings['PauseSymbolEnabled'] = $true
+        $valOff134 = Get-ValidatedSettings -Loaded ([ordered]@{ PauseSymbolEnabled = 0 })
+        $valMissing134 = Get-ValidatedSettings -Loaded ([ordered]@{ })
+        & $assert 'Test 134i: Symbol abschaltbar (Standard an, gespeichertes Aus bleibt aus)' 'False|True|False|True' ("$symOff134|$((Get-DefaultSettings)['PauseSymbolEnabled'])|$($valOff134['PauseSymbolEnabled'])|$($valMissing134['PauseSymbolEnabled'])")
+        & $assert 'Test 134j: Einstellungsdialog enthaelt den Schalter fuer das Pausensymbol' 'True' ([string]$script:SettingsXaml.Contains('x:Name="ChkPauseSymbol"'))
+
+        # g) Zusammenfassung (Tagesabschluss)
+        $sum134 = Get-DaySummaryText -Day $d134 -Now (Get-TestNow $d134 '14:20')
+        $sumOld134 = Get-DaySummaryText -Day $old134 -Now (Get-TestNow $old134 '14:20')
+        & $assert 'Test 134h: Zusammenfassung mit Soll/Ist und Hinweis, alter Tag unveraendert' 'True|True|False' ("$($sum134.Contains('Pausen Soll/Ist:     00:45 / 00:20  (00:25 offen)'))|$($sum134.Contains('Hinweis:             keine feste Betriebspause (Pausen erfasst)'))|$($sumOld134.Contains('Pausen Soll/Ist'))")
+    }
+    finally {
+        $script:App.Settings = $origSettings134
+        if ($script:App.UiPrivacy) { $script:App.UiPrivacy.PauseAndLockDetailsVisible = $origPrivacy134 }
+    }
 
     # --- Zusammenfassung ---
     $failed = @($results | Where-Object { -not $_.Ok })

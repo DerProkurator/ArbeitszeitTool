@@ -662,7 +662,7 @@ $script:Paths = @{
 }
 
 # Versionsstand der Anwendung (fuer Fenstertitel und Einstellungen-Dialog)
-$script:AppVersion = '1.5.4'
+$script:AppVersion = '1.6.0'
 
 # Feste, nicht ueber die Einstellungen aenderbare Grenzen
 $script:Const = @{
@@ -2243,6 +2243,8 @@ function Get-DefaultSettings {
         KeepAliveIntervalSec = 60
         TrayIconEnabled      = $true
         ShowSeconds          = $true
+        # Kaffee-Symbol in der kompakten Ansicht bei offener Pausenzeit (Issue #5)
+        PauseSymbolEnabled   = $true
         Warn945Enabled       = $true
         SoundEnabled         = $false
         StartView            = 'Kompakt'    # 'Kompakt' oder 'Erweitert'
@@ -2295,6 +2297,7 @@ function Get-ValidatedSettings {
     $defaults['KeepAliveIntervalSec'] = [math]::Max(10, [math]::Min(600, [int]$defaults['KeepAliveIntervalSec']))
     if (@('Kompakt', 'Erweitert') -notcontains $defaults['StartView']) { $defaults['StartView'] = 'Kompakt' }
     $defaults['ShutdownOfferEnabled'] = [bool]$defaults['ShutdownOfferEnabled']
+    $defaults['PauseSymbolEnabled'] = [bool]$defaults['PauseSymbolEnabled']
     # Unbekannte Felder werden verworfen; bleibt nichts uebrig, gilt die
     # Standardauswahl.
     $knownFields = New-Object System.Collections.ArrayList
@@ -5018,6 +5021,30 @@ function Get-HeaderLineText {
     return '{0} | KW {1} | {2}' -f $now.ToString($clockFormat), (Get-IsoWeek $now), $now.ToString('dddd, dd.MM.yyyy', $culture)
 }
 
+# Pausenanzeige Soll/Ist (Issue #5) - reine Information, nur fuer Tage nach
+# der neuen Pausenregel. $null = nichts anzeigen (alte Regel/kein Abschnitt).
+#  Erfuellt      : genommene Pausen >= Soll
+#  Automatisch   : feste Betriebspause greift (offener Rest wird automatisch abgezogen)
+#  KeineFeste    : Hinweis "feste Betriebspause wird heute nicht abgezogen"
+#  Arbeitsblock  : Hinweis "ueber 6 h am Stueck ohne Pause" (§ 4 ArbZG)
+#  Symbol        : dezentes Symbol in der Kompaktansicht
+function Get-PauseMarker {
+    param($Comp)
+    if ($null -eq $Comp -or [string]$Comp.PauseRule -ne 'Neu' -or $null -eq $Comp.Beginn) { return $null }
+    $erfuellt = ($Comp.OffenPause -le [TimeSpan]::Zero)
+    $auto = [bool]$Comp.FestePauseAktiv
+    return @{
+        Soll         = $Comp.SollPause
+        Ist          = $Comp.IstPause
+        Offen        = $Comp.OffenPause
+        Erfuellt     = $erfuellt
+        Automatisch  = $auto
+        KeineFeste   = [bool]$Comp.FestePauseEntfaellt
+        Arbeitsblock = [bool]$Comp.HinweisArbeitsblock
+        Symbol       = (((-not $erfuellt) -and (-not $auto)) -or [bool]$Comp.HinweisArbeitsblock)
+    }
+}
+
 # Baut die zweite Zeile der kompakten Ansicht aus den konfigurierten Feldern
 function Get-CompactStatusText {
     param($Comp, $Day)
@@ -5088,6 +5115,13 @@ function Get-CompactStatusText {
     }
     elseif ($Comp.WarnActive) {
         [void]$parts.Add('WARNUNG: noch ' + (Format-Duration $Comp.MaxRest) + ' bis 10:00')
+    }
+    # Dezentes Symbol, solange Pausenzeit offen ist (nicht automatisch
+    # abgezogen) oder ein Arbeitsblock ueber 6 h ohne Pause laeuft (Issue #5).
+    # In den Einstellungen abschaltbar (PauseSymbolEnabled).
+    if ($Day.Status -eq 'Aktiv' -and $script:App.Settings['PauseSymbolEnabled'] -ne $false) {
+        $marker = Get-PauseMarker -Comp $Comp
+        if ($marker -and $marker.Symbol) { [void]$parts.Add([string][char]0x2615) }
     }
     # Fehlgeschlagener Speichervorgang: Zustand ist eindeutig gekennzeichnet,
     # bis ein Wiederholungsversuch erfolgreich war (keine stille Erfolgsannahme).
@@ -5168,7 +5202,7 @@ $script:ExtendedXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="ArbeitszeitTool - Erweiterte Ansicht"
-        Width="1000" Height="660" MinWidth="760" MinHeight="480"
+        Width="1000" Height="750" MinWidth="760" MinHeight="480"
         Background="#FF171C24" WindowStartupLocation="CenterScreen">
     <Window.Resources>
 <!--THEME-->
@@ -5379,6 +5413,27 @@ function Get-ExtendedValuesText {
     if (-not $detailsVisible) { $pauseText = '••:••'; $lockText = '••:••' }
     [void]$lines.Add(('Manuelle Pausen    {0}' -f $pauseText))
     [void]$lines.Add(('Sperrzeit          {0}' -f $lockText))
+
+    # Pausenanzeige Soll/Ist (Issue #5); Ist/offen unterliegen dem Sichtschutz
+    $marker = Get-PauseMarker -Comp $Comp
+    if ($marker) {
+        $istText = Format-Duration $marker.Ist
+        $offenText = Format-Duration $marker.Offen
+        if (-not $detailsVisible) { $istText = '••:••'; $offenText = '••:••' }
+        [void]$lines.Add('')
+        [void]$lines.Add(('Pausen Soll/Ist    {0} / {1}' -f (Format-Duration $marker.Soll), $istText))
+        if ($marker.Erfuellt) { [void]$lines.Add('Pausen-Soll        erfüllt ✓') }
+        elseif ($marker.Automatisch) { [void]$lines.Add(('Pause offen        {0} (autom.)' -f $offenText)) }
+        else { [void]$lines.Add(('Pause offen        {0}' -f $offenText)) }
+        if ($marker.KeineFeste) {
+            [void]$lines.Add('! Feste Betriebspause wird heute')
+            [void]$lines.Add('  nicht automatisch abgezogen')
+        }
+        if ($marker.Arbeitsblock) {
+            [void]$lines.Add('! Über 6 Std. am Stück ohne Pause')
+            [void]$lines.Add('  (§ 4 ArbZG)')
+        }
+    }
     return ($lines.ToArray() -join "`r`n")
 }
 
@@ -5482,6 +5537,13 @@ function Show-ExtendedWindow {
         $win = New-XamlWindow -Xaml $script:ExtendedXaml
         $win.Title = "$($win.Title) (v$($script:AppVersion))"
         Add-DarkWindowChrome -Window $win
+        # Kleine Bildschirme / hohe Skalierung: Starthoehe auf den
+        # Arbeitsbereich begrenzen (wie bei den Einstellungen)
+        try {
+            $workHeight = [System.Windows.SystemParameters]::WorkArea.Height
+            if ($workHeight -gt 200 -and $win.Height -gt ($workHeight - 20)) { $win.Height = $workHeight - 20 }
+        }
+        catch { }
         $script:App.Ui.Extended = $win
         Register-ExtendedWindowEvents -Window $win
     }
@@ -6056,6 +6118,15 @@ function Get-DaySummaryText {
         ('Plus/Minus:          {0}' -f (Format-Duration $abweichung -WithSign:($abweichung.Ticks -ge 0))),
         ('Max. Zeit erreicht:  {0}' -f $maxText)
     )
+    # Pausenanzeige Soll/Ist (Issue #5) - nur Tage nach der neuen Pausenregel
+    $marker = Get-PauseMarker -Comp $comp
+    if ($marker) {
+        $state = 'erfüllt'
+        if (-not $marker.Erfuellt) { $state = (Format-Duration $marker.Offen) + ' offen' }
+        $lines += ('Pausen Soll/Ist:     {0} / {1}  ({2})' -f (Format-Duration $marker.Soll), (Format-Duration $marker.Ist), $state)
+        if ($marker.KeineFeste) { $lines += 'Hinweis:             keine feste Betriebspause (Pausen erfasst)' }
+        if ($marker.Arbeitsblock) { $lines += 'Hinweis:             über 6 Std. am Stück ohne Pause (§ 4 ArbZG)' }
+    }
     return ($lines -join "`r`n")
 }
 
@@ -6752,7 +6823,7 @@ function Set-CompactFieldsPreset {
 $script:SettingsXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Einstellungen" Width="780" Height="620" MinWidth="680" MinHeight="480"
+        Title="Einstellungen" Width="780" Height="920" MinWidth="680" MinHeight="480"
         Background="#FF171C24" WindowStartupLocation="CenterScreen" ResizeMode="CanResize" Topmost="True">
     <Window.Resources>
 <!--THEME-->
@@ -6859,6 +6930,14 @@ $script:SettingsXaml = @'
                                             ToolTip="Das Minimum-Preset verbirgt Werte nur in der Oberfläche. Es ist keine Verschlüsselungs- oder Zugriffssperre."/>
                                 </Grid>
                                 <TextBlock Text="Hinweis: Das Minimum-Preset (nur Uhrzeit, Datum, Kalenderwoche und Status) verbirgt Werte nur in der Oberfläche. Es ist keine Verschlüsselungs- oder Zugriffssperre." TextWrapping="Wrap" Foreground="#FFAAB8C6" Margin="0,6,0,0"/>
+                            </StackPanel>
+                        </GroupBox>
+                        <GroupBox Header="Pausensymbol">
+                            <StackPanel>
+                                <CheckBox x:Name="ChkPauseSymbol">
+                                    <TextBlock Text="Kaffee-Symbol (&#x2615;) anzeigen, solange Pausenzeit offen ist oder über 6 Std. am Stück ohne Pause gearbeitet wird" TextWrapping="Wrap"/>
+                                </CheckBox>
+                                <TextBlock Text="Gilt unabhängig von der Feldauswahl und den Presets. Die Soll/Ist-Anzeige in der erweiterten Ansicht bleibt immer sichtbar." TextWrapping="Wrap" Foreground="#FFAAB8C6" Margin="0,6,0,0"/>
                             </StackPanel>
                         </GroupBox>
                         <GroupBox Header="Eigene Presets (max. 5)">
@@ -7016,6 +7095,7 @@ function Show-SettingsDialog {
     $win.FindName('ChkTopmostReassert').IsChecked = [bool]$s['TopmostReassert']
     $win.FindName('ChkTray').IsChecked = [bool]$s['TrayIconEnabled']
     $win.FindName('ChkSeconds').IsChecked = [bool]$s['ShowSeconds']
+    $win.FindName('ChkPauseSymbol').IsChecked = ($s['PauseSymbolEnabled'] -ne $false)
     if ([string]$s['StartView'] -eq 'Erweitert') { $win.FindName('RbStartErweitert').IsChecked = $true }
     else { $win.FindName('RbStartKompakt').IsChecked = $true }
     $win.FindName('ChkKeepAlive').IsChecked = [bool]$s['KeepAliveEnabled']
@@ -7339,6 +7419,7 @@ function Show-SettingsDialog {
             $s['TopmostReassert'] = [bool]$win.FindName('ChkTopmostReassert').IsChecked
             $s['TrayIconEnabled'] = [bool]$win.FindName('ChkTray').IsChecked
             $s['ShowSeconds'] = [bool]$win.FindName('ChkSeconds').IsChecked
+            $s['PauseSymbolEnabled'] = [bool]$win.FindName('ChkPauseSymbol').IsChecked
             $s['StartView'] = 'Kompakt'
             if ($win.FindName('RbStartErweitert').IsChecked) { $s['StartView'] = 'Erweitert' }
             $s['KeepAliveEnabled'] = [bool]$win.FindName('ChkKeepAlive').IsChecked

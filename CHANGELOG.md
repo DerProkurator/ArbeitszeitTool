@@ -4,6 +4,30 @@ Alle Änderungen am ArbeitszeitTool, neueste Version zuerst. Die aktuelle Versio
 `ArbeitszeitTool.ps1` (`$script:AppVersion`). Diese Datei gehört zum Repository, ist aber
 nicht Teil des ZIP-Downloads.
 
+## 1.6.0 – 23.11.2026 – Genommene Pausen statt fester Betriebspause
+
+Issue #5. Gilt für Arbeitstage ab dem 24.11.2026; ältere Tage rechnen unverändert.
+
+- **Problem:** Im Betrieb wurden immer die vollen 45 Minuten feste Pause abgezogen, auch wenn
+  bereits Pausen genommen wurden. Lücken zwischen Abschnitten zählten nicht, eine manuelle
+  Pause war im Betrieb nicht möglich. Netto, Soll-Ende und Max-Ende fielen zu ungünstig aus.
+- Die feste Betriebspause greift nur noch an reinen Betriebstagen ohne manuelle Pause, Lücke
+  oder Moduswechsel. Sonst werden die echten Pausen abgezogen – auch rückwirkend, wenn eine
+  Pause nachgetragen wird. Windows-Sperren zählen im Betrieb weiterhin als Arbeitszeit;
+  Homeoffice bleibt unverändert.
+- „Pause starten/beenden" (Schaltfläche, Kontextmenü, Tray) auch im Betrieb. Jeder
+  Moduswechsel beendet eine laufende Pause.
+- Pausenanzeige Soll/Ist in den Tageswerten und der Tageszusammenfassung (Soll 45 Min. im
+  Betrieb, sonst 30/45 Min. gestaffelt; Ist = Pausenblöcke ab 15 Min.), Hinweis bei
+  entfallener fester Pause und bei über 6 Std. am Stück ohne Pause (§ 4 ArbZG), dezentes ☕
+  in der Kompaktansicht (abschaltbar unter Einstellungen → Kompakte Ansicht).
+- Erweiterte Ansicht (750 px) und Einstellungen (920 px) öffnen höher, damit Tageswerte und
+  der Reiter „Kompakte Ansicht" ohne Scrollbalken passen; auf kleinen Bildschirmen wird die
+  Höhe auf den Arbeitsbereich begrenzt.
+- Zentrales Pausenmodell `Get-DayPauseModel`: Tagesberechnung, Nettozeit zum Zeitpunkt,
+  10-Stunden-Grenze und Werte je Abschnitt rechnen nach denselben Regeln. Die bisherige
+  Formel liegt als Referenz in den Tests; alte Tage werden dagegen geprüft.
+
 ## 1.5.4 – 02.11.2026 – Passwortwechsel gegen konkurrierende Schreiber
 
 Security-Audit vom 02.11.2026, Befund AZT-SEC-02.
