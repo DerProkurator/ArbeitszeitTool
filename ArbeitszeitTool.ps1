@@ -3340,11 +3340,10 @@ function Switch-WorkMode {
     $oldMode = '-'
     if ($oldSeg) { $oldMode = $oldSeg.Mode }
 
-    # Beim Verlassen des Homeoffice eine noch laufende manuelle Pause sauber
-    # beenden (ohne eigenen Speichervorgang - es wird unten genau einmal gespeichert)
-    if ($oldMode -eq 'Homeoffice' -and $NewMode -ne 'Homeoffice') {
-        Stop-ManualPauseInterval -Day $Day -End $EndTime -Silent -NoSave | Out-Null
-    }
+    # Bei JEDEM Moduswechsel eine noch laufende manuelle Pause sauber beenden
+    # (seit der Pause im Betrieb, Issue #5; ohne eigenen Speichervorgang -
+    # es wird unten genau einmal gespeichert)
+    Stop-ManualPauseInterval -Day $Day -End $EndTime -Silent -NoSave | Out-Null
 
     $newSeg = New-SegmentObject -Mode $NewMode -Start $StartTime -Running $true
     [void]$Day['Segments'].Add($newSeg)
@@ -3356,6 +3355,19 @@ function Switch-WorkMode {
     }
     Write-AppLog -Message "Moduswechsel: $oldMode -> $NewMode (Ende $(Format-Clock $EndTime), Beginn $(Format-Clock $StartTime))"
     return $newSeg
+}
+
+# Darf jetzt eine manuelle Pause GESTARTET werden? Zentrale Regel fuer
+# Schaltflaeche, Kontext-/Traymenue und Invoke-TogglePauseFlow: aktiver Tag,
+# laufender Abschnitt, Maximalzeit nicht erreicht, keine offene Pause; im
+# Homeoffice immer, im Betrieb nur nach neuer Pausenregel (ab Stichtag) -
+# vorher wuerde eine Pause im Betrieb nicht abgezogen.
+function Test-ManualPauseStartAllowed {
+    param([Parameter(Mandatory)]$Day, [Parameter(Mandatory)]$Comp)
+    if ($Day.Status -ne 'Aktiv' -or $Comp.MaxReached -or $Comp.OpenPause) { return $false }
+    if ($Comp.RunningMode -eq 'Homeoffice') { return $true }
+    if ($Comp.RunningMode -eq 'Betrieb') { return (Test-NewPauseRule -Day $Day) }
+    return $false
 }
 
 # Benutzergesteuerte Aktion: bei fehlgeschlagenem Speichervorgang wird die
@@ -5457,7 +5469,7 @@ function Update-ExtendedWindow {
     }
     else {
         $btnPause.Content = 'Pause starten'
-        $btnPause.IsEnabled = ($hasActive -and $Comp.RunningMode -eq 'Homeoffice' -and -not $Comp.MaxReached)
+        $btnPause.IsEnabled = ($hasActive -and (Test-ManualPauseStartAllowed -Day $Day -Comp $Comp))
     }
     $win.FindName('BtnAddSegment').IsEnabled = ($null -ne $Day)
     $win.FindName('BtnComment').IsEnabled = ($null -ne $Day)
@@ -11922,11 +11934,16 @@ function Invoke-TogglePauseFlow {
     if ($comp.OpenPause) {
         Stop-ManualPauseInterval -Day $day | Out-Null
     }
-    elseif ($comp.RunningMode -eq 'Homeoffice') {
+    elseif (Test-ManualPauseStartAllowed -Day $day -Comp $comp) {
         Start-ManualPauseInterval -Day $day | Out-Null
     }
+    elseif ($comp.RunningMode -eq 'Betrieb' -and -not $comp.MaxReached) {
+        $ab = [datetime]::ParseExact([string]$script:Const.PauseRuleNewFrom, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+        Show-Info -Message ('Eine manuelle Pause im Betrieb ist erst für Arbeitstage ab dem {0} vorgesehen. Für diesen Tag gilt noch die feste Betriebspause.' -f $ab.ToString('dd.MM.yyyy'))
+        return
+    }
     else {
-        Show-Info -Message 'Der manuelle Pausenknopf ist nur im Homeoffice-Modus vorgesehen. Im Betrieb läuft die Zeit nach den Betriebsregeln weiter.'
+        Show-Info -Message 'Derzeit kann keine Pause gestartet werden (kein laufender Abschnitt oder maximale Arbeitszeit erreicht).'
         return
     }
     Invoke-MainRefresh -ForceTables
@@ -12174,7 +12191,7 @@ function Update-MenuState {
     $pauseEnabled = $false
     if ($comp) {
         if ($comp.OpenPause) { $pauseHeader = 'Pause beenden'; $pauseEnabled = $true }
-        elseif ($comp.RunningMode -eq 'Homeoffice' -and -not $comp.MaxReached) { $pauseEnabled = $true }
+        elseif (Test-ManualPauseStartAllowed -Day $day -Comp $comp) { $pauseEnabled = $true }
     }
 
     $items = $script:App.Ui.MenuItems

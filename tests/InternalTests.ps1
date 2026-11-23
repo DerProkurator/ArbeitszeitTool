@@ -1235,6 +1235,69 @@ function Invoke-InternalTests {
         Switch-WorkMode -Day $gapDay -NewMode 'Betrieb' -EndTime (Get-Date) -StartTime (Get-Date) | Out-Null
         & $assert 'Test 75: Moduswechsel beendet den alten Abschnitt und beginnt genau EINEN neuen' '2|False|Betrieb|True' ("$(@($gapDay['Segments']).Count)|$($gapDay['Segments'][0]['Running'])|$($gapDay['Segments'][1]['Mode'])|$($gapDay['Segments'][1]['Running'])")
 
+        # --- Test 133 (Issue #5): Pause im Betrieb erfassen ---
+        # Stichtag wird je Fall ausdruecklich gesetzt (unabhaengig vom Testdatum)
+        $origRule133 = $script:Const.PauseRuleNewFrom
+        $origRefresh133 = ${function:Invoke-MainRefresh}
+        $origCurrent133 = $script:App.CurrentDay
+        try {
+            ${function:Invoke-MainRefresh} = { param([switch]$ForceTables) }
+            $today133 = (Get-Date).ToString('yyyy-MM-dd')
+            $tomorrow133 = (Get-Date).AddDays(1).ToString('yyyy-MM-dd')
+            $mk133 = {
+                param([string]$Mode)
+                $d = New-TestDay -DateText $today133
+                [void]$d['Segments'].Add((New-SegmentObject -Mode $Mode -Start (Get-Date).AddHours(-2) -Running $true))
+                return $d
+            }
+            $allowed133 = {
+                param($d)
+                return [string](Test-ManualPauseStartAllowed -Day $d -Comp (Get-DayComputation -Day $d -Now (Get-Date)))
+            }
+
+            # a) Wann darf eine Pause gestartet werden?
+            $script:Const.PauseRuleNewFrom = $today133
+            $bNew = & $mk133 'Betrieb'
+            $hNew = & $mk133 'Homeoffice'
+            $bMax = & $mk133 'Betrieb'; $bMax['MaxReached'] = $true
+            $bOpen = & $mk133 'Betrieb'; [void]$bOpen['ManualPauses'].Add((New-IntervalObject -Start (Get-Date).AddMinutes(-5)))
+            $noRun = New-TestDay -DateText $today133
+            $r133a = "$(& $allowed133 $bNew)|$(& $allowed133 $hNew)|$(& $allowed133 $bMax)|$(& $allowed133 $bOpen)|$(& $allowed133 $noRun)"
+            $script:Const.PauseRuleNewFrom = $tomorrow133
+            $r133a += "|$(& $allowed133 (& $mk133 'Betrieb'))|$(& $allowed133 (& $mk133 'Homeoffice'))"
+            & $assert 'Test 133a: Pause starten - Betrieb/HO ab Stichtag ja, max. erreicht/offene Pause/kein Abschnitt nein, Betrieb vor Stichtag nein, HO immer' 'True|True|False|False|False|False|True' $r133a
+
+            # b) Knopf im Betrieb (neue Regel): starten und beenden ueber Invoke-TogglePauseFlow
+            $script:Const.PauseRuleNewFrom = $today133
+            $dayB133 = & $mk133 'Betrieb'
+            $script:App.CurrentDay = $dayB133
+            Invoke-TogglePauseFlow
+            $afterStart133 = "$(@($dayB133['ManualPauses']).Count)|$($null -eq $dayB133['ManualPauses'][0]['End'])"
+            Invoke-TogglePauseFlow
+            & $assert 'Test 133b: Pausenknopf im Betrieb startet und beendet eine manuelle Pause' '1|True -> 1|False' ("$afterStart133 -> $(@($dayB133['ManualPauses']).Count)|$($null -eq $dayB133['ManualPauses'][0]['End'])")
+
+            # c) Vor dem Stichtag bleibt der Knopf im Betrieb ohne Wirkung
+            $script:Const.PauseRuleNewFrom = $tomorrow133
+            $dayOld133 = & $mk133 'Betrieb'
+            $script:App.CurrentDay = $dayOld133
+            Invoke-TogglePauseFlow
+            & $assert 'Test 133c: Pausenknopf im Betrieb vor dem Stichtag legt keine Pause an' '0' ([string]@($dayOld133['ManualPauses']).Count)
+
+            # d) Jeder Moduswechsel beendet eine laufende Pause - auch Betrieb -> Homeoffice
+            $script:Const.PauseRuleNewFrom = $today133
+            $daySw133 = & $mk133 'Betrieb'
+            $pStart133 = (Get-Date).AddMinutes(-30)
+            [void]$daySw133['ManualPauses'].Add((New-IntervalObject -Start $pStart133))
+            $swEnd133 = (Get-Date).AddMinutes(-10)
+            $seg133 = Switch-WorkMode -Day $daySw133 -NewMode 'Homeoffice' -EndTime $swEnd133 -StartTime (Get-Date)
+            & $assert 'Test 133d: Moduswechsel Betrieb -> Homeoffice beendet die laufende Pause am Abschnittsende' 'True|True|2' ("$($null -ne $seg133)|$($daySw133['ManualPauses'][0]['End'] -eq (ConvertTo-DateTimeString $swEnd133))|$(@($daySw133['Segments']).Count)")
+        }
+        finally {
+            $script:Const.PauseRuleNewFrom = $origRule133
+            ${function:Invoke-MainRefresh} = $origRefresh133
+            $script:App.CurrentDay = $origCurrent133
+        }
+
         # --- Test 76: Sendervalidierung (URI-Schemas, Zugangsdaten, Grenzen) ---
         $mkStation = { param($u, $n = 'Sender') return [ordered]@{ Id = 'x'; Name = $n; Url = $u } }
         & $assert 'Test 76a: http-Adresse ist zulaessig' '' (Test-RadioStation -Station (& $mkStation 'http://streams.example.de/live/mp3'))
