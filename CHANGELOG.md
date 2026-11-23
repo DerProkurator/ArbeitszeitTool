@@ -20,7 +20,8 @@ Issue #5. Gilt für Arbeitstage ab dem 24.11.2026; ältere Tage rechnen unverän
 - Pausenanzeige Soll/Ist in den Tageswerten und der Tageszusammenfassung (Soll 45 Min. im
   Betrieb, sonst 30/45 Min. gestaffelt; Ist = Pausenblöcke ab 15 Min.), Hinweis bei
   entfallener fester Pause und bei über 6 Std. am Stück ohne Pause (§ 4 ArbZG), dezentes ☕
-  in der Kompaktansicht (abschaltbar unter Einstellungen → Kompakte Ansicht).
+  in der Kompaktansicht (abschaltbar unter Einstellungen → Kompakte Ansicht; beim Preset
+  „Minimum“ nie angezeigt, da dort keine Pausenwerte erscheinen sollen).
 - Erweiterte Ansicht (750 px) und Einstellungen (920 px) öffnen höher, damit Tageswerte und
   der Reiter „Kompakte Ansicht" ohne Scrollbalken passen; auf kleinen Bildschirmen wird die
   Höhe auf den Arbeitsbereich begrenzt.

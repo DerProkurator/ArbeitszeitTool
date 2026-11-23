@@ -3738,6 +3738,15 @@ function Invoke-InternalTests {
         & $assert 'Test 134i: Symbol abschaltbar (Standard an, gespeichertes Aus bleibt aus)' 'False|True|False|True' ("$symOff134|$((Get-DefaultSettings)['PauseSymbolEnabled'])|$($valOff134['PauseSymbolEnabled'])|$($valMissing134['PauseSymbolEnabled'])")
         & $assert 'Test 134j: Einstellungsdialog enthaelt den Schalter fuer das Pausensymbol' 'True' ([string]$script:SettingsXaml.Contains('x:Name="ChkPauseSymbol"'))
 
+        # f3) Minimum-Preset (keine Pausenwerte): Symbol bleibt verborgen; mit weiterem Feld wieder sichtbar
+        $origFields134 = $script:App.Settings['CompactFields']
+        $script:App.Settings['CompactFields'] = @($script:CompactPresets['Minimum'])
+        $symMin134 = (& $compact134 $d134 '14:20').Contains($cup)
+        $script:App.Settings['CompactFields'] = @('Warnstatus', 'Beginn')
+        $symMore134 = (& $compact134 $d134 '14:20').Contains($cup)
+        $script:App.Settings['CompactFields'] = $origFields134
+        & $assert 'Test 134k: kein Pausensymbol beim Minimum-Preset, mit weiterem Feld wieder sichtbar' 'False|True' ("$symMin134|$symMore134")
+
         # g) Zusammenfassung (Tagesabschluss)
         $sum134 = Get-DaySummaryText -Day $d134 -Now (Get-TestNow $d134 '14:20')
         $sumOld134 = Get-DaySummaryText -Day $old134 -Now (Get-TestNow $old134 '14:20')

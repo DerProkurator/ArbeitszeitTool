@@ -5186,8 +5186,14 @@ function Get-CompactStatusText {
     }
     # Dezentes Symbol, solange Pausenzeit offen ist (nicht automatisch
     # abgezogen) oder ein Arbeitsblock ueber 6 h ohne Pause laeuft (Issue #5).
-    # In den Einstellungen abschaltbar (PauseSymbolEnabled).
-    if ($Day.Status -eq 'Aktiv' -and $script:App.Settings['PauseSymbolEnabled'] -ne $false) {
+    # In den Einstellungen abschaltbar (PauseSymbolEnabled). Beim Minimum-Preset
+    # (bzw. einer Feldauswahl nur aus dessen Feldern) bleibt es verborgen, da
+    # dort keine Pausenwerte erscheinen sollen.
+    $minimumOnly = $true
+    foreach ($f in @($script:App.Settings['CompactFields'])) {
+        if (@($script:CompactPresets['Minimum']) -notcontains [string]$f) { $minimumOnly = $false }
+    }
+    if ($Day.Status -eq 'Aktiv' -and $script:App.Settings['PauseSymbolEnabled'] -ne $false -and -not $minimumOnly) {
         $marker = Get-PauseMarker -Comp $Comp
         if ($marker -and $marker.Symbol) { [void]$parts.Add([string][char]0x2615) }
     }
@@ -7005,7 +7011,7 @@ $script:SettingsXaml = @'
                                 <CheckBox x:Name="ChkPauseSymbol">
                                     <TextBlock Text="Kaffee-Symbol (&#x2615;) anzeigen, solange Pausenzeit offen ist oder über 6 Std. am Stück ohne Pause gearbeitet wird" TextWrapping="Wrap"/>
                                 </CheckBox>
-                                <TextBlock Text="Gilt unabhängig von der Feldauswahl und den Presets. Die Soll/Ist-Anzeige in der erweiterten Ansicht bleibt immer sichtbar." TextWrapping="Wrap" Foreground="#FFAAB8C6" Margin="0,6,0,0"/>
+                                <TextBlock Text="Gilt für alle Feldauswahlen außer dem Preset „Minimum“ (dort nie angezeigt). Die Soll/Ist-Anzeige in der erweiterten Ansicht bleibt immer sichtbar." TextWrapping="Wrap" Foreground="#FFAAB8C6" Margin="0,6,0,0"/>
                             </StackPanel>
                         </GroupBox>
                         <GroupBox Header="Eigene Presets (max. 5)">

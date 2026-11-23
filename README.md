@@ -442,7 +442,7 @@ Beginn: 06:12 | Netto: 06:36 | Soll-Rest: 00:24 | Max-Ende: 16:57
   manuelle Pause)
 - Ein ☕ am Ende der Zeile (seit 1.6.0) erinnert an noch offene Pausenzeit bzw. an einen
   Arbeitsblock über 6 Stunden ohne Pause (siehe „Pausenregel"); abschaltbar unter
-  Einstellungen → Kompakte Ansicht → Pausensymbol
+  Einstellungen → Kompakte Ansicht → Pausensymbol; beim Preset „Minimum“ erscheint es nie
 - Die Felder der zweiten Zeile sind wählbar (Einstellungen → Kompakte Ansicht bzw. eigene
   Presets). Zwei Felder wechseln automatisch beim Erreichen der Sollzeit:
   **Soll-Rest → Überstunden** und **Soll-Ende → Max-Ende** (seit 1.3.1).
