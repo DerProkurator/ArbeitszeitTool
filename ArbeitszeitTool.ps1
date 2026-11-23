@@ -672,6 +672,14 @@ $script:Const = @{
     WarnMinutes             = 585   # 09:45 h  - Vorwarnung
     BetriebPauseMinutes     = 45    # feste Betriebspause
     BetriebPauseNachMinuten = 360   # Pause beginnt nach 6 h Betriebszeit
+    # Pausenregel ab Stichtag (Issue #5): feste Betriebspause nur noch an reinen
+    # Betriebstagen ohne Pause/Luecke/Moduswechsel; Soll/Ist-Anzeige der Pausen
+    PauseRuleNewFrom        = '2026-11-24'  # Arbeitstage ab diesem Datum (yyyy-MM-dd)
+    PauseBlockMinMinutes    = 15    # Pausenbloecke ab dieser Laenge zaehlen als Ist-Pause
+    PauseSollMinutes        = 30    # Soll Homeoffice/gemischt ab Tagesbeginn (Anzeige)
+    PauseSollLangMinutes    = 45    # Soll Homeoffice/gemischt ab 9 h Arbeit (Anzeige)
+    PauseSollLangNachMinuten = 540  # Staffel springt bei 9 h Arbeit auf 45 min
+    ArbeitsblockMaxMinuten  = 360   # Hinweis bei laengerem Block ohne Pause (§ 4 ArbZG)
     HoGapPromptMinutes      = 3     # ab dieser Luecke wird im Homeoffice nachgefragt
     MaxLogEntries           = 5000  # aktuelle Logeintraege im Tresor
     LogArchiveChunk         = 1000  # Anzahl Eintraege, die pro Rotation archiviert werden
@@ -2664,6 +2672,265 @@ function Get-BetriebPauseWindows {
     return ,$windows
 }
 
+# Vereinigt bereits geparste Intervalle (@{Start=[datetime];End=[datetime]}).
+# Direkt aneinandergrenzende Intervalle werden zu einem Block verbunden.
+function Merge-ParsedIntervals {
+    param($Intervals)
+    $sorted = @(@($Intervals) | Where-Object { $null -ne $_ -and $_.End -gt $_.Start } |
+            Sort-Object -Property @{ Expression = { $_.Start } })
+    $merged = New-Object System.Collections.ArrayList
+    foreach ($iv in $sorted) {
+        if ($merged.Count -gt 0 -and $iv.Start -le $merged[$merged.Count - 1].End) {
+            if ($iv.End -gt $merged[$merged.Count - 1].End) { $merged[$merged.Count - 1].End = $iv.End }
+        }
+        else {
+            [void]$merged.Add(@{ Start = $iv.Start; End = $iv.End })
+        }
+    }
+    return ,$merged
+}
+
+# Zeitraum minus vereinigte (sortierte) Unterbrechungen -> verbleibende Teilstuecke
+function Get-IntervalPieces {
+    param(
+        [Parameter(Mandatory)][datetime]$Start,
+        [Parameter(Mandatory)][datetime]$End,
+        $Breaks
+    )
+    $pieces = New-Object System.Collections.ArrayList
+    $cursor = $Start
+    foreach ($iv in @($Breaks)) {
+        if ($null -eq $iv -or $iv.End -le $cursor -or $iv.Start -ge $End) { continue }
+        if ($iv.Start -gt $cursor) { [void]$pieces.Add(@{ Start = $cursor; End = $iv.Start }) }
+        if ($iv.End -gt $cursor) { $cursor = $iv.End }
+    }
+    if ($End -gt $cursor) { [void]$pieces.Add(@{ Start = $cursor; End = $End }) }
+    return ,$pieces
+}
+
+# Gilt fuer diesen Tag die Pausenregel ab Stichtag (Issue #5)? Aeltere Tage
+# werden unveraendert nach der bisherigen Regel berechnet.
+function Test-NewPauseRule {
+    param([Parameter(Mandatory)]$Day)
+    $date = [string]$Day.Date
+    if ($date -eq '') { return $false }
+    return ([string]::CompareOrdinal($date, [string]$script:Const.PauseRuleNewFrom) -ge 0)
+}
+
+# Neue Regel: Greift die feste Betriebspause? Nur an einem reinen Betriebstag
+# ohne manuelle Pause und ohne Luecke zwischen Abschnitten. Bewertet bewusst
+# die GESAMTEN Tagesdaten (nicht nur bis zu einem Zeitpunkt): Nettozeit und
+# Grenzsuche verwenden so fuer jeden Zeitpunkt dieselbe Regel, und eine
+# nachtraeglich eingetragene Pause schaltet die feste Pause rueckwirkend ab.
+function Test-FesteBetriebspauseAktiv {
+    param([Parameter(Mandatory)]$Day)
+    foreach ($iv in @($Day.ManualPauses)) {
+        if ($null -ne $iv) { return $false }
+    }
+    $maxEnd = $null
+    foreach ($seg in (Get-ParsedSegments -Day $Day -Now ([datetime]::MaxValue))) {
+        if ($seg.End -le $seg.Start) { continue }
+        if ([string]$seg.Mode -ne 'Betrieb') { return $false }
+        if ($null -ne $maxEnd -and $seg.Start -gt $maxEnd) { return $false }
+        if ($null -eq $maxEnd -or $seg.End -gt $maxEnd) { $maxEnd = $seg.End }
+    }
+    return $true
+}
+
+# ZENTRALES Pausenmodell eines Tages zum Zeitpunkt $Time. Reine Funktion:
+# veraendert nichts, speichert nichts, protokolliert nichts.
+#  - Alte Regel (vor Stichtag): feste Betriebspause nach 6 h Betriebszeit,
+#    manuelle Pausen/Sperren nur im Homeoffice - identisch zur bisherigen Rechnung.
+#  - Neue Regel: feste Betriebspause nur, wenn Test-FesteBetriebspauseAktiv;
+#    sonst werden im Betrieb die manuellen Pausen abgezogen (Sperren nicht).
+#    Homeoffice unveraendert.
+#  - Pausenanzeige (Soll/Ist, nur Information): Pausenbloecke aus Luecken,
+#    manuellen Pausen und Homeoffice-Sperren; Ist zaehlt Bloecke ab
+#    PauseBlockMinMinutes plus die bereits abgezogene feste Betriebspause.
+# Ohne -CapAtTime gilt die Semantik von Get-DayComputation (nur laufende
+# Abschnitte/offene Intervalle enden bei $Time), mit -CapAtTime die von
+# Get-DayNettoAtTime (alle Abschnitte werden am Zeitpunkt gekappt).
+function Get-DayPauseModel {
+    param(
+        [Parameter(Mandatory)]$Day,
+        [Parameter(Mandatory)][datetime]$Time,
+        [switch]$CapAtTime,
+        # Nur die Zeitwerte (fuer die Binaersuche der 10-h-Grenze) - ohne
+        # Pausenbloecke, Soll/Ist und Arbeitsblock-Hinweis
+        [switch]$NettoOnly
+    )
+    $isNew = Test-NewPauseRule -Day $Day
+    $useFeste = $true
+    if ($isNew) { $useFeste = Test-FesteBetriebspauseAktiv -Day $Day }
+
+    $segs = New-Object System.Collections.ArrayList
+    foreach ($seg in (Get-ParsedSegments -Day $Day -Now $Time)) {
+        $e = $seg.End
+        if ($CapAtTime -and $e -gt $Time) { $e = $Time }
+        if ($e -le $seg.Start) { continue }
+        [void]$segs.Add(@{ Mode = [string]$seg.Mode; Start = $seg.Start; End = $e })
+    }
+    $betriebSegs = @($segs | Where-Object { $_.Mode -eq 'Betrieb' })
+    $hoSegs = @($segs | Where-Object { $_.Mode -eq 'Homeoffice' })
+
+    $lockMerged = Merge-TimeIntervals -Intervals $Day.LockIntervals -Now $Time
+    $pauseMerged = Merge-TimeIntervals -Intervals $Day.ManualPauses -Now $Time
+    $allNonWork = New-Object System.Collections.ArrayList
+    foreach ($iv in @($Day.LockIntervals)) { [void]$allNonWork.Add($iv) }
+    foreach ($iv in @($Day.ManualPauses)) { [void]$allNonWork.Add($iv) }
+    $nonWorkMerged = Merge-TimeIntervals -Intervals $allNonWork -Now $Time
+
+    # --- Betrieb ---
+    $betriebBrutto = [TimeSpan]::Zero
+    foreach ($seg in $betriebSegs) { $betriebBrutto += ($seg.End - $seg.Start) }
+    $festeAbzug = [TimeSpan]::Zero
+    $pauseWindows = New-Object System.Collections.ArrayList
+    $betriebManuell = [TimeSpan]::Zero
+    if ($useFeste) {
+        $sixHours = [TimeSpan]::FromMinutes($script:Const.BetriebPauseNachMinuten)
+        $maxPause = [TimeSpan]::FromMinutes($script:Const.BetriebPauseMinutes)
+        $festeAbzug = $betriebBrutto - $sixHours
+        if ($festeAbzug -lt [TimeSpan]::Zero) { $festeAbzug = [TimeSpan]::Zero }
+        if ($festeAbzug -gt $maxPause) { $festeAbzug = $maxPause }
+        $pauseWindows = Get-BetriebPauseWindows -BetriebSegments $betriebSegs
+    }
+    else {
+        foreach ($seg in $betriebSegs) {
+            $betriebManuell += Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $pauseMerged
+        }
+    }
+    $betriebNetto = $betriebBrutto - $festeAbzug - $betriebManuell
+
+    # --- Homeoffice: Sperrzeiten und manuelle Pausen als vereinigte Menge ---
+    $hoBrutto = [TimeSpan]::Zero
+    $hoAbzug = [TimeSpan]::Zero
+    $sperrZeit = [TimeSpan]::Zero
+    $hoManuell = [TimeSpan]::Zero
+    foreach ($seg in $hoSegs) {
+        $hoBrutto += ($seg.End - $seg.Start)
+        $hoAbzug += Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $nonWorkMerged
+        $sperrZeit += Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $lockMerged
+        $hoManuell += Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $pauseMerged
+    }
+    $hoNetto = $hoBrutto - $hoAbzug
+    $netto = $betriebNetto + $hoNetto
+
+    # Abgezogene Unterbrechungen je Modus (Grundlage der Werte je Abschnitt)
+    $betriebBreaks = $pauseMerged
+    if ($useFeste) { $betriebBreaks = $pauseWindows }
+    $rule = 'Alt'
+    if ($isNew) { $rule = 'Neu' }
+    $model = @{
+        Rule                 = $rule
+        IsNewRule            = $isNew
+        FestePauseAktiv      = $useFeste
+        BetriebBrutto        = $betriebBrutto
+        BetriebNetto         = $betriebNetto
+        FesteAbzug           = $festeAbzug
+        PauseWindows         = $pauseWindows
+        BetriebManuellePause = $betriebManuell
+        BetriebBreaks        = $betriebBreaks
+        HoBreaks             = $nonWorkMerged
+        HoBrutto             = $hoBrutto
+        HoAbzug              = $hoAbzug
+        HoNetto              = $hoNetto
+        SperrZeit            = $sperrZeit
+        ManuellePause        = ($hoManuell + $betriebManuell)
+        Netto                = $netto
+    }
+    if ($NettoOnly) { return $model }
+
+    # --- Pausenbloecke: Luecken, manuelle Pausen, Sperren im Homeoffice ---
+    $minBlock = [TimeSpan]::FromMinutes($script:Const.PauseBlockMinMinutes)
+    $blocks = New-Object System.Collections.ArrayList
+    if ($segs.Count -gt 0) {
+        $dayStart = $segs[0].Start
+        $dayEnd = $segs[0].End
+        foreach ($seg in $segs) { if ($seg.End -gt $dayEnd) { $dayEnd = $seg.End } }
+        $cand = New-Object System.Collections.ArrayList
+        $maxEnd = $segs[0].End
+        foreach ($seg in $segs) {
+            if ($seg.Start -gt $maxEnd) { [void]$cand.Add(@{ Start = $maxEnd; End = $seg.Start }) }
+            if ($seg.End -gt $maxEnd) { $maxEnd = $seg.End }
+        }
+        foreach ($iv in $pauseMerged) {
+            $s = $iv.Start
+            if ($dayStart -gt $s) { $s = $dayStart }
+            $e = $iv.End
+            if ($dayEnd -lt $e) { $e = $dayEnd }
+            if ($e -gt $s) { [void]$cand.Add(@{ Start = $s; End = $e }) }
+        }
+        foreach ($seg in $hoSegs) {
+            foreach ($iv in $lockMerged) {
+                $s = $iv.Start
+                if ($seg.Start -gt $s) { $s = $seg.Start }
+                $e = $iv.End
+                if ($seg.End -lt $e) { $e = $seg.End }
+                if ($e -gt $s) { [void]$cand.Add(@{ Start = $s; End = $e }) }
+            }
+        }
+        foreach ($b in (Merge-ParsedIntervals -Intervals $cand)) {
+            $dur = $b.End - $b.Start
+            [void]$blocks.Add(@{ Start = $b.Start; End = $b.End; Dauer = $dur; Zaehlt = ($dur -ge $minBlock) })
+        }
+    }
+
+    # --- Soll/Ist (nur Anzeige) ---
+    $ist = [TimeSpan]::Zero
+    foreach ($b in $blocks) { if ($b.Zaehlt) { $ist += $b.Dauer } }
+    if ($useFeste) { $ist += $festeAbzug }
+    $soll = [TimeSpan]::Zero
+    if ($segs.Count -gt 0) {
+        if ($hoSegs.Count -eq 0) {
+            $soll = [TimeSpan]::FromMinutes($script:Const.BetriebPauseMinutes)
+        }
+        else {
+            $soll = [TimeSpan]::FromMinutes($script:Const.PauseSollMinutes)
+            if ($netto -ge [TimeSpan]::FromMinutes($script:Const.PauseSollLangNachMinuten)) {
+                $soll = [TimeSpan]::FromMinutes($script:Const.PauseSollLangMinutes)
+            }
+        }
+    }
+    $offen = $soll - $ist
+    if ($offen -lt [TimeSpan]::Zero) { $offen = [TimeSpan]::Zero }
+
+    # --- Laengster zusammenhaengender Arbeitsblock ohne zaehlende Pause ---
+    $breaks = New-Object System.Collections.ArrayList
+    foreach ($b in $blocks) { if ($b.Zaehlt) { [void]$breaks.Add($b) } }
+    foreach ($w in $pauseWindows) { [void]$breaks.Add($w) }
+    $breaksMerged = Merge-ParsedIntervals -Intervals $breaks
+    $pieces = New-Object System.Collections.ArrayList
+    foreach ($seg in $segs) {
+        $deduct = $nonWorkMerged
+        if ($seg.Mode -eq 'Betrieb') { $deduct = $betriebBreaks }
+        foreach ($p in (Get-IntervalPieces -Start $seg.Start -End $seg.End -Breaks $deduct)) { [void]$pieces.Add($p) }
+    }
+    $longest = [TimeSpan]::Zero
+    $current = [TimeSpan]::Zero
+    $prev = $null
+    foreach ($p in @($pieces | Sort-Object -Property @{ Expression = { $_.Start } })) {
+        if ($null -ne $prev -and $p.Start -gt $prev.End -and
+            (Get-OverlapDuration -Start $prev.End -End $p.Start -MergedIntervals $breaksMerged) -gt [TimeSpan]::Zero) {
+            $current = [TimeSpan]::Zero
+        }
+        $current += ($p.End - $p.Start)
+        if ($current -gt $longest) { $longest = $current }
+        if ($null -eq $prev -or $p.End -gt $prev.End) { $prev = $p }
+    }
+
+    $hasBetrieb = $false
+    foreach ($seg in @($Day.Segments)) { if ($null -ne $seg -and [string]$seg.Mode -eq 'Betrieb') { $hasBetrieb = $true } }
+
+    $model['FestePauseEntfaellt'] = ($isNew -and $hasBetrieb -and -not $useFeste)
+    $model['Pausenbloecke'] = $blocks
+    $model['IstPause'] = $ist
+    $model['SollPause'] = $soll
+    $model['OffenPause'] = $offen
+    $model['LaengsterArbeitsblock'] = $longest
+    $model['HinweisArbeitsblock'] = ($longest -gt [TimeSpan]::FromMinutes($script:Const.ArbeitsblockMaxMinuten))
+    return $model
+}
+
 # Zentrale Tagesberechnung. Reine Funktion: Tag + Bezugszeitpunkt -> alle Werte.
 function Get-DayComputation {
     param(
@@ -2671,42 +2938,17 @@ function Get-DayComputation {
         [datetime]$Now = (Get-Date)
     )
     $segs = Get-ParsedSegments -Day $Day -Now $Now
-    $betriebSegs = @($segs | Where-Object { $_.Mode -eq 'Betrieb' })
-    $hoSegs = @($segs | Where-Object { $_.Mode -eq 'Homeoffice' })
 
-    # --- Betrieb: Sperren/Pausen zaehlen weiter, feste Pause nach 6 h ---
-    $betriebBrutto = [TimeSpan]::Zero
-    foreach ($seg in $betriebSegs) { $betriebBrutto += ($seg.End - $seg.Start) }
+    # --- Abzuege aus dem zentralen Pausenmodell (alte/neue Regel je nach Stichtag) ---
+    $pm = Get-DayPauseModel -Day $Day -Time $Now
+    $festePauseAktiv = [bool]$pm.FestePauseAktiv
+    $betriebBrutto = $pm.BetriebBrutto
     $sixHours = [TimeSpan]::FromMinutes($script:Const.BetriebPauseNachMinuten)
     $maxPause = [TimeSpan]::FromMinutes($script:Const.BetriebPauseMinutes)
-    $festeAbzug = $betriebBrutto - $sixHours
-    if ($festeAbzug -lt [TimeSpan]::Zero) { $festeAbzug = [TimeSpan]::Zero }
-    if ($festeAbzug -gt $maxPause) { $festeAbzug = $maxPause }
-    $betriebNetto = $betriebBrutto - $festeAbzug
-    $pauseWindows = Get-BetriebPauseWindows -BetriebSegments $betriebSegs
-
-    # --- Homeoffice: Sperrzeiten und manuelle Pausen als vereinigte Menge abziehen ---
-    $lockMerged = Merge-TimeIntervals -Intervals $Day.LockIntervals -Now $Now
-    $pauseMerged = Merge-TimeIntervals -Intervals $Day.ManualPauses -Now $Now
-    $allNonWork = New-Object System.Collections.ArrayList
-    foreach ($iv in @($Day.LockIntervals)) { [void]$allNonWork.Add($iv) }
-    foreach ($iv in @($Day.ManualPauses)) { [void]$allNonWork.Add($iv) }
-    $nonWorkMerged = Merge-TimeIntervals -Intervals $allNonWork -Now $Now
-
-    $hoBrutto = [TimeSpan]::Zero
-    $hoAbzug = [TimeSpan]::Zero
-    $sperrZeit = [TimeSpan]::Zero
-    $manuellePause = [TimeSpan]::Zero
-    foreach ($seg in $hoSegs) {
-        $hoBrutto += ($seg.End - $seg.Start)
-        $hoAbzug += Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $nonWorkMerged
-        $sperrZeit += Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $lockMerged
-        $manuellePause += Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $pauseMerged
-    }
-    $hoNetto = $hoBrutto - $hoAbzug
+    $festeAbzug = $pm.FesteAbzug
 
     # --- Gesamtwerte ---
-    $netto = $betriebNetto + $hoNetto
+    $netto = $pm.Netto
     $regular = [TimeSpan]::FromMinutes([int]$Day.RegularMinutes)
     $maxTs = [TimeSpan]::FromMinutes([int]$Day.MaxMinutes)
     $warnTs = [TimeSpan]::FromMinutes($script:Const.WarnMinutes)
@@ -2734,14 +2976,19 @@ function Get-DayComputation {
     foreach ($iv in @($Day.ManualPauses)) { if ($null -eq $iv.End) { $openPause = $iv } }
 
     # Zaehlt die Nettozeit gerade? (laufendes Segment, im HO nicht gesperrt/pausiert,
-    # im Betrieb nicht innerhalb des festen Pausenfensters)
+    # im Betrieb nicht innerhalb des festen Pausenfensters bzw. - ohne feste
+    # Pause (neue Regel) - nicht waehrend einer manuellen Pause)
     $isCounting = $false
     $inFesterPause = $false
     if ($runningSeg -and $Day.Status -eq 'Aktiv' -and -not $Day.MaxReached) {
-        if ($runningMode -eq 'Betrieb') {
+        if ($runningMode -eq 'Betrieb' -and $festePauseAktiv) {
             # Grenzwert: bei exakt 06:00 Betriebszeit ist die feste Pause bereits aktiv
             $inFesterPause = ($betriebBrutto -ge $sixHours -and $festeAbzug -lt $maxPause)
             $isCounting = -not $inFesterPause
+        }
+        elseif ($runningMode -eq 'Betrieb') {
+            # Windows-Sperren zaehlen im Betrieb weiterhin als Arbeitszeit
+            $isCounting = ($null -eq $openPause)
         }
         else {
             $isCounting = ($null -eq $openLock -and $null -eq $openPause)
@@ -2755,7 +3002,7 @@ function Get-DayComputation {
     if ($runningSeg -and $Day.Status -eq 'Aktiv' -and -not $Day.MaxReached) {
         $sollRestRaw = $regular - $netto
         $maxRestRaw = $maxTs - $netto
-        if ($runningMode -eq 'Betrieb') {
+        if ($runningMode -eq 'Betrieb' -and $festePauseAktiv) {
             # Kuenftige feste Pause einplanen, falls noch nicht (voll) verbraucht
             $pauseStartsIn = $sixHours - $betriebBrutto
             if ($pauseStartsIn -lt [TimeSpan]::Zero) { $pauseStartsIn = [TimeSpan]::Zero }
@@ -2773,8 +3020,9 @@ function Get-DayComputation {
             $endePausiert = $inFesterPause
         }
         else {
-            # Homeoffice: keine kuenftigen Pausen erfinden; bereits entstandene
-            # Sperr-/Pausenzeiten stecken in $netto und schieben das Ende nach hinten.
+            # Homeoffice bzw. Betrieb ohne feste Pause (neue Regel): keine
+            # kuenftigen Pausen erfinden; bereits entstandene Sperr-/Pausenzeiten
+            # stecken in $netto und schieben das Ende nach hinten.
             if ($sollRestRaw -gt [TimeSpan]::Zero) { $sollEnde = $Now + $sollRestRaw }
             if ($maxRestRaw -gt [TimeSpan]::Zero) { $maxEnde = $Now + $maxRestRaw }
             $endePausiert = -not $isCounting
@@ -2793,15 +3041,28 @@ function Get-DayComputation {
         Segments       = $segs
         Beginn         = $beginn
         BetriebBrutto  = $betriebBrutto
-        BetriebNetto   = $betriebNetto
+        BetriebNetto   = $pm.BetriebNetto
         FesteAbzug     = $festeAbzug
-        PauseWindows   = $pauseWindows
-        HoBrutto       = $hoBrutto
-        HoNetto        = $hoNetto
-        HoAbzug        = $hoAbzug
-        SperrZeit      = $sperrZeit
-        ManuellePause  = $manuellePause
+        PauseWindows   = $pm.PauseWindows
+        HoBrutto       = $pm.HoBrutto
+        HoNetto        = $pm.HoNetto
+        HoAbzug        = $pm.HoAbzug
+        SperrZeit      = $pm.SperrZeit
+        ManuellePause  = $pm.ManuellePause
         Netto          = $netto
+        # Pausenmodell (Issue #5): Regel, Abzuege je Modus, Soll/Ist-Anzeige
+        PauseRule             = $pm.Rule
+        FestePauseAktiv       = $festePauseAktiv
+        FestePauseEntfaellt   = [bool]$pm.FestePauseEntfaellt
+        BetriebManuellePause  = $pm.BetriebManuellePause
+        BetriebBreaks         = $pm.BetriebBreaks
+        HoBreaks              = $pm.HoBreaks
+        Pausenbloecke         = $pm.Pausenbloecke
+        SollPause             = $pm.SollPause
+        IstPause              = $pm.IstPause
+        OffenPause            = $pm.OffenPause
+        LaengsterArbeitsblock = $pm.LaengsterArbeitsblock
+        HinweisArbeitsblock   = [bool]$pm.HinweisArbeitsblock
         Regular        = $regular
         SollRest       = $sollRest
         Ueberstunden   = $ueberstunden
@@ -2838,26 +3099,17 @@ function Update-DayTotals {
         FesteBetriebspause = Format-Duration $comp.FesteAbzug
         ManuellePause = Format-Duration $comp.ManuellePause
         SperrZeit     = Format-Duration $comp.SperrZeit
-        PauseGesamt   = Format-Duration ($comp.FesteAbzug + $comp.HoAbzug)
+        PauseGesamt   = Format-Duration ($comp.FesteAbzug + $comp.HoAbzug + $comp.BetriebManuellePause)
         SollAbweichung = (Format-Duration $abweichung -WithSign:($abweichung.Ticks -ge 0))
     }
 
-    # Berechnete Werte je Segment aktualisieren
-    $lockMerged = Merge-TimeIntervals -Intervals $Day.LockIntervals -Now $Now
-    $pauseMergedAll = New-Object System.Collections.ArrayList
-    foreach ($iv in @($Day.LockIntervals)) { [void]$pauseMergedAll.Add($iv) }
-    foreach ($iv in @($Day.ManualPauses)) { [void]$pauseMergedAll.Add($iv) }
-    $nonWorkMerged = Merge-TimeIntervals -Intervals $pauseMergedAll -Now $Now
-
+    # Berechnete Werte je Segment aktualisieren (Unterbrechungen je Modus
+    # aus dem zentralen Pausenmodell)
     foreach ($seg in $comp.Segments) {
         $brutto = $seg.End - $seg.Start
-        $pause = [TimeSpan]::Zero
-        if ($seg.Mode -eq 'Betrieb') {
-            $pause = Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $comp.PauseWindows
-        }
-        else {
-            $pause = Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $nonWorkMerged
-        }
+        $breaks = $comp.HoBreaks
+        if ($seg.Mode -eq 'Betrieb') { $breaks = $comp.BetriebBreaks }
+        $pause = Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $breaks
         $seg.Ref['Brutto'] = Format-Duration $brutto
         $seg.Ref['Pause'] = Format-Duration $pause
         $seg.Ref['Netto'] = Format-Duration ($brutto - $pause)
@@ -2908,20 +3160,13 @@ function Get-SegmentDisplayRows {
         [datetime]$Now = (Get-Date)
     )
     if ($null -eq $Comp) { $Comp = Get-DayComputation -Day $Day -Now $Now }
-    $nonWork = New-Object System.Collections.ArrayList
-    foreach ($iv in @($Day.LockIntervals)) { [void]$nonWork.Add($iv) }
-    foreach ($iv in @($Day.ManualPauses)) { [void]$nonWork.Add($iv) }
-    $nonWorkMerged = Merge-TimeIntervals -Intervals $nonWork -Now $Now
     $ja = @('nein', 'ja')
     $rows = New-Object System.Collections.ArrayList
     foreach ($seg in $Comp.Segments) {
         $brutto = $seg.End - $seg.Start
-        if ($seg.Mode -eq 'Betrieb') {
-            $pause = Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $Comp.PauseWindows
-        }
-        else {
-            $pause = Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $nonWorkMerged
-        }
+        $breaks = $Comp.HoBreaks
+        if ($seg.Mode -eq 'Betrieb') { $breaks = $Comp.BetriebBreaks }
+        $pause = Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $breaks
         $endText = 'läuft'
         if (-not $seg.Running) { $endText = Format-Clock $seg.End }
         [void]$rows.Add(@{
@@ -2943,7 +3188,8 @@ function Get-SegmentDisplayRows {
 
 # Reine ANZEIGE-Berechnung der Teilabschnitte: die Arbeitsphasen jedes
 # Abschnitts zwischen den Pausen (Abschnitt minus vereinigte Pausenintervalle).
-# Homeoffice: manuelle Pausen und Sperrintervalle; Betrieb: feste Betriebspause.
+# Homeoffice: manuelle Pausen und Sperrintervalle; Betrieb: feste Betriebspause
+# bzw. (neue Regel ohne feste Pause) die manuellen Pausen.
 # Identische Grundlage wie Get-SegmentDisplayRows - die Summe der Teilabschnitte
 # eines Abschnitts entspricht exakt dessen Netto. Jede Unterbrechung trennt.
 # Veraendert keine Daten und loest keinen Speichervorgang aus.
@@ -2954,16 +3200,12 @@ function Get-WorkPhases {
         [datetime]$Now = (Get-Date)
     )
     if ($null -eq $Comp) { $Comp = Get-DayComputation -Day $Day -Now $Now }
-    $nonWork = New-Object System.Collections.ArrayList
-    foreach ($iv in @($Day.LockIntervals)) { [void]$nonWork.Add($iv) }
-    foreach ($iv in @($Day.ManualPauses)) { [void]$nonWork.Add($iv) }
-    $nonWorkMerged = Merge-TimeIntervals -Intervals $nonWork -Now $Now
     $phases = New-Object System.Collections.ArrayList
     $segNo = 0
     foreach ($seg in $Comp.Segments) {
         $segNo++
-        $breaks = $nonWorkMerged
-        if ($seg.Mode -eq 'Betrieb') { $breaks = $Comp.PauseWindows }
+        $breaks = $Comp.HoBreaks
+        if ($seg.Mode -eq 'Betrieb') { $breaks = $Comp.BetriebBreaks }
         $cuts = New-Object System.Collections.ArrayList
         $cursor = $seg.Start
         foreach ($iv in @($breaks | Sort-Object -Property @{ Expression = { $_.Start } })) {
@@ -3561,39 +3803,16 @@ function Get-AutoEndReviewCandidate {
 # Reine, nebenwirkungsfreie Nettozeit eines Tages BIS zu einem Zeitpunkt:
 # saemtliche Segmente werden am Zeitpunkt gekappt (auch bereits mit spaeterem
 # Ende gespeicherte), laufende Segmente und offene Pausen-/Sperrintervalle
-# laufen rechnerisch bis zum Zeitpunkt. Identische Rechenregeln wie
-# Get-DayComputation (feste Betriebspause, vereinigte Nichtarbeitszeiten) -
+# laufen rechnerisch bis zum Zeitpunkt. Rechnet ueber das zentrale
+# Pausenmodell (Get-DayPauseModel -CapAtTime) und damit nach denselben Regeln
+# wie Get-DayComputation (alte/neue Pausenregel je nach Stichtag) -
 # veraendert nichts, speichert nichts, protokolliert nichts.
 function Get-DayNettoAtTime {
     param(
         [Parameter(Mandatory)]$Day,
         [Parameter(Mandatory)][datetime]$Time
     )
-    $segs = Get-ParsedSegments -Day $Day -Now $Time
-    $betriebBrutto = [TimeSpan]::Zero
-    $hoSegs = New-Object System.Collections.ArrayList
-    foreach ($seg in @($segs)) {
-        $s = $seg.Start
-        $e = $seg.End
-        if ($e -gt $Time) { $e = $Time }
-        if ($s -ge $e) { continue }
-        if ($seg.Mode -eq 'Betrieb') { $betriebBrutto += ($e - $s) }
-        else { [void]$hoSegs.Add(@{ Start = $s; End = $e }) }
-    }
-    $sixHours = [TimeSpan]::FromMinutes($script:Const.BetriebPauseNachMinuten)
-    $maxPause = [TimeSpan]::FromMinutes($script:Const.BetriebPauseMinutes)
-    $festeAbzug = $betriebBrutto - $sixHours
-    if ($festeAbzug -lt [TimeSpan]::Zero) { $festeAbzug = [TimeSpan]::Zero }
-    if ($festeAbzug -gt $maxPause) { $festeAbzug = $maxPause }
-    $netto = $betriebBrutto - $festeAbzug
-    $allNonWork = New-Object System.Collections.ArrayList
-    foreach ($iv in @($Day.LockIntervals)) { [void]$allNonWork.Add($iv) }
-    foreach ($iv in @($Day.ManualPauses)) { [void]$allNonWork.Add($iv) }
-    $nonWorkMerged = Merge-TimeIntervals -Intervals $allNonWork -Now $Time
-    foreach ($seg in @($hoSegs)) {
-        $netto += ($seg.End - $seg.Start) - (Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $nonWorkMerged)
-    }
-    return $netto
+    return (Get-DayPauseModel -Day $Day -Time $Time -CapAtTime -NettoOnly).Netto
 }
 
 # ZENTRALE, nebenwirkungsfreie Suche nach dem FRUEHESTEN Zeitpunkt, an dem

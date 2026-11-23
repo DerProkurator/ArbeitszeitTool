@@ -3247,6 +3247,314 @@ function Invoke-InternalTests {
         }
     }
 
+    # =====================================================================
+    # Tests 129-131 (Issue #5): zentrales Pausenmodell Get-DayPauseModel.
+    # Die Testtage liegen fest vor (2026-11-23) bzw. ab dem Stichtag
+    # ($script:Const.PauseRuleNewFrom = 2026-11-24) - unabhaengig vom Testdatum.
+    # =====================================================================
+    $newDate = '2026-11-25'
+    $oldDate = '2026-11-23'
+    $pm = {
+        param($Day, [string]$TimeText, [switch]$Cap)
+        return Get-DayPauseModel -Day $Day -Time (Get-TestNow $Day $TimeText) -CapAtTime:$Cap
+    }
+    $fd = { param($ts) return (Format-Duration $ts) }
+
+    # --- Test 129: Demo-Faelle aus dem Issue (Regelarbeitszeit 7:00) ---
+    # Fall 1: reiner Betriebstag ohne Pause -> feste Pause wie bisher
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    $m = & $pm $d '14:00'
+    & $assert 'Test 129a: Fall 1 - reiner Betriebstag, feste Pause 45 min, Soll/Ist 45/45' 'Neu|True|False|06:15|00:45|00:45|00:45|00:00' ("$($m.Rule)|$($m.FestePauseAktiv)|$($m.FestePauseEntfaellt)|$(& $fd $m.Netto)|$(& $fd $m.FesteAbzug)|$(& $fd $m.SollPause)|$(& $fd $m.IstPause)|$(& $fd $m.OffenPause)")
+    $m = & $pm $d '13:30'
+    & $assert 'Test 129a2: Fall 1 - waehrend der festen Pause Ist 30, offen 15' '00:30|00:15' ("$(& $fd $m.IstPause)|$(& $fd $m.OffenPause)")
+
+    # Fall 2: Windows-Sperre im Betrieb zaehlt nicht und schaltet nichts ab
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'LockIntervals' -StartText '10:00' -EndText '10:30' | Out-Null
+    $m = & $pm $d '14:00'
+    & $assert 'Test 129b: Fall 2 - Sperre im Betrieb: feste Pause bleibt, kein Pausenblock' 'True|06:15|00:45|0' ("$($m.FestePauseAktiv)|$(& $fd $m.Netto)|$(& $fd $m.IstPause)|$(@($m.Pausenbloecke).Count)")
+
+    # Fall 3: Beispiel aus dem Issue (Luecke 40 min + Pause 20 min)
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:30' -EndText '09:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '09:40' -EndText '12:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '12:00' -EndText '12:20' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '12:20' | Out-Null
+    $m = & $pm $d '14:30'
+    & $assert 'Test 129c: Fall 3 - feste Pause entfaellt, Netto 06:00, Soll/Ist 45/60, zwei Bloecke' 'False|True|06:00|00:00|00:45|01:00|00:00|2' ("$($m.FestePauseAktiv)|$($m.FestePauseEntfaellt)|$(& $fd $m.Netto)|$(& $fd $m.FesteAbzug)|$(& $fd $m.SollPause)|$(& $fd $m.IstPause)|$(& $fd $m.OffenPause)|$(@($m.Pausenbloecke).Count)")
+    $m = & $pm $d '15:30'
+    & $assert 'Test 129c2: Fall 3 - Netto 07:00 um 15:30 (Soll-Ende 15:30)' '07:00' (& $fd $m.Netto)
+    # Variante: Pause liegt INNERHALB eines laufenden Betriebsabschnitts -> wird abgezogen
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:30' -EndText '09:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '09:40' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '12:00' -EndText '12:20' | Out-Null
+    $m = & $pm $d '15:30'
+    & $assert 'Test 129c3: Fall 3 - Pause im Betriebsabschnitt abgezogen, Netto 07:00' '07:00|00:20|01:00' ("$(& $fd $m.Netto)|$(& $fd $m.BetriebManuellePause)|$(& $fd $m.IstPause)")
+
+    # Fall 4: eine manuelle Pause von 20 min
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:20' | Out-Null
+    $m = & $pm $d '14:20'
+    & $assert 'Test 129d: Fall 4 - Pause 20 min: Netto 07:00, Soll/Ist 45/20, offen 25, kein Hinweis' 'False|True|07:00|00:20|00:25|False' ("$($m.FestePauseAktiv)|$($m.FestePauseEntfaellt)|$(& $fd $m.Netto)|$(& $fd $m.IstPause)|$(& $fd $m.OffenPause)|$($m.HinweisArbeitsblock)")
+    $m = & $pm $d '16:30'
+    & $assert 'Test 129d2: Fall 4 - 6:10 h am Stueck nach der Pause -> Hinweis' 'True|06:10' ("$($m.HinweisArbeitsblock)|$(& $fd $m.LaengsterArbeitsblock)")
+
+    # Fall 5: eine manuelle Pause von 10 min (abgezogen, aber kein Ist)
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:10' | Out-Null
+    $m = & $pm $d '14:10'
+    & $assert 'Test 129e: Fall 5 - Pause 10 min: Netto 07:00, Ist 0, offen 45, kurze Pause trennt keinen Block' 'False|07:00|00:00|00:45|False|True|07:00' ("$($m.FestePauseAktiv)|$(& $fd $m.Netto)|$(& $fd $m.IstPause)|$(& $fd $m.OffenPause)|$($m.Pausenbloecke[0].Zaehlt)|$($m.HinweisArbeitsblock)|$(& $fd $m.LaengsterArbeitsblock)")
+
+    # Fall 6: nachtraeglich eingetragene Pause schaltet die feste Pause rueckwirkend ab
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    $m = & $pm $d '15:00'
+    $before = "$($m.FestePauseAktiv)|$(& $fd $m.Netto)"
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:15' | Out-Null
+    $m = & $pm $d '15:00'
+    & $assert 'Test 129f: Fall 6 - nachtraegliche Pause: vorher 07:15 mit fester Pause, danach 07:45, Ist 15, offen 30' 'True|07:15 -> False|07:45|00:15|00:30' ("$before -> $($m.FestePauseAktiv)|$(& $fd $m.Netto)|$(& $fd $m.IstPause)|$(& $fd $m.OffenPause)")
+
+    # Fall 7: Homeoffice mit Pause 10 min (nichts automatisch, Soll 30)
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '08:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:10' | Out-Null
+    $m = & $pm $d '14:40'
+    & $assert 'Test 129g: Fall 7 - Homeoffice: Netto 06:30, Soll/Ist 30/0, kein Hinweis auf feste Pause' '06:30|00:00|00:30|00:00|00:30|False' ("$(& $fd $m.Netto)|$(& $fd $m.FesteAbzug)|$(& $fd $m.SollPause)|$(& $fd $m.IstPause)|$(& $fd $m.OffenPause)|$($m.FestePauseEntfaellt)")
+
+    # Fall 8: Homeoffice 9:30 h mit 30 min Pause (Staffel 45)
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '12:00' -EndText '12:30' | Out-Null
+    $m = & $pm $d '17:00'
+    & $assert 'Test 129h: Fall 8 - Homeoffice 09:30: Soll/Ist 45/30, offen 15' '09:30|00:45|00:30|00:15' ("$(& $fd $m.Netto)|$(& $fd $m.SollPause)|$(& $fd $m.IstPause)|$(& $fd $m.OffenPause)")
+
+    # Fall 9: gemischt mit Fahrweg 30 min
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '07:00' -EndText '09:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '09:30' | Out-Null
+    $m = & $pm $d '14:30'
+    & $assert 'Test 129i: Fall 9 - gemischt: keine feste Pause, Netto 07:00, Soll/Ist 30/30' 'False|True|07:00|00:30|00:30|00:00' ("$($m.FestePauseAktiv)|$($m.FestePauseEntfaellt)|$(& $fd $m.Netto)|$(& $fd $m.SollPause)|$(& $fd $m.IstPause)|$(& $fd $m.OffenPause)")
+    $m = & $pm $d '16:00'
+    & $assert 'Test 129i2: Fall 9 - auch nach 6:30 h Betrieb kein automatischer Abzug' '08:30|00:00' ("$(& $fd $m.Netto)|$(& $fd $m.FesteAbzug)")
+
+    # --- Test 130: Randwerte und Sonderfaelle ---
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:14' | Out-Null
+    $m14 = & $pm $d '12:00'
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:15' | Out-Null
+    $m15 = & $pm $d '12:00'
+    & $assert 'Test 130a: Pausenblock 14 min zaehlt nicht, 15 min zaehlt' '00:00|00:15' ("$(& $fd $m14.IstPause)|$(& $fd $m15.IstPause)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '12:00' -EndText '12:30' | Out-Null
+    $mA = & $pm $d '16:29'
+    $mB = & $pm $d '16:30'
+    & $assert 'Test 130b: Staffel bei 08:59 -> 30 min, bei 09:00 -> 45 min' '08:59|00:30|09:00|00:45' ("$(& $fd $mA.Netto)|$(& $fd $mA.SollPause)|$(& $fd $mB.Netto)|$(& $fd $mB.SollPause)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '07:30' -EndText '07:45' | Out-Null
+    $mA = & $pm $d '13:45'
+    $mB = & $pm $d '13:46'
+    & $assert 'Test 130c: Arbeitsblock exakt 06:00 -> kein Hinweis, 06:01 -> Hinweis' '06:00|False|06:01|True' ("$(& $fd $mA.LaengsterArbeitsblock)|$($mA.HinweisArbeitsblock)|$(& $fd $mB.LaengsterArbeitsblock)|$($mB.HinweisArbeitsblock)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    $mA = & $pm $d '13:00'
+    $mB = & $pm $d '15:00'
+    & $assert 'Test 130d: feste Pause ab exakt 06:00 trennt den Block - kein Hinweis' '06:00|False|06:00|False|00:45' ("$(& $fd $mA.LaengsterArbeitsblock)|$($mA.HinweisArbeitsblock)|$(& $fd $mB.LaengsterArbeitsblock)|$($mB.HinweisArbeitsblock)|$(& $fd $mB.IstPause)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' -EndText '10:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '10:00' | Out-Null
+    $m = & $pm $d '14:00'
+    & $assert 'Test 130e: zwei Betriebsabschnitte ohne Luecke -> feste Pause bleibt' 'True|06:15|00:45' ("$($m.FestePauseAktiv)|$(& $fd $m.Netto)|$(& $fd $m.FesteAbzug)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' -EndText '10:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '10:01' | Out-Null
+    $m = & $pm $d '14:01'
+    & $assert 'Test 130f: Luecke von 1 min -> feste Pause entfaellt, Ist 0, offen 45' 'False|True|07:00|00:00|00:45' ("$($m.FestePauseAktiv)|$($m.FestePauseEntfaellt)|$(& $fd $m.Netto)|$(& $fd $m.IstPause)|$(& $fd $m.OffenPause)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '08:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'LockIntervals' -StartText '10:00' -EndText '10:20' | Out-Null
+    $m = & $pm $d '12:00'
+    & $assert 'Test 130g: Sperre im Homeoffice zaehlt als Pause (Ist 20) und wird abgezogen' '03:40|00:20|00:20' ("$(& $fd $m.Netto)|$(& $fd $m.SperrZeit)|$(& $fd $m.IstPause)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' -EndText '10:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '09:50' -EndText '10:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '10:05' | Out-Null
+    $m = & $pm $d '12:00'
+    & $assert 'Test 130h: Pause 10 min + angrenzende Luecke 5 min = ein Block von 15 min' '1|00:15|04:45' ("$(@($m.Pausenbloecke).Count)|$(& $fd $m.IstPause)|$(& $fd $m.Netto)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' | Out-Null
+    $mA = & $pm $d '10:10'
+    $mB = & $pm $d '10:20'
+    & $assert 'Test 130i: laufende Pause im Betrieb - Netto steht, Ist ab 15 min' '03:00|00:00|03:00|00:20' ("$(& $fd $mA.Netto)|$(& $fd $mA.IstPause)|$(& $fd $mB.Netto)|$(& $fd $mB.IstPause)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '07:00' -EndText '09:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '09:00' | Out-Null
+    $m = & $pm $d '15:00'
+    & $assert 'Test 130j: Moduswechsel ohne Luecke -> feste Pause entfaellt, 8 h am Stueck -> Hinweis' 'False|08:00|00:00|00:30|True' ("$($m.FestePauseAktiv)|$(& $fd $m.Netto)|$(& $fd $m.IstPause)|$(& $fd $m.SollPause)|$($m.HinweisArbeitsblock)")
+
+    # --- Test 131: Stichtag und Gleichwertigkeit mit der bisherigen Rechnung ---
+    foreach ($case in @(@{ Date = $oldDate; Expected = 'Alt|True|06:35|00:00' }, @{ Date = '2026-11-24'; Expected = 'Neu|False|07:00|00:20' })) {
+        $d = New-TestDay -DateText $case.Date
+        Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+        Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:20' | Out-Null
+        $m = & $pm $d '14:20'
+        & $assert ("Test 131a: Tag {0} mit Pause im Betrieb -> {1}" -f $case.Date, $case.Expected) $case.Expected ("$($m.Rule)|$($m.FestePauseAktiv)|$(& $fd $m.Netto)|$(& $fd $m.BetriebManuellePause)")
+    }
+
+    # Alte Regel (und neue Regel an reinen Betriebstagen) muss exakt der
+    # bisherigen Rechnung entsprechen. $legacyRef ist der eingefrorene Stand
+    # der Formeln aus Get-DayComputation/Get-DayNettoAtTime bis v1.5.4.
+    $legacyRef = {
+        param($Day, [datetime]$Time, [bool]$Cap)
+        $betriebSegs = New-Object System.Collections.ArrayList
+        $hoSegs = New-Object System.Collections.ArrayList
+        foreach ($seg in (Get-ParsedSegments -Day $Day -Now $Time)) {
+            $s = $seg.Start
+            $e = $seg.End
+            if ($Cap) {
+                if ($e -gt $Time) { $e = $Time }
+                if ($s -ge $e) { continue }
+            }
+            if ($seg.Mode -eq 'Betrieb') { [void]$betriebSegs.Add(@{ Start = $s; End = $e }) }
+            else { [void]$hoSegs.Add(@{ Start = $s; End = $e }) }
+        }
+        $bb = [TimeSpan]::Zero
+        foreach ($seg in $betriebSegs) { $bb += ($seg.End - $seg.Start) }
+        $fest = $bb - [TimeSpan]::FromMinutes(360)
+        if ($fest -lt [TimeSpan]::Zero) { $fest = [TimeSpan]::Zero }
+        if ($fest -gt [TimeSpan]::FromMinutes(45)) { $fest = [TimeSpan]::FromMinutes(45) }
+        $all = New-Object System.Collections.ArrayList
+        foreach ($iv in @($Day.LockIntervals)) { [void]$all.Add($iv) }
+        foreach ($iv in @($Day.ManualPauses)) { [void]$all.Add($iv) }
+        $nonWork = Merge-TimeIntervals -Intervals $all -Now $Time
+        $locks = Merge-TimeIntervals -Intervals $Day.LockIntervals -Now $Time
+        $pauses = Merge-TimeIntervals -Intervals $Day.ManualPauses -Now $Time
+        $hb = [TimeSpan]::Zero; $ha = [TimeSpan]::Zero; $sp = [TimeSpan]::Zero; $mp = [TimeSpan]::Zero
+        foreach ($seg in $hoSegs) {
+            $hb += ($seg.End - $seg.Start)
+            $ha += Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $nonWork
+            $sp += Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $locks
+            $mp += Get-OverlapDuration -Start $seg.Start -End $seg.End -MergedIntervals $pauses
+        }
+        return @{
+            Netto = ($bb - $fest + $hb - $ha); BetriebBrutto = $bb; BetriebNetto = ($bb - $fest); FesteAbzug = $fest
+            HoBrutto = $hb; HoAbzug = $ha; HoNetto = ($hb - $ha); SperrZeit = $sp; ManuellePause = $mp
+            # Ohne @() um den Aufruf: die Funktion liefert bereits eine Liste (return ,$list)
+            Windows = (Get-BetriebPauseWindows -BetriebSegments $betriebSegs).Count
+        }
+    }
+    $eqDays = New-Object System.Collections.ArrayList
+    $d = New-TestDay; Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '06:12' | Out-Null; [void]$eqDays.Add($d)
+    $d = New-TestDay; Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '06:00' -EndText '11:59' | Out-Null; [void]$eqDays.Add($d)
+    $d = New-TestDay; Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '08:00' -EndText '12:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'LockIntervals' -StartText '09:00' -EndText '09:20' | Out-Null; [void]$eqDays.Add($d)
+    $d = New-TestDay; Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '08:00' -EndText '12:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:30' | Out-Null
+    Add-TestInterval -Day $d -ListName 'LockIntervals' -StartText '10:10' -EndText '10:40' | Out-Null; [void]$eqDays.Add($d)
+    $d = New-TestDay; Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '06:00' -EndText '10:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '10:30' -EndText '13:30' | Out-Null; [void]$eqDays.Add($d)
+    $d = New-TestDay; Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:20' | Out-Null
+    Add-TestInterval -Day $d -ListName 'LockIntervals' -StartText '11:00' -EndText '11:30' | Out-Null; [void]$eqDays.Add($d)
+    $d = New-TestDay; Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '07:00' -EndText '09:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '09:30' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '12:00' | Out-Null; [void]$eqDays.Add($d)
+    $d = New-TestDay -DateText $newDate; Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '06:12' | Out-Null; [void]$eqDays.Add($d)
+    $mismatch = New-Object System.Collections.ArrayList
+    $dayNo = 0
+    foreach ($d in $eqDays) {
+        $dayNo++
+        foreach ($t in @('07:00', '09:00', '12:00', '13:00', '15:00', '18:00')) {
+            $now = Get-TestNow $d $t
+            $ref = & $legacyRef $d $now $false
+            $c = Get-DayComputation -Day $d -Now $now
+            foreach ($f in @('Netto', 'BetriebBrutto', 'BetriebNetto', 'FesteAbzug', 'HoBrutto', 'HoAbzug', 'HoNetto', 'SperrZeit', 'ManuellePause')) {
+                if ($ref[$f] -ne $c[$f]) { [void]$mismatch.Add("Tag $dayNo $t $f") }
+            }
+            if ($ref.Windows -ne @($c.PauseWindows).Count) { [void]$mismatch.Add("Tag $dayNo $t PauseWindows") }
+            $refCap = & $legacyRef $d $now $true
+            if ($refCap.Netto -ne (Get-DayNettoAtTime -Day $d -Time $now)) { [void]$mismatch.Add("Tag $dayNo $t NettoAtTime") }
+        }
+    }
+    & $assert 'Test 131b: alte Regel und reiner Betriebstag identisch zur bisherigen Formel (Get-DayComputation/Get-DayNettoAtTime)' '' ($mismatch -join ', ')
+
+    # --- Test 132: Tagesberechnung nach neuer Regel (Soll-/Max-Ende, Zaehlstatus, 10-h-Grenze, Abschnittswerte) ---
+    $fc = { param($t) if ($null -eq $t) { return '-' }; return (Format-Clock $t) }
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    $c = Get-DayComputation -Day $d -Now (Get-TestNow $d '10:00')
+    & $assert 'Test 132a: reiner Betriebstag - Soll-Ende 14:45, Max-Ende 17:45 (feste Pause eingeplant)' '14:45|17:45|True|True' ("$(& $fc $c.SollEnde)|$(& $fc $c.MaxEnde)|$($c.IsCounting)|$($c.FestePauseAktiv)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:20' | Out-Null
+    $c = Get-DayComputation -Day $d -Now (Get-TestNow $d '12:00')
+    & $assert 'Test 132b: Betrieb mit Pause 20 min - Soll-Ende 14:20, Max-Ende 17:20, keine feste Pause eingeplant' '04:40|14:20|17:20|True|False|True|00:45|00:20' ("$(& $fd $c.Netto)|$(& $fc $c.SollEnde)|$(& $fc $c.MaxEnde)|$($c.IsCounting)|$($c.InFesterPause)|$($c.FestePauseEntfaellt)|$(& $fd $c.SollPause)|$(& $fd $c.IstPause)")
+    $now132 = Get-TestNow $d '14:20'
+    Update-DayTotals -Day $d -Now $now132 | Out-Null
+    $rows132 = Get-SegmentDisplayRows -Day $d -Now $now132
+    $ph132 = Get-WorkPhases -Day $d -Now $now132
+    & $assert 'Test 132c: Abschnittswerte - Pause 00:20, Netto 07:00, Pausen gesamt 00:20, zwei Arbeitsphasen' '00:20|07:00|00:20|00:20|2|10:00|10:20' ("$($d.Segments[0].Pause)|$($d.Segments[0].Netto)|$($d.Totals.PauseGesamt)|$($rows132[0].Pause)|$($ph132.Count)|$(Format-Clock $ph132[0].End)|$(Format-Clock $ph132[1].Start)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' | Out-Null
+    $c = Get-DayComputation -Day $d -Now (Get-TestNow $d '10:10')
+    & $assert 'Test 132d: laufende Pause im Betrieb - Netto steht, Zaehlung pausiert, Soll-Ende 14:10' '03:00|False|True|14:10' ("$(& $fd $c.Netto)|$($c.IsCounting)|$($c.EndePausiert)|$(& $fc $c.SollEnde)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'LockIntervals' -StartText '10:00' | Out-Null
+    $c = Get-DayComputation -Day $d -Now (Get-TestNow $d '10:10')
+    & $assert 'Test 132e: offene Windows-Sperre im Betrieb - Zeit zaehlt weiter' '03:10|True' ("$(& $fd $c.Netto)|$($c.IsCounting)")
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:30' -EndText '09:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '09:40' -EndText '12:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '12:00' -EndText '12:20' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '12:20' | Out-Null
+    $c = Get-DayComputation -Day $d -Now (Get-TestNow $d '14:30')
+    & $assert 'Test 132f: Beispiel aus dem Issue - Soll-Ende 15:30 (bisher 16:15)' '15:30' (& $fc $c.SollEnde)
+
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Homeoffice' -StartText '07:00' -EndText '09:00' | Out-Null
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '09:30' | Out-Null
+    $c = Get-DayComputation -Day $d -Now (Get-TestNow $d '12:00')
+    & $assert 'Test 132g: gemischter Tag - Soll-Ende 14:30, Max-Ende 17:30' '14:30|17:30' ("$(& $fc $c.SollEnde)|$(& $fc $c.MaxEnde)")
+
+    foreach ($case in @(@{ Date = $newDate; Expected = '17:20:00' }, @{ Date = $oldDate; Expected = '17:45:00' })) {
+        $d = New-TestDay -DateText $case.Date
+        Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+        Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:20' | Out-Null
+        $t132 = Find-DayMaxNettoReachedTime -Day $d -Cutoff (Get-TestNow $d '20:00')
+        & $assert ("Test 132h: 10-h-Grenze mit Pause im Betrieb ({0}) -> {1}" -f $case.Date, $case.Expected) $case.Expected ($t132.ToString('HH:mm:ss'))
+    }
+    $d = New-TestDay -DateText $newDate
+    Add-TestSegment -Day $d -Mode 'Betrieb' -StartText '07:00' | Out-Null
+    Add-TestInterval -Day $d -ListName 'ManualPauses' -StartText '10:00' -EndText '10:20' | Out-Null
+    $stopped132 = Invoke-AutoStopIfNeeded -Day $d -Now (Get-TestNow $d '18:00')
+    $c = Get-DayComputation -Day $d -Now (Get-TestNow $d '18:00')
+    & $assert 'Test 132i: automatischer Stopp an der 10-h-Grenze (17:20), Netto exakt 10:00' 'True|10:00|17:20' ("$stopped132|$(& $fd $c.Netto)|$(Format-Clock (ConvertFrom-DateTimeString $d.Segments[0].End))")
+
     # --- Zusammenfassung ---
     $failed = @($results | Where-Object { -not $_.Ok })
     Write-Host ''
